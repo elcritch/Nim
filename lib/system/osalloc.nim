@@ -191,7 +191,7 @@ elif defined(nintendoswitch) and not defined(StandaloneHeapSize):
     when reallyOsDealloc:
       freeMem(p)
 
-elif defined(posix) and not defined(StandaloneHeapSize):
+elif defined(posix) and (not defined(StandaloneHeapSize) or not defined(freertos)):
   const
     PROT_READ  = 1             # page can be read
     PROT_WRITE = 2             # page can be written
@@ -284,6 +284,30 @@ elif hostOS == "standalone" or defined(StandaloneHeapSize):
   const StandaloneHeapSize {.intdefine.}: int = 1024 * PageSize
   var
     theHeap: array[StandaloneHeapSize div sizeof(float64), float64] # 'float64' for alignment
+    bumpPointer = cast[int](addr theHeap)
+
+  proc osAllocPages(size: int): pointer {.inline.} =
+    if size+bumpPointer < cast[int](addr theHeap) + sizeof(theHeap):
+      result = cast[pointer](bumpPointer)
+      inc bumpPointer, size
+    else:
+      raiseOutOfMem()
+
+  proc osTryAllocPages(size: int): pointer {.inline.} =
+    if size+bumpPointer < cast[int](addr theHeap) + sizeof(theHeap):
+      result = cast[pointer](bumpPointer)
+      inc bumpPointer, size
+
+  proc osDeallocPages(p: pointer, size: int) {.inline.} =
+    if bumpPointer-size == cast[int](p):
+      dec bumpPointer, size
+
+elif defined(freertos) or defined(CustomMallocedHeapSize):
+  proc c_malloc(size: csize_t): pointer {.
+    importc: "malloc", header: "<stdlib.h>".}
+
+  var
+    theHeap: pointer = c_malloc(CustomMallocedHeapSize)
     bumpPointer = cast[int](addr theHeap)
 
   proc osAllocPages(size: int): pointer {.inline.} =
