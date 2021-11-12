@@ -49,6 +49,11 @@ runnableExamples("-r:off"):
   let socket = newSocket()
   socket.connect("google.com", Port(80))
 
+runnableExamples("-r:off"):
+  let socket = newSocket()
+  let ip = parseIpAddress("1.1.1.1")
+  socket.connect(ip, Port(80))
+
 ## For SSL, use the following example:
 
 runnableExamples("-r:off -d:ssl"):
@@ -63,7 +68,14 @@ runnableExamples("-r:off -d:ssl"):
 
 runnableExamples("-r:off"):
   let socket = newSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-  socket.sendTo("192.168.0.1", Port(27960), "status\n")
+  let bytes = socket.sendTo("192.168.0.1", Port(27960), "status\n")
+  echo("sent: ", bytes)
+
+runnableExamples("-r:off"):
+  let socket = newSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+  let ip = parseIpAddress("192.168.0.1")
+  let bytes = socket.sendTo(ip, Port(27960), "status\n")
+  echo("sent: ", bytes)
 
 ## Creating a server
 ## -----------------
@@ -1607,6 +1619,35 @@ proc recvLine*(socket: Socket, timeout = -1,
   result = ""
   readLine(socket, result, timeout, flags, maxLength)
 
+proc recvFrom*(socket: Socket;
+               data: var string, length: int;
+               address: var IpAddress, port: var Port,
+               flags = 0'i32): int {.tags: [ReadIOEffect].} =
+  ## Receives data from `socket`. This function should normally be used with
+  ## connection-less sockets (UDP sockets).
+  ##
+  ## If an error occurs an OSError exception will be raised. Otherwise the return
+  ## value will be the length of data received.
+  ##
+  ## .. warning:: This function does not yet have a buffered implementation,
+  ##   so when `socket` is buffered the non-buffered implementation will be
+  ##   used. Therefore if `socket` contains something in its buffer this
+  ##   function will make no effort to return it.
+  data.setLen(length)
+  var sockAddress: Sockaddr_storage
+  var addrLen = sizeof(sockAddress).SockLen
+  result = recvfrom(socket.fd, cstring(data), length, flags.cint,
+                    cast[ptr SockAddr](addr(sockAddress)), addr(addrLen))
+
+  if result == 0: # posix says this indicates no packets waiting and peer has reset
+    data.setLen(0)
+  elif result > 0:
+    data.setLen(result)
+    sockAddress.fromSockAddr(addrLen, address, port)
+  else:
+    raiseOSError(osLastError())
+
+
 proc recvFrom*(socket: Socket, data: var string, length: int,
                address: var string, port: var Port, flags = 0'i32): int {.
                tags: [ReadIOEffect].} =
@@ -1702,14 +1743,42 @@ proc trySend*(socket: Socket, data: string): bool {.tags: [WriteIOEffect].} =
   ## and instead returns `false` on failure.
   result = send(socket, cstring(data), data.len) == data.len
 
+proc sendTo*(socket: Socket, address: IpAddress, port: Port, data: pointer,
+             size: int, af: Domain = AF_INET, flags = 0'i32): int {.
+              discardable, tags: [WriteIOEffect].} =
+  ## This proc sends `data` to the specified `IPAddress`. Hostnames
+  ## are not supported for this variant.
+  ##
+  ## If an error occurs an OSError exception will be raised. Otherwise
+  ## the number of bytes writen will be returned.
+  ##
+  ## **Note:** You may wish to use the high-level version of this function
+  ## which is defined below.
+  ##
+  ## **Note:** This proc is not available for SSL sockets.
+  assert(socket.protocol != IPPROTO_TCP, "Cannot `sendTo` on a TCP socket")
+  assert(not socket.isClosed, "Cannot `sendTo` on a closed socket")
+
+  var sa: Sockaddr_storage
+  var sl: Socklen
+  toSockAddr(address, port, sa, sl)
+
+  result = sendto(socket.fd, data, size.cint, flags.cint,
+                  cast[ptr SockAddr](addr sa), sl)
+
+  if result == -1'i32:
+    let osError = osLastError()
+    raiseOSError(osError)
+
 proc sendTo*(socket: Socket, address: string, port: Port, data: pointer,
-             size: int, af: Domain = AF_INET, flags = 0'i32) {.
-             tags: [WriteIOEffect].} =
+             size: int, af: Domain = AF_INET, flags = 0'i32): int {.
+             discardable, tags: [WriteIOEffect].} =
   ## This proc sends `data` to the specified `address`,
   ## which may be an IP address or a hostname, if a hostname is specified
   ## this function will try each IP of that hostname.
   ##
-  ## If an error occurs an OSError exception will be raised.
+  ## If an error occurs an OSError exception will be raised. Otherwise
+  ## the number of bytes writen will be returned.
   ##
   ## **Note:** You may wish to use the high-level version of this function
   ## which is defined below.
@@ -1721,7 +1790,7 @@ proc sendTo*(socket: Socket, address: string, port: Port, data: pointer,
   # try all possibilities:
   var success = false
   var it = aiList
-  var result = 0
+  result = 0
   while it != nil:
     result = sendto(socket.fd, data, size.cint, flags.cint, it.ai_addr,
                     it.ai_addrlen.SockLen)
@@ -1736,16 +1805,17 @@ proc sendTo*(socket: Socket, address: string, port: Port, data: pointer,
   if not success:
     raiseOSError(osError)
 
-proc sendTo*(socket: Socket, address: string, port: Port,
-             data: string) {.tags: [WriteIOEffect].} =
+proc sendTo*(socket: Socket, address: string | IpAddress, port: Port,
+             data: string): int {.tags: [WriteIOEffect], discardable.} =
   ## This proc sends `data` to the specified `address`,
   ## which may be an IP address or a hostname, if a hostname is specified
   ## this function will try each IP of that hostname.
   ##
-  ## If an error occurs an OSError exception will be raised.
+  ## If an error occurs an OSError exception will be raised. Otherwise
+  ## the number of bytes writen will be returned.
   ##
   ## This is the high-level version of the above `sendTo` function.
-  socket.sendTo(address, port, cstring(data), data.len, socket.domain)
+  result = socket.sendTo(address, port, cstring(data), data.len, socket.domain)
 
 
 proc isSsl*(socket: Socket): bool =
@@ -1929,6 +1999,31 @@ proc dial*(address: string, port: Port,
   else:
     raise newException(IOError, "Couldn't resolve address: " & address)
 
+proc connect*(socket: Socket, address: IpAddress,
+    port = Port(0)) {.tags: [ReadIOEffect].} =
+  ## Connects socket to `address`:`port`. `Address` can be an IP address or a
+  ## host name. If `address` is a host name, this function will try each IP
+  ## of that host name. `htons` is already performed on `port` so you must
+  ## not do it.
+  ##
+  ## If `socket` is an SSL socket a handshake will be automatically performed.
+  # try all possibilities:
+  var sa: Sockaddr_storage
+  var sl: Socklen
+  toSockAddr(address, port, sa, sl)
+
+  var lastError: OSErrorCode
+  var result = connect(socket.fd, cast[ptr SockAddr](addr sa), sl)
+  if result != 0'i32:
+    raiseOSError(lastError)
+
+  when defineSsl:
+    if socket.isSsl:
+      # RFC3546 for SNI specifies that IP addresses are not allowed.
+      ErrClearError()
+      let ret = SSL_connect(socket.sslHandle)
+      socketError(socket, ret)
+
 proc connect*(socket: Socket, address: string,
     port = Port(0)) {.tags: [ReadIOEffect].} =
   ## Connects socket to `address`:`port`. `Address` can be an IP address or a
@@ -1967,6 +2062,41 @@ proc connect*(socket: Socket, address: string,
         if not isIpAddress(address):
           socket.checkCertName(address)
 
+proc checkConnectAsync(ret: int, lastError: var OSErrorCode): bool =
+  if ret == 0'i32:
+    result = true
+  else:
+    lastError = osLastError()
+    when useWinVersion:
+      # Windows EINTR doesn't behave same as POSIX.
+      if lastError.int32 == WSAEWOULDBLOCK:
+        result = true
+    else:
+      if lastError.int32 == EINTR or lastError.int32 == EINPROGRESS:
+        result = true
+
+proc connectAsync(socket: Socket, address: IpAddress, port = Port(0),
+                  af: Domain = AF_INET) {.tags: [ReadIOEffect].} =
+  ## A variant of `connect` for non-blocking sockets.
+  ##
+  ## This procedure will immediately return, it will not block until a connection
+  ## is made. It is up to the caller to make sure the connection has been established
+  ## by checking (using `select`) whether the socket is writeable.
+  ##
+  ## **Note**: For SSL sockets, the `handshake` procedure must be called
+  ## whenever the socket successfully connects to a server.
+  var sa: Sockaddr_storage
+  var sl: Socklen
+  toSockAddr(address, port, sa, sl)
+  
+  var success = false
+  var lastError: OSErrorCode
+
+  var ret = connect(socket.fd, cast[ptr SockAddr](addr sa), sl)
+  success = checkConnectAsync(ret, lastError)
+
+  if not success: raiseOSError(lastError)
+
 proc connectAsync(socket: Socket, name: string, port = Port(0),
                   af: Domain = AF_INET) {.tags: [ReadIOEffect].} =
   ## A variant of `connect` for non-blocking sockets.
@@ -1984,27 +2114,15 @@ proc connectAsync(socket: Socket, name: string, port = Port(0),
   var it = aiList
   while it != nil:
     var ret = connect(socket.fd, it.ai_addr, it.ai_addrlen.SockLen)
-    if ret == 0'i32:
-      success = true
+    success = checkConnectAsync(ret, lastError)
+    if success:
       break
-    else:
-      lastError = osLastError()
-      when useWinVersion:
-        # Windows EINTR doesn't behave same as POSIX.
-        if lastError.int32 == WSAEWOULDBLOCK:
-          success = true
-          break
-      else:
-        if lastError.int32 == EINTR or lastError.int32 == EINPROGRESS:
-          success = true
-          break
-
     it = it.ai_next
 
   freeaddrinfo(aiList)
   if not success: raiseOSError(lastError)
 
-proc connect*(socket: Socket, address: string, port = Port(0),
+proc connect*(socket: Socket, address: string | IpAddress, port = Port(0),
     timeout: int) {.tags: [ReadIOEffect, WriteIOEffect].} =
   ## Connects to server as specified by `address` on port specified by `port`.
   ##
