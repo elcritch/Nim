@@ -1714,7 +1714,7 @@ proc trySend*(socket: Socket, data: string): bool {.tags: [WriteIOEffect].} =
 
 proc sendTo*(socket: Socket, address: IpAddress, port: Port, data: pointer,
              size: int, af: Domain = AF_INET, flags = 0'i32): int {.
-              tags: [WriteIOEffect], discardable.} =
+              discardable, tags: [WriteIOEffect].} =
   ## This proc sends `data` to the specified `IPAddress`. Hostnames
   ## are not supported for this variant.
   ##
@@ -1741,7 +1741,7 @@ proc sendTo*(socket: Socket, address: IpAddress, port: Port, data: pointer,
 
 proc sendTo*(socket: Socket, address: string, port: Port, data: pointer,
              size: int, af: Domain = AF_INET, flags = 0'i32): int {.
-             tags: [WriteIOEffect], discardable.} =
+             discardable, tags: [WriteIOEffect].} =
   ## This proc sends `data` to the specified `address`,
   ## which may be an IP address or a hostname, if a hostname is specified
   ## this function will try each IP of that hostname.
@@ -2031,6 +2031,41 @@ proc connect*(socket: Socket, address: string,
         if not isIpAddress(address):
           socket.checkCertName(address)
 
+proc checkConnectAsync(ret: int, lastError: var OSErrorCode): bool =
+  if ret == 0'i32:
+    result = true
+  else:
+    lastError = osLastError()
+    when useWinVersion:
+      # Windows EINTR doesn't behave same as POSIX.
+      if lastError.int32 == WSAEWOULDBLOCK:
+        result = true
+    else:
+      if lastError.int32 == EINTR or lastError.int32 == EINPROGRESS:
+        result = true
+
+proc connectAsync(socket: Socket, address: IpAddress, port = Port(0),
+                  af: Domain = AF_INET) {.tags: [ReadIOEffect].} =
+  ## A variant of `connect` for non-blocking sockets.
+  ##
+  ## This procedure will immediately return, it will not block until a connection
+  ## is made. It is up to the caller to make sure the connection has been established
+  ## by checking (using `select`) whether the socket is writeable.
+  ##
+  ## **Note**: For SSL sockets, the `handshake` procedure must be called
+  ## whenever the socket successfully connects to a server.
+  var sa: Sockaddr_storage
+  var sl: Socklen
+  toSockAddr(address, port, sa, sl)
+  
+  var success = false
+  var lastError: OSErrorCode
+
+  var ret = connect(socket.fd, cast[ptr SockAddr](addr sa), sl)
+  success = checkConnectAsync(ret, lastError)
+
+  if not success: raiseOSError(lastError)
+
 proc connectAsync(socket: Socket, name: string, port = Port(0),
                   af: Domain = AF_INET) {.tags: [ReadIOEffect].} =
   ## A variant of `connect` for non-blocking sockets.
@@ -2048,27 +2083,15 @@ proc connectAsync(socket: Socket, name: string, port = Port(0),
   var it = aiList
   while it != nil:
     var ret = connect(socket.fd, it.ai_addr, it.ai_addrlen.SockLen)
-    if ret == 0'i32:
-      success = true
+    success = checkConnectAsync(ret, lastError)
+    if success:
       break
-    else:
-      lastError = osLastError()
-      when useWinVersion:
-        # Windows EINTR doesn't behave same as POSIX.
-        if lastError.int32 == WSAEWOULDBLOCK:
-          success = true
-          break
-      else:
-        if lastError.int32 == EINTR or lastError.int32 == EINPROGRESS:
-          success = true
-          break
-
     it = it.ai_next
 
   freeaddrinfo(aiList)
   if not success: raiseOSError(lastError)
 
-proc connect*(socket: Socket, address: string, port = Port(0),
+proc connect*(socket: Socket, address: string | IpAddress, port = Port(0),
     timeout: int) {.tags: [ReadIOEffect, WriteIOEffect].} =
   ## Connects to server as specified by `address` on port specified by `port`.
   ##
