@@ -49,6 +49,11 @@ runnableExamples("-r:off"):
   let socket = newSocket()
   socket.connect("google.com", Port(80))
 
+runnableExamples("-r:off"):
+  let socket = newSocket()
+  let ip = parseIpAddress("1.1.1.1")
+  socket.connect(ip, Port(80))
+
 ## For SSL, use the following example:
 
 runnableExamples("-r:off -d:ssl"):
@@ -64,6 +69,11 @@ runnableExamples("-r:off -d:ssl"):
 runnableExamples("-r:off"):
   let socket = newSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
   socket.sendTo("192.168.0.1", Port(27960), "status\n")
+
+runnableExamples("-r:off"):
+  let socket = newSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+  let ip = parseIpAddress("192.168.0.1")
+  doAssert socket.sendTo(ip, Port(27960), "status\c\l") == 8
 
 ## Creating a server
 ## -----------------
@@ -1607,11 +1617,12 @@ proc recvLine*(socket: Socket, timeout = -1,
   result = ""
   readLine(socket, result, timeout, flags, maxLength)
 
-proc recvFrom*(socket: Socket, data: var string, length: int,
-               address: var string, port: var Port, flags = 0'i32): int {.
+proc recvFrom*[T: string | IpAddress](socket: Socket, data: var string, length: int,
+               address: var T, port: var Port, flags = 0'i32): int {.
                tags: [ReadIOEffect].} =
   ## Receives data from `socket`. This function should normally be used with
-  ## connection-less sockets (UDP sockets).
+  ## connection-less sockets (UDP sockets). The source address of the data
+  ## packet is returned as either a string or an IpAddress.
   ##
   ## If an error occurs an OSError exception will be raised. Otherwise the return
   ## value will be the length of data received.
@@ -1620,18 +1631,23 @@ proc recvFrom*(socket: Socket, data: var string, length: int,
   ##   so when `socket` is buffered the non-buffered implementation will be
   ##   used. Therefore if `socket` contains something in its buffer this
   ##   function will make no effort to return it.
-  template adaptRecvFromToDomain(domain: Domain) =
+  template adaptRecvFromToDomain(sockAddress: untyped, domain: Domain) =
     var addrLen = sizeof(sockAddress).SockLen
     result = recvfrom(socket.fd, cstring(data), length.cint, flags.cint,
                       cast[ptr SockAddr](addr(sockAddress)), addr(addrLen))
 
     if result != -1:
       data.setLen(result)
-      address = getAddrString(cast[ptr SockAddr](addr(sockAddress)))
-      when domain == AF_INET6:
-        port = ntohs(sockAddress.sin6_port).Port
+
+      when typeof(address) is string:
+        address = getAddrString(cast[ptr SockAddr](addr(sockAddress)))
+        when domain == AF_INET6:
+          port = ntohs(sockAddress.sin6_port).Port
+        else:
+          port = ntohs(sockAddress.sin_port).Port
       else:
-        port = ntohs(sockAddress.sin_port).Port
+        data.setLen(result)
+        sockAddress.fromSockAddr(addrLen, address, port)
     else:
       raiseOSError(osLastError())
 
@@ -1641,10 +1657,10 @@ proc recvFrom*(socket: Socket, data: var string, length: int,
   case socket.domain
   of AF_INET6:
     var sockAddress: Sockaddr_in6
-    adaptRecvFromToDomain(AF_INET6)
+    adaptRecvFromToDomain(sockAddress, AF_INET6)
   of AF_INET:
     var sockAddress: Sockaddr_in
-    adaptRecvFromToDomain(AF_INET)
+    adaptRecvFromToDomain(sockAddress, AF_INET)
   else:
     raise newException(ValueError, "Unknown socket address family")
 
@@ -1707,7 +1723,8 @@ proc sendTo*(socket: Socket, address: string, port: Port, data: pointer,
              tags: [WriteIOEffect].} =
   ## This proc sends `data` to the specified `address`,
   ## which may be an IP address or a hostname, if a hostname is specified
-  ## this function will try each IP of that hostname.
+  ## this function will try each IP of that hostname. This function
+  ## should normally be used with connection-less sockets (UDP sockets).
   ##
   ## If an error occurs an OSError exception will be raised.
   ##
@@ -1740,12 +1757,39 @@ proc sendTo*(socket: Socket, address: string, port: Port,
              data: string) {.tags: [WriteIOEffect].} =
   ## This proc sends `data` to the specified `address`,
   ## which may be an IP address or a hostname, if a hostname is specified
-  ## this function will try each IP of that hostname.
+  ## this function will try each IP of that hostname. Generally
+  ## for use with connection-less (UDP) sockets.
   ##
   ## If an error occurs an OSError exception will be raised.
   ##
   ## This is the high-level version of the above `sendTo` function.
   socket.sendTo(address, port, cstring(data), data.len, socket.domain)
+
+proc sendTo*(socket: Socket,
+             address: IpAddress, port: Port,
+             data: var string, size: int,
+             af: Domain = AF_INET, flags = 0'i32): int {.
+              discardable, tags: [WriteIOEffect].} =
+  ## This proc sends `data` to the specified `IpAddress`. 
+  ## Generally for use with connection-less (UDP) sockets. Also 
+  ## returns the number of bytes written.
+  ##
+  ## If an error occurs an OSError exception will be raised.
+  ##
+  ## This is the high-level version of the above `sendTo` function.
+  assert(socket.protocol != IPPROTO_TCP, "Cannot `sendTo` on a TCP socket")
+  assert(not socket.isClosed, "Cannot `sendTo` on a closed socket")
+
+  var sa: Sockaddr_storage
+  var sl: Socklen
+  toSockAddr(address, port, sa, sl)
+  let datasz = min(size, data.len())
+  result = sendto(socket.fd, cstring(data), datasz.cint, flags.cint,
+                  cast[ptr SockAddr](addr sa), sl)
+
+  if result == -1'i32:
+    let osError = osLastError()
+    raiseOSError(osError)
 
 
 proc isSsl*(socket: Socket): bool =
