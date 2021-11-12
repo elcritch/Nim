@@ -1958,6 +1958,31 @@ proc dial*(address: string, port: Port,
   else:
     raise newException(IOError, "Couldn't resolve address: " & address)
 
+proc connect*(socket: Socket, address: IpAddress,
+    port = Port(0)) {.tags: [ReadIOEffect].} =
+  ## Connects socket to `address`:`port`. `Address` can be an IP address or a
+  ## host name. If `address` is a host name, this function will try each IP
+  ## of that host name. `htons` is already performed on `port` so you must
+  ## not do it.
+  ##
+  ## If `socket` is an SSL socket a handshake will be automatically performed.
+  # try all possibilities:
+  var sa: Sockaddr_storage
+  var sl: Socklen
+  toSockAddr(address, port, sa, sl)
+
+  var lastError: OSErrorCode
+  var result = connect(socket.fd, cast[ptr SockAddr](addr sa), sl)
+  if result != 0'i32:
+    raiseOSError(lastError)
+
+  when defineSsl:
+    if socket.isSsl:
+      # RFC3546 for SNI specifies that IP addresses are not allowed.
+      ErrClearError()
+      let ret = SSL_connect(socket.sslHandle)
+      socketError(socket, ret)
+
 proc connect*(socket: Socket, address: string,
     port = Port(0)) {.tags: [ReadIOEffect].} =
   ## Connects socket to `address`:`port`. `Address` can be an IP address or a
