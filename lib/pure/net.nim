@@ -68,12 +68,14 @@ runnableExamples("-r:off -d:ssl"):
 
 runnableExamples("-r:off"):
   let socket = newSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-  socket.sendTo("192.168.0.1", Port(27960), "status\n")
+  let bytes = socket.sendTo("192.168.0.1", Port(27960), "status\n")
+  echo("sent: ", bytes)
 
 runnableExamples("-r:off"):
   let socket = newSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
   let ip = parseIpAddress("192.168.0.1")
-  socket.sendTo(ip, Port(27960), "status\n")
+  let bytes = socket.sendTo(ip, Port(27960), "status\n")
+  echo("sent: ", bytes)
 
 ## Creating a server
 ## -----------------
