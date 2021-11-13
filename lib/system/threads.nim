@@ -54,7 +54,13 @@ const
       1024*64*sizeof(int)-1
     else:
       1024*256*sizeof(int)-1
-  ThreadStackSize = ThreadStackMask+1 - StackGuardSize
+
+when defined(zephyr):
+  const
+    ThreadStackSize = ThreadStackMask+1 - StackGuardSize
+else:
+  var
+    ThreadStackSize* = 8192
 
 #const globalsSlot = ThreadVarSlot(0)
 #sysAssert checkSlot.int == globalsSlot.int
@@ -321,7 +327,12 @@ else:
     when hasSharedHeap: t.core.stackSize = ThreadStackSize
     var a {.noinit.}: Pthread_attr
     doAssert pthread_attr_init(a) == 0
-    let setstacksizeResult = pthread_attr_setstacksize(a, ThreadStackSize)
+    when defined(zephyr):
+      var stk = allocShared0(ThreadStackSize + 128)
+      let setstacksizeResult = pthread_attr_setstack(addr a, stk, ThreadStackSize)
+    else:
+      let setstacksizeResult = pthread_attr_setstacksize(a, ThreadStackSize)
+
     when not defined(ios):
       # This fails on iOS
       doAssert(setstacksizeResult == 0)
