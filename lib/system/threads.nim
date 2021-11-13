@@ -56,11 +56,11 @@ const
       1024*256*sizeof(int)-1
 
 when defined(zephyr):
-  const
-    ThreadStackSize = ThreadStackMask+1 - StackGuardSize
-else:
   var
     ThreadStackSize* = 8192
+else:
+  const
+    ThreadStackSize = ThreadStackMask+1 - StackGuardSize
 
 #const globalsSlot = ThreadVarSlot(0)
 #sysAssert checkSlot.int == globalsSlot.int
@@ -328,6 +328,7 @@ else:
     var a {.noinit.}: Pthread_attr
     doAssert pthread_attr_init(a) == 0
     when defined(zephyr):
+      echo "THEADS: ThreadStackSize ", ThreadStackSize
       var stk = allocShared0(ThreadStackSize + 128)
       let setstacksizeResult = pthread_attr_setstack(addr a, stk, ThreadStackSize)
     else:
