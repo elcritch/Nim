@@ -318,8 +318,6 @@ else:
     ## `TArg` can be `void` if you
     ## don't need to pass any data to the thread.
     t.core = cast[PGcThread](allocShared0(sizeof(GcThread)))
-    when defined(zephyr):
-      if ThreadStackSize == 0: ThreadStackSize = 8192
 
     when TArg isnot void: t.data = param
     t.dataFn = tp
