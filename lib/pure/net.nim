@@ -1777,8 +1777,7 @@ proc sendTo*(socket: Socket, address: string, port: Port, data: pointer,
   ## which may be an IP address or a hostname, if a hostname is specified
   ## this function will try each IP of that hostname.
   ##
-  ## If an error occurs an OSError exception will be raised. Otherwise
-  ## the number of bytes writen will be returned.
+  ## If an error occurs an OSError exception will be raised.
   ##
   ## **Note:** You may wish to use the high-level version of this function
   ## which is defined below.
@@ -1790,7 +1789,7 @@ proc sendTo*(socket: Socket, address: string, port: Port, data: pointer,
   # try all possibilities:
   var success = false
   var it = aiList
-  result = 0
+  var result = 0
   while it != nil:
     result = sendto(socket.fd, data, size.cint, flags.cint, it.ai_addr,
                     it.ai_addrlen.SockLen)
@@ -1805,17 +1804,16 @@ proc sendTo*(socket: Socket, address: string, port: Port, data: pointer,
   if not success:
     raiseOSError(osError)
 
-proc sendTo*(socket: Socket, address: string | IpAddress, port: Port,
-             data: string): int {.tags: [WriteIOEffect].} =
+proc sendTo*(socket: Socket, address: string, port: Port,
+             data: string) {.tags: [WriteIOEffect].} =
   ## This proc sends `data` to the specified `address`,
   ## which may be an IP address or a hostname, if a hostname is specified
   ## this function will try each IP of that hostname.
   ##
-  ## If an error occurs an OSError exception will be raised. Otherwise
-  ## the number of bytes writen will be returned.
+  ## If an error occurs an OSError exception will be raised.
   ##
   ## This is the high-level version of the above `sendTo` function.
-  result = socket.sendTo(address, port, cstring(data), data.len, socket.domain)
+  socket.sendTo(address, port, cstring(data), data.len, socket.domain)
 
 
 proc isSsl*(socket: Socket): bool =
