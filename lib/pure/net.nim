@@ -1771,8 +1771,8 @@ proc sendTo*(socket: Socket, address: IpAddress, port: Port, data: pointer,
     raiseOSError(osError)
 
 proc sendTo*(socket: Socket, address: string, port: Port, data: pointer,
-             size: int, af: Domain = AF_INET, flags = 0'i32): int {.
-             discardable, tags: [WriteIOEffect].} =
+             size: int, af: Domain = AF_INET, flags = 0'i32) {.
+             tags: [WriteIOEffect].} =
   ## This proc sends `data` to the specified `address`,
   ## which may be an IP address or a hostname, if a hostname is specified
   ## this function will try each IP of that hostname.
@@ -1806,7 +1806,7 @@ proc sendTo*(socket: Socket, address: string, port: Port, data: pointer,
     raiseOSError(osError)
 
 proc sendTo*(socket: Socket, address: string | IpAddress, port: Port,
-             data: string): int {.tags: [WriteIOEffect], discardable.} =
+             data: string): int {.tags: [WriteIOEffect].} =
   ## This proc sends `data` to the specified `address`,
   ## which may be an IP address or a hostname, if a hostname is specified
   ## this function will try each IP of that hostname.
