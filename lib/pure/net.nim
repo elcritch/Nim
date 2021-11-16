@@ -1633,10 +1633,10 @@ proc recvFrom*(socket: Socket;
   ##   so when `socket` is buffered the non-buffered implementation will be
   ##   used. Therefore if `socket` contains something in its buffer this
   ##   function will make no effort to return it.
+  data.setLen(length)
   var sockAddress: Sockaddr_storage
   var addrLen = sizeof(sockAddress).SockLen
-  let dataLen = min(length, data.len()).cint
-  result = recvfrom(socket.fd, cstring(data), dataLen, flags.cint,
+  result = recvfrom(socket.fd, cstring(data), length, flags.cint,
                     cast[ptr SockAddr](addr(sockAddress)), addr(addrLen))
 
   if result == 0: # posix says this indicates no packets waiting and peer has reset
