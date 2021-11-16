@@ -1743,8 +1743,10 @@ proc trySend*(socket: Socket, data: string): bool {.tags: [WriteIOEffect].} =
   ## and instead returns `false` on failure.
   result = send(socket, cstring(data), data.len) == data.len
 
-proc sendTo*(socket: Socket, address: IpAddress, port: Port, data: pointer,
-             size: int, af: Domain = AF_INET, flags = 0'i32): int {.
+proc sendTo*(socket: Socket;
+             address: IpAddress, port: Port,
+             data: var string, size: int,
+             af: Domain = AF_INET, flags = 0'i32): int {.
               discardable, tags: [WriteIOEffect].} =
   ## This proc sends `data` to the specified `IPAddress`. Hostnames
   ## are not supported for this variant.
@@ -1762,8 +1764,8 @@ proc sendTo*(socket: Socket, address: IpAddress, port: Port, data: pointer,
   var sa: Sockaddr_storage
   var sl: Socklen
   toSockAddr(address, port, sa, sl)
-
-  result = sendto(socket.fd, data, size.cint, flags.cint,
+  let datasz = min(size, data.len())
+  result = sendto(socket.fd, cstring(data), datasz.cint, flags.cint,
                   cast[ptr SockAddr](addr sa), sl)
 
   if result == -1'i32:
