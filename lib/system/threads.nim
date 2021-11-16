@@ -47,19 +47,20 @@
 when not declared(ThisIsSystem):
   {.error: "You must not import this module explicitly".}
 
-const
-  StackGuardSize = 4096
-  ThreadStackMask =
-    when defined(genode):
-      1024*64*sizeof(int)-1
-    else:
-      1024*256*sizeof(int)-1
-
 when defined(zephyr):
+
   var
-    ThreadStackSize* = 8192
+    StackGuardSize * {.importc: "K_THREAD_STACK_RESERVED", header: "<kernel.h>".}: csize_t
+    ThreadStackSize* {.threadvar.}: int
+
 else:
   const
+    StackGuardSize = 4096
+    ThreadStackMask =
+      when defined(genode):
+        1024*64*sizeof(int)-1
+      else:
+        1024*256*sizeof(int)-1
     ThreadStackSize = ThreadStackMask+1 - StackGuardSize
 
 #const globalsSlot = ThreadVarSlot(0)
@@ -321,6 +322,8 @@ else:
     ## `TArg` can be `void` if you
     ## don't need to pass any data to the thread.
     t.core = cast[PGcThread](allocShared0(sizeof(GcThread)))
+    when defined(zephyr):
+      if ThreadStackSize == 0: ThreadStackSize = 8192
 
     when TArg isnot void: t.data = param
     t.dataFn = tp
@@ -329,7 +332,9 @@ else:
     doAssert pthread_attr_init(a) == 0
     when defined(zephyr):
       echo "THEADS: ThreadStackSize ", ThreadStackSize
-      var stk = allocShared0(ThreadStackSize + 128)
+      var
+        rawStk = allocShared0(ThreadStackSize + StackGuardSize.int)
+        stk = cast[pointer](cast[csize_t](rawStk) + StackGuardSize.csize_t)
       let setstacksizeResult = pthread_attr_setstack(addr a, stk, ThreadStackSize)
     else:
       let setstacksizeResult = pthread_attr_setstacksize(a, ThreadStackSize)
