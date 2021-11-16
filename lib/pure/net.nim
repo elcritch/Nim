@@ -1619,6 +1619,35 @@ proc recvLine*(socket: Socket, timeout = -1,
   result = ""
   readLine(socket, result, timeout, flags, maxLength)
 
+proc recvFrom*(socket: Socket;
+               data: var string, length: int;
+               address: var IpAddress, port: var Port,
+               flags = 0'i32): int {.tags: [ReadIOEffect].} =
+  ## Receives data from `socket`. This function should normally be used with
+  ## connection-less sockets (UDP sockets).
+  ##
+  ## If an error occurs an OSError exception will be raised. Otherwise the return
+  ## value will be the length of data received.
+  ##
+  ## .. warning:: This function does not yet have a buffered implementation,
+  ##   so when `socket` is buffered the non-buffered implementation will be
+  ##   used. Therefore if `socket` contains something in its buffer this
+  ##   function will make no effort to return it.
+  var sockAddress: Sockaddr_storage
+  var addrLen = sizeof(sockAddress).SockLen
+  let dataLen = min(length, data.len()).cint
+  result = recvfrom(socket.fd, cstring(data), dataLen, flags.cint,
+                    cast[ptr SockAddr](addr(sockAddress)), addr(addrLen))
+
+  if result == 0: # posix says this indicates no packets waiting and peer has reset
+    data.setLen(0)
+  elif result > 0:
+    data.setLen(result)
+    sockAddress.fromSockAddr(addrLen, address, port)
+  else:
+    raiseOSError(osLastError())
+
+
 proc recvFrom*(socket: Socket, data: var string, length: int,
                address: var string, port: var Port, flags = 0'i32): int {.
                tags: [ReadIOEffect].} =
