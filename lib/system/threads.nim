@@ -47,17 +47,23 @@
 when not declared(ThisIsSystem):
   {.error: "You must not import this module explicitly".}
 
-const
-  StackGuardSize {.intdefine.} = 4096
-  ThreadStackMask {.intdefine.} =
-    when defined(genode):
-      1024*64*sizeof(int)-1
-    elif defined(zephyr):
-      8192
-    else:
-      1024*256*sizeof(int)-1
+when defined(zephyr):
+  const
+    StackGuardSize {.intdefine.} = 128
+    ThreadStackSizeDefault {.intdefine.} = 8192
+    ThreadStackSize = ThreadStackSizeDefault + StackGuardSize
+else:
+  const
+    StackGuardSize = 4096
+    ThreadStackMask =
+      when defined(genode):
+        1024*64*sizeof(int)-1
+      elif defined(zephyr):
+        8192
+      else:
+        1024*256*sizeof(int)-1
 
-  ThreadStackSize = ThreadStackMask+1 - StackGuardSize
+    ThreadStackSize = ThreadStackMask+1 - StackGuardSize
 
 #const globalsSlot = ThreadVarSlot(0)
 #sysAssert checkSlot.int == globalsSlot.int
