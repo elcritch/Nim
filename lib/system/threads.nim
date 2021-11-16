@@ -50,8 +50,7 @@ when not declared(ThisIsSystem):
 when defined(zephyr):
   const
     StackGuardSize {.intdefine.} = 128
-    ThreadStackSizeDefault {.intdefine.} = 8192
-    ThreadStackSize = ThreadStackSizeDefault + StackGuardSize
+    ThreadStackSize {.intdefine.} = 8192
 else:
   const
     StackGuardSize = 4096
@@ -331,8 +330,9 @@ else:
     var a {.noinit.}: Pthread_attr
     doAssert pthread_attr_init(a) == 0
     when defined(zephyr):
-      echo "THEADS: ThreadStackSize ", ThreadStackSize
-      var stk = allocShared0(ThreadStackSize + 128)
+      var
+        rawstk = allocShared0(ThreadStackSize + StackGuardSize)
+        stk = cast[pointer](cast[int](rawstk) + StackGuardSize)
       let setstacksizeResult = pthread_attr_setstack(addr a, stk, ThreadStackSize)
     else:
       let setstacksizeResult = pthread_attr_setstacksize(a, ThreadStackSize)
