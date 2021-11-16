@@ -1619,35 +1619,6 @@ proc recvLine*(socket: Socket, timeout = -1,
   result = ""
   readLine(socket, result, timeout, flags, maxLength)
 
-proc recvFrom*(socket: Socket;
-               data: var string, length: int;
-               address: var IpAddress, port: var Port,
-               flags = 0'i32): int {.tags: [ReadIOEffect].} =
-  ## Receives data from `socket`. This function should normally be used with
-  ## connection-less sockets (UDP sockets).
-  ##
-  ## If an error occurs an OSError exception will be raised. Otherwise the return
-  ## value will be the length of data received.
-  ##
-  ## .. warning:: This function does not yet have a buffered implementation,
-  ##   so when `socket` is buffered the non-buffered implementation will be
-  ##   used. Therefore if `socket` contains something in its buffer this
-  ##   function will make no effort to return it.
-  data.setLen(length)
-  var sockAddress: Sockaddr_storage
-  var addrLen = sizeof(sockAddress).SockLen
-  result = recvfrom(socket.fd, cstring(data), length, flags.cint,
-                    cast[ptr SockAddr](addr(sockAddress)), addr(addrLen))
-
-  if result == 0: # posix says this indicates no packets waiting and peer has reset
-    data.setLen(0)
-  elif result > 0:
-    data.setLen(result)
-    sockAddress.fromSockAddr(addrLen, address, port)
-  else:
-    raiseOSError(osLastError())
-
-
 proc recvFrom*(socket: Socket, data: var string, length: int,
                address: var string, port: var Port, flags = 0'i32): int {.
                tags: [ReadIOEffect].} =
@@ -2049,31 +2020,6 @@ proc dial*(address: string, port: Port,
   else:
     raise newException(IOError, "Couldn't resolve address: " & address)
 
-proc connect*(socket: Socket, address: IpAddress,
-    port = Port(0)) {.tags: [ReadIOEffect].} =
-  ## Connects socket to `address`:`port`. `Address` can be an IP address or a
-  ## host name. If `address` is a host name, this function will try each IP
-  ## of that host name. `htons` is already performed on `port` so you must
-  ## not do it.
-  ##
-  ## If `socket` is an SSL socket a handshake will be automatically performed.
-  # try all possibilities:
-  var sa: Sockaddr_storage
-  var sl: Socklen
-  toSockAddr(address, port, sa, sl)
-
-  var lastError: OSErrorCode
-  var result = connect(socket.fd, cast[ptr SockAddr](addr sa), sl)
-  if result != 0'i32:
-    raiseOSError(lastError)
-
-  when defineSsl:
-    if socket.isSsl:
-      # RFC3546 for SNI specifies that IP addresses are not allowed.
-      ErrClearError()
-      let ret = SSL_connect(socket.sslHandle)
-      socketError(socket, ret)
-
 proc connect*(socket: Socket, address: string,
     port = Port(0)) {.tags: [ReadIOEffect].} =
   ## Connects socket to `address`:`port`. `Address` can be an IP address or a
@@ -2112,8 +2058,6 @@ proc connect*(socket: Socket, address: string,
         if not isIpAddress(address):
           socket.checkCertName(address)
 
-<<<<<<< HEAD
-=======
 proc connect*(socket: Socket, address: IpAddress,
     port = Port(0)) {.tags: [ReadIOEffect].} =
   ## Connects socket to `address`:`port`. `Address` can be an IP address or a
@@ -2139,7 +2083,6 @@ proc connect*(socket: Socket, address: IpAddress,
       let ret = SSL_connect(socket.sslHandle)
       socketError(socket, ret)
 
->>>>>>> devel-std-net-improvements
 proc checkConnectAsync(ret: int, lastError: var OSErrorCode): bool =
   if ret == 0'i32:
     result = true
@@ -2153,31 +2096,6 @@ proc checkConnectAsync(ret: int, lastError: var OSErrorCode): bool =
       if lastError.int32 == EINTR or lastError.int32 == EINPROGRESS:
         result = true
 
-<<<<<<< HEAD
-proc connectAsync(socket: Socket, address: IpAddress, port = Port(0),
-                  af: Domain = AF_INET) {.tags: [ReadIOEffect].} =
-  ## A variant of `connect` for non-blocking sockets.
-  ##
-  ## This procedure will immediately return, it will not block until a connection
-  ## is made. It is up to the caller to make sure the connection has been established
-  ## by checking (using `select`) whether the socket is writeable.
-  ##
-  ## **Note**: For SSL sockets, the `handshake` procedure must be called
-  ## whenever the socket successfully connects to a server.
-  var sa: Sockaddr_storage
-  var sl: Socklen
-  toSockAddr(address, port, sa, sl)
-  
-  var success = false
-  var lastError: OSErrorCode
-
-  var ret = connect(socket.fd, cast[ptr SockAddr](addr sa), sl)
-  success = checkConnectAsync(ret, lastError)
-
-  if not success: raiseOSError(lastError)
-
-=======
->>>>>>> devel-std-net-improvements
 proc connectAsync(socket: Socket, name: string, port = Port(0),
                   af: Domain = AF_INET) {.tags: [ReadIOEffect].} =
   ## A variant of `connect` for non-blocking sockets.
@@ -2203,8 +2121,6 @@ proc connectAsync(socket: Socket, name: string, port = Port(0),
   freeaddrinfo(aiList)
   if not success: raiseOSError(lastError)
 
-<<<<<<< HEAD
-=======
 proc connectAsync(socket: Socket, address: IpAddress, port = Port(0),
                   af: Domain = AF_INET) {.tags: [ReadIOEffect].} =
   ## A variant of `connect` for non-blocking sockets. This version takes a parsed IpAddress,
@@ -2222,7 +2138,6 @@ proc connectAsync(socket: Socket, address: IpAddress, port = Port(0),
 
   if not success: raiseOSError(lastError)
 
->>>>>>> devel-std-net-improvements
 proc connect*(socket: Socket, address: string | IpAddress, port = Port(0),
     timeout: int) {.tags: [ReadIOEffect, WriteIOEffect].} =
   ## Connects to server as specified by `address` on port specified by `port`.
