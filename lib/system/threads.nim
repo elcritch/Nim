@@ -47,17 +47,22 @@
 when not declared(ThisIsSystem):
   {.error: "You must not import this module explicitly".}
 
-const
-  StackGuardSize {.intdefine.} = 4096
-  ThreadStackMask {.intdefine.} =
-    when defined(genode):
-      1024*64*sizeof(int)-1
-    elif defined(zephyr):
-      8192
-    else:
-      1024*256*sizeof(int)-1
+when defined(zephyr):
+  const
+    StackGuardSize {.intdefine.} = 128
+    ThreadStackSize {.intdefine.} = 8192
+else:
+  const
+    StackGuardSize = 4096
+    ThreadStackMask =
+      when defined(genode):
+        1024*64*sizeof(int)-1
+      elif defined(zephyr):
+        8192
+      else:
+        1024*256*sizeof(int)-1
 
-  ThreadStackSize = ThreadStackMask+1 - StackGuardSize
+    ThreadStackSize = ThreadStackMask+1 - StackGuardSize
 
 #const globalsSlot = ThreadVarSlot(0)
 #sysAssert checkSlot.int == globalsSlot.int
@@ -325,10 +330,9 @@ else:
     var a {.noinit.}: Pthread_attr
     doAssert pthread_attr_init(a) == 0
     when defined(zephyr):
-      echo "THEADS: ThreadStackSize ", ThreadStackSize
       var
-        rawStk = allocShared0(ThreadStackSize + StackGuardSize.int)
-        stk = cast[pointer](cast[csize_t](rawStk) + StackGuardSize.csize_t)
+        rawstk = allocShared0(ThreadStackSize + StackGuardSize)
+        stk = cast[pointer](cast[int](rawstk) + StackGuardSize)
       let setstacksizeResult = pthread_attr_setstack(addr a, stk, ThreadStackSize)
     else:
       let setstacksizeResult = pthread_attr_setstacksize(a, ThreadStackSize)
