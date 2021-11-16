@@ -47,21 +47,17 @@
 when not declared(ThisIsSystem):
   {.error: "You must not import this module explicitly".}
 
-when defined(zephyr):
+const
+  StackGuardSize {.intdefine.} = 4096
+  ThreadStackMask {.intdefine.} =
+    when defined(genode):
+      1024*64*sizeof(int)-1
+    elif defined(zephyr):
+      8192
+    else:
+      1024*256*sizeof(int)-1
 
-  var
-    StackGuardSize * {.importc: "K_THREAD_STACK_RESERVED", header: "<kernel.h>".}: csize_t
-    ThreadStackSize* {.threadvar.}: int
-
-else:
-  const
-    StackGuardSize = 4096
-    ThreadStackMask =
-      when defined(genode):
-        1024*64*sizeof(int)-1
-      else:
-        1024*256*sizeof(int)-1
-    ThreadStackSize = ThreadStackMask+1 - StackGuardSize
+  ThreadStackSize = ThreadStackMask+1 - StackGuardSize
 
 #const globalsSlot = ThreadVarSlot(0)
 #sysAssert checkSlot.int == globalsSlot.int
