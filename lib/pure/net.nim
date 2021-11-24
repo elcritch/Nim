@@ -49,11 +49,6 @@ runnableExamples("-r:off"):
   let socket = newSocket()
   socket.connect("google.com", Port(80))
 
-runnableExamples("-r:off"):
-  let socket = newSocket()
-  let ip = parseIpAddress("1.1.1.1")
-  socket.connect(ip, Port(80))
-
 ## For SSL, use the following example:
 
 runnableExamples("-r:off -d:ssl"):
