@@ -1763,7 +1763,7 @@ proc sendTo*(socket: Socket, address: string, port: Port,
   socket.sendTo(address, port, cstring(data), data.len, socket.domain)
 
 proc sendTo*(socket: Socket, address: IpAddress, port: Port,
-             data: var string, flags = 0'i32): int {.
+             data: string, flags = 0'i32): int {.
               discardable, tags: [WriteIOEffect].} =
   ## This proc sends `data` to the specified `IpAddress` and returns
   ## the number of bytes written. 
