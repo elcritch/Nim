@@ -1771,6 +1771,7 @@ proc sendTo*(socket: Socket,
              af: Domain = AF_INET, flags = 0'i32): int {.
               discardable, tags: [WriteIOEffect].} =
   ## This proc sends `data` to the specified `IpAddress`. 
+  ##
   ## Generally for use with connection-less (UDP) sockets. Also 
   ## returns the number of bytes written.
   ##
