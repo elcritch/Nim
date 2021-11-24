@@ -1622,7 +1622,7 @@ proc recvFrom*[T: string | IpAddress](socket: Socket, data: var string, length: 
                tags: [ReadIOEffect].} =
   ## Receives data from `socket`. This function should normally be used with
   ## connection-less sockets (UDP sockets). The source address of the data
-  ## packet is returned as either a string or an IpAddress.
+  ## packet is stored in the `address` argument as either a string or an IpAddress.
   ##
   ## If an error occurs an OSError exception will be raised. Otherwise the return
   ## value will be the length of data received.
@@ -1654,6 +1654,7 @@ proc recvFrom*[T: string | IpAddress](socket: Socket, data: var string, length: 
   assert(socket.protocol != IPPROTO_TCP, "Cannot `recvFrom` on a TCP socket")
   # TODO: Buffered sockets
   data.setLen(length)
+
   case socket.domain
   of AF_INET6:
     var sockAddress: Sockaddr_in6
@@ -1757,23 +1758,22 @@ proc sendTo*(socket: Socket, address: string, port: Port,
              data: string) {.tags: [WriteIOEffect].} =
   ## This proc sends `data` to the specified `address`,
   ## which may be an IP address or a hostname, if a hostname is specified
-  ## this function will try each IP of that hostname. Generally
-  ## for use with connection-less (UDP) sockets.
+  ## this function will try each IP of that hostname.
+  ## 
+  ## Generally for use with connection-less (UDP) sockets.
   ##
   ## If an error occurs an OSError exception will be raised.
   ##
   ## This is the high-level version of the above `sendTo` function.
   socket.sendTo(address, port, cstring(data), data.len, socket.domain)
 
-proc sendTo*(socket: Socket,
-             address: IpAddress, port: Port,
-             data: var string, size: int,
-             af: Domain = AF_INET, flags = 0'i32): int {.
+proc sendTo*(socket: Socket, address: IpAddress, port: Port,
+             data: var string, flags = 0'i32): int {.
               discardable, tags: [WriteIOEffect].} =
-  ## This proc sends `data` to the specified `IpAddress`. 
+  ## This proc sends `data` to the specified `IpAddress` and returns
+  ## the number of bytes written. 
   ##
-  ## Generally for use with connection-less (UDP) sockets. Also 
-  ## returns the number of bytes written.
+  ## Generally for use with connection-less (UDP) sockets. 
   ##
   ## If an error occurs an OSError exception will be raised.
   ##
@@ -1784,8 +1784,7 @@ proc sendTo*(socket: Socket,
   var sa: Sockaddr_storage
   var sl: Socklen
   toSockAddr(address, port, sa, sl)
-  let datasz = min(size, data.len())
-  result = sendto(socket.fd, cstring(data), datasz.cint, flags.cint,
+  result = sendto(socket.fd, cstring(data), data.len().cint, flags.cint,
                   cast[ptr SockAddr](addr sa), sl)
 
   if result == -1'i32:
