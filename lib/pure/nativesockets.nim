@@ -240,6 +240,25 @@ else:
     else:
       result = cint(ord(p))
 
+proc initSocketAddress*(domain: Domain): SocketAddress =
+  result = SocketAddress(domain: domain)
+  case domain
+  of AF_INET:
+    when useWinVersion:
+      result.sin_family = uint16(ord(AF_INET))
+    else:
+      result.inet.sin_family = TSa_Family(posix.AF_INET)
+  of AF_INET6:
+    when useWinVersion:
+      result.inet6.sin6_family = uint16(ord(AF_INET6))
+    else:
+      result.inet6.sin6_family = TSa_Family(posix.AF_INET6)
+  of AF_UNIX:
+    when defined(posix):
+      result.unix.sun_family = TSa_Family(posix.AF_UNIX)
+  of AF_UNSPEC:
+    result.storage.ss_family = TSa_Family(posix.AF_UNSPEC)
+
 proc getPort*(sa: SocketAddress): Port =
   ## Get port on socket address
   case sa.domain:
@@ -247,10 +266,8 @@ proc getPort*(sa: SocketAddress): Port =
     result = Port(ntohs(sa.inet.sin_port))
   of AF_INET6:
     result = Port(ntohs(sa.inet6.sin6_port))
-  of AF_UNIX:
-    raise newException(ValueError, "no port for unix domains")
-  of AF_UNSPEC:
-    raise newException(ValueError, "no port for unspecified domains")
+  of AF_UNIX, AF_UNSPEC:
+    raise newException(ValueError, "only have ports on IPv4/IPv6")
 
 proc setPort*(sa: var SocketAddress, port: Port) =
   ## Set port on socket address
@@ -259,12 +276,53 @@ proc setPort*(sa: var SocketAddress, port: Port) =
     sa.inet.sin_port = htons(uint16(port)) 
   of AF_INET6:
     sa.inet6.sin6_port = htons(uint16(port)) 
-  of AF_UNIX:
-    raise newException(ValueError, "no port for unix domains")
-  of AF_UNSPEC:
-    raise newException(ValueError, "no port for unspecified domains")
+  of AF_UNIX, AF_UNSPEC:
+    raise newException(ValueError, "only have ports on IPv4/IPv6")
 
-proc getSockLen*(sa: SocketAddress): SockLen =
+proc getFamily*(sa: SocketAddress): TSa_Family =
+  ## Get domain on socket address
+  case sa.domain:
+  of AF_INET:
+    result = sa.inet.sin_family
+  of AF_INET6:
+    result = sa.inet6.sin6_family
+  of AF_UNIX:
+    result = sa.unix.sun_family
+  of AF_UNSPEC:
+    result = sa.storage.ss_family
+
+proc unsafeSockAddrPtr*(sa: SocketAddress): ptr SockAddr =
+  ## Socket len
+  case sa.domain:
+  of AF_INET:
+    result = cast[ptr SockAddr](unsafeAddr(sa.inet))
+  of AF_INET6:
+    result = cast[ptr SockAddr](unsafeAddr(sa.inet6))
+  of AF_UNIX:
+    result = cast[ptr SockAddr](unsafeAddr(sa.unix))
+  of AF_UNSPEC:
+    result = cast[ptr SockAddr](unsafeAddr(sa.storage))
+
+proc unsafeInAddrPtr*(sa: SocketAddress): ptr InAddr =
+  ## Socket len
+  case sa.domain:
+  of AF_INET:
+    result = cast[ptr InAddr](unsafeAddr(sa.inet.sin_addr))
+  of AF_INET6:
+    result = cast[ptr InAddr](unsafeAddr(sa.inet6.sin6_addr))
+  of AF_UNIX, AF_UNSPEC:
+    raise newException(ValueError, "only have InAddr for IPv4/IPv6")
+
+proc isAddrV4mapped*(sa: SocketAddress): bool {.inline.} =
+  result = false
+  when defined(posix) and not defined(nimdoc) and not defined(zephyr):
+    case sa.domain:
+    of AF_INET6:
+      result = posix.IN6_IS_ADDR_V4MAPPED(unsafeAddr sa.inet6.sin6_addr) != 0
+    else:
+      result = false
+
+proc sockLen*(sa: SocketAddress): SockLen =
   ## Socket len
   case sa.domain:
   of AF_INET:
@@ -348,6 +406,9 @@ proc createNativeSocket*(domain: Domain = AF_INET,
 proc bindAddr*(socket: SocketHandle, name: ptr SockAddr,
     namelen: SockLen): cint =
   result = bindSocket(socket, name, namelen)
+
+proc bindAddr*(socket: SocketHandle, name: SocketAddress): cint =
+  result = bindSocket(socket, name.unsafeSockAddrPtr(), name.sockLen())
 
 proc listen*(socket: SocketHandle, backlog = SOMAXCONN): cint {.tags: [
     ReadIOEffect].} =
@@ -580,6 +641,26 @@ when not useNimNetLite:
       raise newException(IOError, "Unknown socket family in getAddrString")
     setLen(strAddress, len(cstring(strAddress)))
 
+  proc getAddrString*(sockAddr: SocketAddress, strAddress: var string) =
+    ## Stores in `strAddress` the string representation of the address inside
+    ## `sockAddr`
+    ##
+    ## **Note**
+    ## * `strAddress` must be initialized to 46 in length.
+    const length = 46
+    assert(length >= len(strAddress),
+          "`strAddress` was not initialized correctly. 46 != `len(strAddress)`")
+    
+    ## Set port on socket address
+    let inaddr = sockAddr.unsafeInAddrPtr()
+    let domain = sockAddr.domain.toInt()
+    if inet_ntop(domain, inaddr, addr strAddress[0], strAddress.len.int32) == nil:
+        raiseOSError(osLastError())
+    if sockAddr.isAddrV4mapped():
+      strAddress.setSlice("::ffff:".len..<length)
+    
+    setLen(strAddress, len(cstring(strAddress)))
+
   when defined(posix) and not defined(nimdoc):
     proc makeUnixAddr*(path: string): Sockaddr_un =
       result.sun_family = AF_UNIX.TSa_Family
@@ -602,42 +683,16 @@ when not useNimNetLite:
       raiseOSError(osLastError())
     result = Port(nativesockets.ntohs(name.sin_port))
 
-  proc getLocalAddr*(socket: SocketHandle, domain: Domain): (string, Port) =
+  proc getSocketAddress*(socket: SocketHandle, domain: Domain): SocketAddress =
     ## Returns the socket's local address and port number.
     ##
     ## Similar to POSIX's `getsockname`:idx:.
-    case domain
-    of AF_INET:
-      var name: Sockaddr_in
-      when useWinVersion:
-        name.sin_family = uint16(ord(AF_INET))
-      else:
-        name.sin_family = TSa_Family(posix.AF_INET)
-      var namelen = sizeof(name).SockLen
-      if getsockname(socket, cast[ptr SockAddr](addr(name)),
-                    addr(namelen)) == -1'i32:
+    var sa = initSocketAddress(domain = domain)
+    var sl: SockLen
+    if getsockname(socket, sa.unsafeSockAddrPtr(), addr sl) == -1'i32:
         raiseOSError(osLastError())
-      result = ($inet_ntoa(name.sin_addr),
-                Port(nativesockets.ntohs(name.sin_port)))
-    of AF_INET6:
-      var name: Sockaddr_in6
-      when useWinVersion:
-        name.sin6_family = uint16(ord(AF_INET6))
-      else:
-        name.sin6_family = TSa_Family(posix.AF_INET6)
-      var namelen = sizeof(name).SockLen
-      if getsockname(socket, cast[ptr SockAddr](addr(name)),
-                    addr(namelen)) == -1'i32:
-        raiseOSError(osLastError())
-      # Cannot use INET6_ADDRSTRLEN here, because it's a C define.
-      result[0] = newString(64)
-      if inet_ntop(name.sin6_family.cint,
-          addr name.sin6_addr, addr result[0][0], (result[0].len+1).int32).isNil:
-        raiseOSError(osLastError())
-      setLen(result[0], result[0].cstring.len)
-      result[1] = Port(nativesockets.ntohs(name.sin6_port))
-    else:
-      raiseOSError(OSErrorCode(-1), "invalid socket family in getLocalAddr")
+    assert sl == sa.sockLen()
+    assert sa.domain.int32 == sa.getFamily().int32
 
   proc getPeerAddr*(socket: SocketHandle, domain: Domain): (string, Port) =
     ## Returns the socket's peer address and port number.
