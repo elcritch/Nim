@@ -94,6 +94,20 @@ type
     length*: int
     addrList*: seq[string]
 
+  SocketAddress* = object         ## stores a socket address
+    case domain*: Domain          ## the type of the socket address (generally IPv4 or IPv6)
+    of Domain.AF_INET6:
+      sockaddr_inet6*: Sockaddr_in6 ## Contains a struct socketaddr_in6
+                                       ## case of IPv6
+    of Domain.AF_INET:
+      sockaddr_inet*: Sockaddr_in ## Contains a struct socketaddr_in
+                                       ## case of IPv4
+    of Domain.AF_UNIX:
+      sockaddr_unix*: Sockaddr_un ## Contains a struct socketaddr_in
+                                       ## case of Unix socket
+    of Domain.AF_UNSPEC:
+      sockaddr_storage*: Sockaddr_storage ## Contains a struct socketaddr_in
+
 when useWinVersion:
   let
     osInvalidSocket* = winlean.INVALID_SOCKET
