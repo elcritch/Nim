@@ -97,16 +97,16 @@ type
   SocketAddress* = object         ## stores a socket address
     case domain*: Domain          ## the type of the socket address (generally IPv4 or IPv6)
     of Domain.AF_INET6:
-      sockaddr_inet6*: Sockaddr_in6 ## Contains a struct socketaddr_in6
+      inet6*: Sockaddr_in6 ## Contains a struct socketaddr_in6
                                        ## case of IPv6
     of Domain.AF_INET:
-      sockaddr_inet*: Sockaddr_in ## Contains a struct socketaddr_in
+      inet*: Sockaddr_in ## Contains a struct socketaddr_in
                                        ## case of IPv4
     of Domain.AF_UNIX:
-      sockaddr_unix*: Sockaddr_un ## Contains a struct socketaddr_in
+      unix*: Sockaddr_un ## Contains a struct socketaddr_in
                                        ## case of Unix socket
     of Domain.AF_UNSPEC:
-      sockaddr_storage*: Sockaddr_storage ## Contains a struct socketaddr_in
+      storage*: Sockaddr_storage ## Contains a struct socketaddr_in
 
 when useWinVersion:
   let
@@ -144,6 +144,35 @@ proc toInt*(typ: SockType): cint
 
 proc toInt*(p: Protocol): cint
   ## Converts the Protocol enum to a platform-dependent `cint`.
+
+proc ntohl*(x: uint32): uint32 =
+  ## Converts 32-bit unsigned integers from network to host byte order.
+  ## On machines where the host byte order is the same as network byte order,
+  ## this is a no-op; otherwise, it performs a 4-byte swap operation.
+  when cpuEndian == bigEndian: result = x
+  else: result = (x shr 24'u32) or
+                  (x shr 8'u32 and 0xff00'u32) or
+                  (x shl 8'u32 and 0xff0000'u32) or
+                  (x shl 24'u32)
+
+proc ntohs*(x: uint16): uint16 =
+  ## Converts 16-bit unsigned integers from network to host byte order. On
+  ## machines where the host byte order is the same as network byte order,
+  ## this is a no-op; otherwise, it performs a 2-byte swap operation.
+  when cpuEndian == bigEndian: result = x
+  else: result = (x shr 8'u16) or (x shl 8'u16)
+
+template htonl*(x: uint32): untyped =
+  ## Converts 32-bit unsigned integers from host to network byte order. On
+  ## machines where the host byte order is the same as network byte order,
+  ## this is a no-op; otherwise, it performs a 4-byte swap operation.
+  nativesockets.ntohl(x)
+
+template htons*(x: uint16): untyped =
+  ## Converts 16-bit unsigned integers from host to network byte order.
+  ## On machines where the host byte order is the same as network byte
+  ## order, this is a no-op; otherwise, it performs a 2-byte swap operation.
+  nativesockets.ntohs(x)
 
 when not useWinVersion:
   proc toInt(domain: Domain): cint =
@@ -210,6 +239,42 @@ else:
       result = 58.cint
     else:
       result = cint(ord(p))
+
+proc getPort*(sa: SocketAddress): Port =
+  ## Get port on socket address
+  case sa.domain:
+  of AF_INET:
+    result = Port(ntohs(sa.inet.sin_port))
+  of AF_INET6:
+    result = Port(ntohs(sa.inet6.sin6_port))
+  of AF_UNIX:
+    raise newException(ValueError, "no port for unix domains")
+  of AF_UNSPEC:
+    raise newException(ValueError, "no port for unspecified domains")
+
+proc setPort*(sa: var SocketAddress, port: Port) =
+  ## Set port on socket address
+  case sa.domain:
+  of AF_INET:
+    sa.inet.sin_port = htons(uint16(port)) 
+  of AF_INET6:
+    sa.inet6.sin6_port = htons(uint16(port)) 
+  of AF_UNIX:
+    raise newException(ValueError, "no port for unix domains")
+  of AF_UNSPEC:
+    raise newException(ValueError, "no port for unspecified domains")
+
+proc getSockLen*(sa: SocketAddress): SockLen =
+  ## Socket len
+  case sa.domain:
+  of AF_INET:
+    result = SockLen(sizeof(sa.inet))
+  of AF_INET6:
+    result = SockLen(sizeof(sa.inet6))
+  of AF_UNIX:
+    result = SockLen(sizeof(sa.unix))
+  of AF_UNSPEC:
+    result = SockLen(sizeof(sa.storage))
 
 proc toSockType*(protocol: Protocol): SockType =
   result = case protocol
@@ -320,35 +385,6 @@ proc getAddrInfo*(address: string, port: Port, domain: Domain = AF_INET,
       raiseOSError(osLastError())
     else:
       raiseOSError(osLastError(), $gai_strerror(gaiResult))
-
-proc ntohl*(x: uint32): uint32 =
-  ## Converts 32-bit unsigned integers from network to host byte order.
-  ## On machines where the host byte order is the same as network byte order,
-  ## this is a no-op; otherwise, it performs a 4-byte swap operation.
-  when cpuEndian == bigEndian: result = x
-  else: result = (x shr 24'u32) or
-                  (x shr 8'u32 and 0xff00'u32) or
-                  (x shl 8'u32 and 0xff0000'u32) or
-                  (x shl 24'u32)
-
-proc ntohs*(x: uint16): uint16 =
-  ## Converts 16-bit unsigned integers from network to host byte order. On
-  ## machines where the host byte order is the same as network byte order,
-  ## this is a no-op; otherwise, it performs a 2-byte swap operation.
-  when cpuEndian == bigEndian: result = x
-  else: result = (x shr 8'u16) or (x shl 8'u16)
-
-template htonl*(x: uint32): untyped =
-  ## Converts 32-bit unsigned integers from host to network byte order. On
-  ## machines where the host byte order is the same as network byte order,
-  ## this is a no-op; otherwise, it performs a 4-byte swap operation.
-  nativesockets.ntohl(x)
-
-template htons*(x: uint16): untyped =
-  ## Converts 16-bit unsigned integers from host to network byte order.
-  ## On machines where the host byte order is the same as network byte
-  ## order, this is a no-op; otherwise, it performs a 2-byte swap operation.
-  nativesockets.ntohs(x)
 
 proc getSockDomain*(socket: SocketHandle): Domain =
   ## Returns the socket's domain (AF_INET or AF_INET6).
