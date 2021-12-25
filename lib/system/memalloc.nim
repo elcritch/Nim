@@ -67,24 +67,33 @@ when hasAlloc and not defined(js):
   type AllocStats* = object
     allocCount: int
     deallocCount: int
-
-  proc `-`*(a, b: AllocStats): AllocStats =
-    result.allocCount = a.allocCount - b.allocCount
-    result.deallocCount = a.deallocCount - b.deallocCount
-
-  template dumpAllocstats*(code: untyped) =
-    let stats1 = getAllocStats()
-    code
-    let stats2 = getAllocStats()
-    echo $(stats2 - stats1)
+    reallocCount: int
+    allocBytes: int
 
   when defined(nimAllocStats):
+
+    proc `-`*(a, b: AllocStats): AllocStats =
+      result.allocCount = a.allocCount - b.allocCount
+      result.deallocCount = a.deallocCount - b.deallocCount
+      result.reallocCount = a.reallocCount - b.reallocCount
+      result.allocBytes = a.allocBytes - b.allocBytes
+
+    template dumpAllocstats*(code: untyped) =
+      let stats1 = getAllocStats()
+      code
+      let stats2 = getAllocStats()
+      echo $(stats2 - stats1)
+
     var stats: AllocStats
     template incStat(what: untyped) = inc stats.what
+    template incStat(what: untyped, count: untyped) = inc stats.what, count
     proc getAllocStats*(): AllocStats = stats
 
   else:
     template incStat(what: untyped) = discard
+    template incStat(what: untyped, count: untyped) = discard
+    template dumpAllocstats*(code: untyped) =
+      code
     proc getAllocStats*(): AllocStats = discard
 
   template alloc*(size: Natural): pointer =
@@ -101,6 +110,7 @@ when hasAlloc and not defined(js):
     ## See also:
     ## * `alloc0 <#alloc0.t,Natural>`_
     incStat(allocCount)
+    incStat(allocBytes, size)
     allocImpl(size)
 
   proc createU*(T: typedesc, size = 1.Positive): ptr T {.inline, benign, raises: [].} =
@@ -132,6 +142,7 @@ when hasAlloc and not defined(js):
     ## The allocated memory belongs to its allocating thread!
     ## Use `allocShared0 <#allocShared0.t,Natural>`_ to allocate from a shared heap.
     incStat(allocCount)
+    incStat(allocBytes, size)
     alloc0Impl(size)
 
   proc create*(T: typedesc, size = 1.Positive): ptr T {.inline, benign, raises: [].} =
@@ -161,6 +172,7 @@ when hasAlloc and not defined(js):
     ## The allocated memory belongs to its allocating thread!
     ## Use `reallocShared <#reallocShared.t,pointer,Natural>`_ to reallocate
     ## from a shared heap.
+    incStat(reallocCount)
     reallocImpl(p, newSize)
 
   template realloc0*(p: pointer, oldSize, newSize: Natural): pointer =
@@ -221,6 +233,7 @@ when hasAlloc and not defined(js):
     ## See also:
     ## * `allocShared0 <#allocShared0.t,Natural>`_.
     incStat(allocCount)
+    incStat(allocBytes, size.int)
     allocSharedImpl(size)
 
   proc createSharedU*(T: typedesc, size = 1.Positive): ptr T {.inline, tags: [],
@@ -251,6 +264,7 @@ when hasAlloc and not defined(js):
     ## containing zero, so it is somewhat safer than
     ## `allocShared <#allocShared.t,Natural>`_.
     incStat(allocCount)
+    incStat(allocBytes, size)
     allocShared0Impl(size)
 
   proc createShared*(T: typedesc, size = 1.Positive): ptr T {.inline.} =
@@ -275,6 +289,7 @@ when hasAlloc and not defined(js):
     ## `deallocShared(p)`.
     ## In other cases the block has to be freed with
     ## `deallocShared <#deallocShared,pointer>`_.
+    incStat(reallocCount)
     reallocSharedImpl(p, newSize)
 
   template reallocShared0*(p: pointer, oldSize, newSize: Natural): pointer =
@@ -289,6 +304,7 @@ when hasAlloc and not defined(js):
     ## `deallocShared(p)`.
     ## In other cases the block has to be freed with
     ## `deallocShared <#deallocShared,pointer>`_.
+    incStat(reallocCount)
     reallocShared0Impl(p, oldSize, newSize)
 
   proc resizeShared*[T](p: ptr T, newSize: Natural): ptr T {.inline, raises: [].} =
