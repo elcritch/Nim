@@ -964,6 +964,15 @@ type BuildCache = object
   depfiles: seq[(string, string)]
   nimexe: string
 
+proc jsonCacheMatches*(buildcache: BuildCache, jsonfile: AbsoluteFile): bool =
+  ## check if buildcache matches existing buildcache to avoid re-writing it
+  if jsonfile.fileExists():
+    try:
+      let oldbcache = jsonfile.string.parseFile().jsonTo(BuildCache)
+      result = buildcache == oldbcache
+    except JsonParsingError:
+      result = false
+
 proc writeJsonBuildInstructions*(conf: ConfigRef) =
   var linkFiles = collect(for it in conf.externalToLink:
     var it = it
@@ -991,7 +1000,9 @@ proc writeJsonBuildInstructions*(conf: ConfigRef) =
         (path, $secureHashFile(path)))
     bcache.nimexe = hashNimExe()
   conf.jsonBuildFile = conf.jsonBuildInstructionsFile
-  conf.jsonBuildFile.string.writeFile(bcache.toJson.pretty)
+  # only write if the cache is stale to help with exernal build systems
+  if not bcache.jsonCacheMatches(conf.jsonBuildFile):
+    conf.jsonBuildFile.string.writeFile(bcache.toJson.pretty)
 
 proc changeDetectedViaJsonBuildInstructions*(conf: ConfigRef; jsonFile: AbsoluteFile): bool =
   if not fileExists(jsonFile) or not fileExists(conf.absOutFile): return true
