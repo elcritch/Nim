@@ -2,9 +2,9 @@ import hashes
 
 const chash* = staticRead("testing.c").hash()
 {.emit: "#include <testing.c>".}
-proc cversion*(): Hash {.exportc.} =
+proc cversion*(): Hash {.exportc: "cversion_" & $chash.} =
   chash
 
-proc add(a, b: cint): cint {.importc.}
+proc add*(a, b: cint): cint {.importc.}
 
-echo add(1, 2)
+# echo add(1, 2)
