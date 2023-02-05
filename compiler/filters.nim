@@ -12,6 +12,8 @@
 import
   llstream, idents, strutils, ast, msgs, options,
   renderer, pathutils
+import std / sha1
+import lineinfos
 
 proc invalidPragma(conf: ConfigRef; n: PNode) =
   localError(conf, n.info,
@@ -69,4 +71,15 @@ proc filterReplace*(conf: ConfigRef; stdin: PLLStream, filename: AbsoluteFile, c
   var line = newStringOfCap(80)
   while llStreamReadLine(stdin, line):
     llStreamWriteln(result, replace(line, sub, by))
+  llStreamClose(stdin)
+
+proc filterIncludeRawC*(conf: ConfigRef; stdin: PLLStream, filename: AbsoluteFile): PLLStream =
+  rawMessage(conf, warnUser, "filterIncludeRawC: " & filename.string)
+  let chash = $secureHashFile(filename.string)
+  rawMessage(conf, warnUser, "filterIncludeRawC:hash: " & chash)
+  result = llStreamOpen("")
+  llStreamWriteln(result, """import hashes""")
+  # llStreamWriteln(result, """const chash* = staticRead("""" & $filename & """").hash() """)
+  llStreamWriteln(result, """let chash = """" & chash & '"')
+  llStreamWriteln(result, """{.emit: "#include <""" & $filename & """> ".} """)
   llStreamClose(stdin)

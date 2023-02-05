@@ -24,6 +24,7 @@ type
     filtTemplate = "stdtmpl"
     filtReplace = "replace"
     filtStrip = "strip"
+    filtRawC = "rawc"
 
 proc utf8Bom(s: string): int =
   if s.len >= 3 and s[0] == '\xEF' and s[1] == '\xBB' and s[2] == '\xBF':
@@ -76,9 +77,16 @@ proc getCallee(conf: ConfigRef; n: PNode): PIdent =
   else:
     localError(conf, n.info, "invalid filter: " & renderTree(n))
 
+const cExtensions = [".c", ".h", ".hpp", ".cpp", ".cxx", ".cc", ".c++"]
+
 proc applyFilter(p: var Parser, n: PNode, filename: AbsoluteFile,
                  stdin: PLLStream): PLLStream =
-  var f = getFilter(getCallee(p.lex.config, n))
+  rawMessage(p.lex.config, warnUser, "APPLY FILTER: " & filename.string)
+  var f =
+    if filename.splitFile().ext in cExtensions:
+      filtRawC
+    else:
+      getFilter(getCallee(p.lex.config, n))
   result = case f
            of filtNone:
              stdin
@@ -88,6 +96,8 @@ proc applyFilter(p: var Parser, n: PNode, filename: AbsoluteFile,
              filterStrip(p.lex.config, stdin, filename, n)
            of filtReplace:
              filterReplace(p.lex.config, stdin, filename, n)
+           of filtRawC:
+             filterIncludeRawC(p.lex.config, stdin, filename)
   if f != filtNone:
     assert p.lex.config != nil
     if p.lex.config.hasHint(hintCodeBegin):
@@ -115,7 +125,11 @@ proc openParser*(p: var Parser, fileIdx: FileIndex, inputstream: PLLStream;
                   cache: IdentCache; config: ConfigRef) =
   assert config != nil
   let filename = toFullPathConsiderDirty(config, fileIdx)
-  var pipe = parsePipe(filename, inputstream, cache, config)
+  var pipe =
+    if filename.splitFile().ext in cExtensions:
+      newNode(nkElse)
+    else:
+      parsePipe(filename, inputstream, cache, config)
   p.lex.config = config
   let s = if pipe != nil: evalPipe(p, pipe, filename, inputstream)
           else: inputstream

@@ -1,0 +1,10 @@
+#? stdtmpl(subsChar = '$', metaChar = '#')
+#proc generateXML(name, age: string): string =
+#  result = ""
+<xml>
+  <name>$name</name>
+  <age>$age</age>
+  <version>11</version>
+</xml>
+
+
