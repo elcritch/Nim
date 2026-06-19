@@ -1522,7 +1522,9 @@ proc genProcLvl3*(m: BModule, prc: PSym) =
     # cfsProcs emitters (NimMain block, trav markers, ...) never end up
     # inside a definition's span.
     var defFlags = ""
-    if sfExportc in prc.flags or sfConstructor in prc.flags: defFlags.add 'x'
+    if sfExportc in prc.flags or sfExportNimAbi in prc.flags or
+        sfConstructor in prc.flags:
+      defFlags.add 'x'
     if sfCompilerProc in prc.flags: defFlags.add 'c'
     if prc.kind == skMethod or sfDispatcher in prc.flags: defFlags.add 'm'
     if (prc.typ == nil or prc.typ.callConv != ccInline) and

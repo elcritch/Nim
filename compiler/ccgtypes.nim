@@ -106,8 +106,9 @@ proc isSharedInstanceCName(m: BModule; s: PSym): bool =
 proc fillBackendName(m: BModule; s: PSym) =
   if s.loc.snippet == "":
     var result: Rope
-    if s.kind in routineKinds and {optCDebug, optItaniumMangle} * m.g.config.globalOptions == {optCDebug, optItaniumMangle} and
-      m.g.config.symbolFiles == disabledSf:
+    if s.kind in routineKinds and (sfExportNimAbi in s.flags or
+        ({optCDebug, optItaniumMangle} * m.g.config.globalOptions == {optCDebug, optItaniumMangle} and
+          m.g.config.symbolFiles == disabledSf)):
       result = mangleProc(m, s, false).rope
     else:
       let shared = sharedInstanceCName(m, s)

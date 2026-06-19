@@ -3821,6 +3821,7 @@ proc expr(p: BProc, n: PNode, d: var TLoc) =
       elif prc.skipGenericOwner.kind == skModule and sfCompileTime notin prc.flags:
         if ({sfExportc, sfCompilerProc} * prc.flags == {sfExportc}) or
             (sfExportc in prc.flags and lfExportLib in prc.loc.flags) or
+            sfExportNimAbi in prc.flags or
             (prc.kind == skMethod):
           # due to a bug/limitation in the lambda lifting, unused inner procs
           # are not transformed correctly. We work around this issue (#411) here

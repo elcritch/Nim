@@ -2581,6 +2581,10 @@ proc semProcAux(c: PContext, n: PNode, kind: TSymKind,
 
   if {sfError, sfExportc} * s.flags == {sfError, sfExportc}:
     localError(c.config, n.info, "{.error.} and {.exportc.} pragmas are incompatible")
+  if {sfExportNimAbi, sfExportc} * s.flags == {sfExportNimAbi, sfExportc}:
+    localError(c.config, n.info, "{.exportnimabi.} and {.exportc.} pragmas are incompatible")
+  if {sfExportNimAbi, sfImportc} * s.flags == {sfExportNimAbi, sfImportc}:
+    localError(c.config, n.info, "{.exportnimabi.} and {.importc.} pragmas are incompatible")
 
   if n[pragmasPos].kind != nkEmpty and sfBorrow notin s.flags:
     setEffectsForProcType(c.graph, s.typ, n[pragmasPos], s)

@@ -35,7 +35,7 @@ const
     wBorrow, wImportCompilerProc, wThread,
     wAsmNoStackFrame, wDiscardable, wNoInit, wCodegenDecl,
     wGensym, wInject, wRaises, wEffectsOf, wTags, wForbids, wLocks, wDelegator, wGcSafe,
-    wConstructor, wLiftLocals, wStackTrace, wLineTrace, wNoDestroy,
+    wConstructor, wLiftLocals, wStackTrace, wLineTrace, wNoDestroy, wExportNimAbi,
     wRequires, wEnsures, wEnforceNoRaises, wSystemRaisesDefect, wVirtual, wQuirky, wMember}
   converterPragmas* = procPragmas
   methodPragmas* = procPragmas+{wBase}-{wImportCpp}
@@ -905,6 +905,15 @@ proc singlePragma(c: PContext, sym: PSym, n: PNode, i: var int,
           else:
             incl(sym, sfMangleCpp)
         incl(sym.flagsImpl, sfUsed) # avoid wrong hints
+      of wExportNimAbi:
+        noVal(c, it)
+        if sym == nil or sym.kind notin routineKinds:
+          invalidPragma(c, it)
+        else:
+          if c.config.backend != backendC:
+            localError(c.config, it.info, "exportnimabi requires `c` backend, got: " & $c.config.backend)
+          incl(sym, {sfExportNimAbi, sfUsed})
+          incl(sym, lfExportLib)
       of wImportc:
         let name = getOptionalStr(c, it, "$1")
         cppDefine(c.config, name)
@@ -1379,8 +1388,8 @@ proc implicitPragmas*(c: PContext, sym: PSym, info: TLineInfo,
         if sym.kind in routineKinds and sym.ast != nil:
           mergeValidPragmas(sym.ast, o, validPragmas)
 
-    if lfExportLib in sym.loc.flags and sfExportc notin sym.flags:
-      localError(c.config, info, ".dynlib requires .exportc")
+    if lfExportLib in sym.loc.flags and {sfExportc, sfExportNimAbi} * sym.flags == {}:
+      localError(c.config, info, ".dynlib requires .exportc or .exportnimabi")
     var lib = c.optionStack[^1].dynlib
     if {lfDynamicLib, lfHeader} * sym.loc.flags == {} and
         sfImportc in sym.flags and lib != nil:
