@@ -201,6 +201,9 @@ type
     hasSymRedefs*: bool
       # set once a redefinition mapping has been installed; makes `getGenSym`
       # consult the proc-con mapping for non-gensym symbols too.
+    nimAbiAccessorTypes*: IntSet
+      # `ref object` type ids whose `.exportnimabi.` accessor procs have already
+      # been generated for this module.
 
   TBorrowState* = enum
     bsNone, bsReturnNotMatch, bsNoDistinct, bsGeneric, bsNotSupported, bsMatch

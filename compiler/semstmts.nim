@@ -2447,6 +2447,177 @@ proc semMethodPrototype(c: PContext; s: PSym; n: PNode) =
     else:
       localError(c.config, n.info, "'method' needs a parameter that has an object type")
 
+type
+  NimAbiAccessorMode = enum
+    naamUnsupported,
+    naamPodValue,
+    naamManagedCopy,
+    naamHandle
+
+proc nimAbiRefObject(t: PType): PType =
+  if t == nil: return nil
+  let refType = t.skipTypes(abstractInst)
+  if refType.kind == tyRef:
+    let objType = refType.elementType.skipTypes(abstractInst)
+    if objType.kind == tyObject:
+      return objType
+  result = nil
+
+proc hasNimAbiVariantFields(n: PNode): bool =
+  if n == nil: return false
+  result = false
+  case n.kind
+  of nkRecCase:
+    result = true
+  else:
+    for i in 0..<n.safeLen:
+      if hasNimAbiVariantFields(n[i]): return true
+
+proc collectNimAbiFields(n: PNode; fields: var seq[PSym]) =
+  if n == nil: return
+  case n.kind
+  of nkSym:
+    if n.sym.kind == skField:
+      fields.add n.sym
+  of nkRecList, nkOfBranch, nkElse:
+    for i in 0..<n.len:
+      collectNimAbiFields(n[i], fields)
+  else:
+    discard
+
+proc collectNimAbiObjectFields(t: PType; fields: var seq[PSym]) =
+  if t == nil: return
+  if t.baseClass != nil:
+    collectNimAbiObjectFields(t.baseClass.skipTypes(abstractInst), fields)
+  collectNimAbiFields(t.n, fields)
+
+proc isNimAbiPodType(t: PType): bool =
+  if t == nil: return false
+  let typ = t.skipTypes(abstractInst + {tyRange})
+  case typ.kind
+  of tyBool, tyChar, tyEnum, tyCstring, tyPointer, tyPtr, tyNil,
+      tyInt, tyInt8, tyInt16, tyInt32, tyInt64,
+      tyUInt, tyUInt8, tyUInt16, tyUInt32, tyUInt64,
+      tyFloat, tyFloat32, tyFloat64, tyFloat128:
+    result = true
+  of tyArray:
+    result = isNimAbiPodType(typ.elementType)
+  of tyTuple:
+    result = true
+    for child in typ.kids:
+      if not isNimAbiPodType(child): return false
+  of tyObject:
+    if hasNimAbiVariantFields(typ.n): return false
+    result = true
+    var fields: seq[PSym] = @[]
+    collectNimAbiObjectFields(typ, fields)
+    for field in fields:
+      if not isNimAbiPodType(field.typ): return false
+  else:
+    result = false
+
+proc nimAbiAccessorMode(fieldType: PType): NimAbiAccessorMode =
+  if fieldType == nil: return naamUnsupported
+  let typ = fieldType.skipTypes(abstractInst)
+  if typ.kind == tyString:
+    result = naamManagedCopy
+  elif nimAbiRefObject(typ) != nil:
+    result = naamHandle
+  elif isNimAbiPodType(typ):
+    result = naamPodValue
+  else:
+    result = naamUnsupported
+
+proc nimAbiTypeNode(t: PType; info: TLineInfo): PNode =
+  newNodeIT(nkType, info, t)
+
+proc nimAbiPragmas(c: PContext; info: TLineInfo): PNode =
+  result = newNodeI(nkPragma, info)
+  result.add newIdentNode(getIdent(c.cache, "exportnimabi"), info)
+
+proc newNimAbiAccessorSym(c: PContext; name: string; info: TLineInfo): PSym =
+  result = newSym(skProc, getIdent(c.cache, name), c.idgen,
+    getCurrOwner(c), info, c.config.options)
+  incl(result.flagsImpl, {sfExported, sfUsed})
+
+proc newNimAbiGetter(c: PContext; refType: PType; field: PSym): PNode =
+  let
+    info = field.info
+    getter = newNimAbiAccessorSym(c, field.name.s, info)
+    receiver = newSym(skParam, getIdent(c.cache, "r"), c.idgen, getter, info)
+  receiver.typ = refType
+  receiver.options = c.config.options
+  incl(receiver.flagsImpl, sfUsed)
+
+  let params = newTreeI(nkFormalParams, info,
+    nimAbiTypeNode(field.typ, info),
+    newTreeI(nkIdentDefs, info,
+      newSymNode(receiver), nimAbiTypeNode(refType, info), c.graph.emptyNode))
+  let body = newTreeI(nkDotExpr, info, newSymNode(receiver), newSymNode(field))
+  result = newProcNode(nkProcDef, info, body,
+    params, newSymNode(getter), c.graph.emptyNode, c.graph.emptyNode,
+    nimAbiPragmas(c, info), c.graph.emptyNode)
+
+proc newNimAbiSetter(c: PContext; refType: PType; field: PSym): PNode =
+  let
+    info = field.info
+    setter = newNimAbiAccessorSym(c, field.name.s & "=", info)
+    receiver = newSym(skParam, getIdent(c.cache, "r"), c.idgen, setter, info)
+    value = newSym(skParam, getIdent(c.cache, "value"), c.idgen, setter, info)
+  receiver.typ = refType
+  receiver.options = c.config.options
+  value.typ = field.typ
+  value.options = c.config.options
+  incl(receiver.flagsImpl, sfUsed)
+  incl(value.flagsImpl, sfUsed)
+
+  let params = newTreeI(nkFormalParams, info,
+    c.graph.emptyNode,
+    newTreeI(nkIdentDefs, info,
+      newSymNode(receiver), nimAbiTypeNode(refType, info), c.graph.emptyNode),
+    newTreeI(nkIdentDefs, info,
+      newSymNode(value), nimAbiTypeNode(field.typ, info), c.graph.emptyNode))
+  let target = newTreeI(nkDotExpr, info, newSymNode(receiver), newSymNode(field))
+  let body = newTreeI(nkAsgn, info, target, newSymNode(value))
+  result = newProcNode(nkProcDef, info, body,
+    params, newSymNode(setter), c.graph.emptyNode, c.graph.emptyNode,
+    nimAbiPragmas(c, info), c.graph.emptyNode)
+
+proc generateNimAbiAccessorsFor(c: PContext; refType, objType: PType): seq[PNode] =
+  result = @[]
+  if objType == nil: return
+  if containsOrIncl(c.nimAbiAccessorTypes, objType.id): return
+  if hasNimAbiVariantFields(objType.n):
+    localError(c.config, objType.sym.info,
+      "exportnimabi accessors do not support variant ref object type '" &
+      objType.sym.name.s & "'")
+    return
+
+  var fields: seq[PSym] = @[]
+  collectNimAbiObjectFields(objType, fields)
+  for field in fields:
+    if sfExported in field.flags:
+      let mode = nimAbiAccessorMode(field.typ)
+      if mode == naamUnsupported:
+        localError(c.config, field.info,
+          "exportnimabi accessor for field '" & field.name.s &
+          "' has unsupported type: " & typeToString(field.typ))
+      else:
+        result.add semProc(c, newNimAbiGetter(c, refType, field))
+        result.add semProc(c, newNimAbiSetter(c, refType, field))
+
+proc generateNimAbiAccessors(c: PContext; exportedProc: PSym): seq[PNode] =
+  result = @[]
+  if exportedProc.typ == nil: return
+  template collect(t: PType) =
+    let objType = nimAbiRefObject(t)
+    if objType != nil:
+      result.add generateNimAbiAccessorsFor(c, t.skipTypes(abstractInst), objType)
+
+  collect(exportedProc.typ.returnType)
+  for i in 1..<exportedProc.typ.len:
+    collect(exportedProc.typ[i])
+
 proc semProcAux(c: PContext, n: PNode, kind: TSymKind,
                 validPragmas: TSpecialWords, flags: TExprFlags = {}): PNode =
   result = semProcAnnotation(c, n, validPragmas)
@@ -2753,6 +2924,16 @@ proc semProcAux(c: PContext, n: PNode, kind: TSymKind,
   # When not highlighting we still need to allow for suggestions though
   if not isHighlight:
     suggestSym(c.graph, s.info, s, c.graph.usageSym)
+
+  if sfExportNimAbi in s.flags and not isAnon and
+      s.skipGenericOwner.kind == skModule:
+    let accessors = generateNimAbiAccessors(c, s)
+    if accessors.len > 0:
+      let original = result
+      result = newNodeI(nkStmtList, original.info)
+      result.add original
+      for accessor in accessors:
+        result.add accessor
 
 proc determineType(c: PContext, s: PSym) =
   if s.typ != nil: return

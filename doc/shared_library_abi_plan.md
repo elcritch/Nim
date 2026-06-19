@@ -11,14 +11,15 @@
 
 ### Milestone 2: Opaque Ref Object Handles and Accessors
 
-- [ ] Classify exported `ref object` types as opaque ABI handles.
-- [ ] Generate producer-side accessor exports for public fields on opaque refs.
+- [x] Classify exported `ref object` types as opaque ABI handles.
+- [x] Generate producer-side accessor exports for public fields on opaque refs.
 - [ ] Generate importer-side wrapper accessors so public fields remain source-level ergonomic.
-- [ ] Define accessor return policy for POD values, managed copies, borrowed views, and nested handles.
-- [ ] Keep allocation, destruction, ARC retain/release, managed fields, and invariants inside the producer library.
+- [x] Define accessor return policy for POD values, managed copies, borrowed views, and nested handles.
+- [x] Keep allocation, destruction, ARC retain/release, managed fields, and invariants inside the producer library.
 - [ ] Require exported constructor, accessor, and destructor or retain/release procs for handle-backed APIs.
-- [ ] Reject direct cross-library layout access and unsupported accessor shapes with clear diagnostics.
-- [ ] Add tests for opaque handle signatures and rejection paths.
+- [ ] Reject direct cross-library layout access with clear diagnostics.
+- [x] Reject unsupported accessor shapes with clear diagnostics.
+- [x] Add tests for opaque handle signatures and rejection paths.
 
 ### Milestone 3: Explicit Init and Metadata
 
