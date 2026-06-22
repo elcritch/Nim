@@ -22,6 +22,7 @@ rm -rf dynlibs/exportnimabi_refs/nimcache \
 The nimcache should contain:
 
 ```text
+producer.abi.c
 producer_abi.nim
 producer.abi.h
 producer.abi.json
@@ -36,12 +37,34 @@ Compile the Nim consumer against the generated ABI module and C header:
   dynlibs/exportnimabi_refs/consumer.nim
 ```
 
+The generated Nim ABI module exposes `initProducerAbi()`. Public imported proc
+wrappers call it automatically before forwarding to private mangled imports. The
+producer library also exports `NimAbiInit_producer`, which compares the expected
+ABI fingerprint and calls `NimMain` exactly once on success.
+
 Validate the generated C ABI header:
 
 ```sh
 printf '#include "producer.abi.h"\n' > dynlibs/exportnimabi_refs/nimcache/check_abi_header.c
 cc -fsyntax-only -I"$PWD/lib" -Idynlibs/exportnimabi_refs/nimcache \
   dynlibs/exportnimabi_refs/nimcache/check_abi_header.c
+```
+
+Validate the generated explicit init C entry point:
+
+```sh
+cc -fsyntax-only -I"$PWD/lib" -Idynlibs/exportnimabi_refs/nimcache \
+  dynlibs/exportnimabi_refs/nimcache/producer.abi.c
+```
+
+Build and inspect the shared library:
+
+```sh
+./compiler/nim-abi-test c --app:lib \
+  --nimcache:dynlibs/exportnimabi_refs/nimcache \
+  dynlibs/exportnimabi_refs/producer.nim
+nm -gU dynlibs/exportnimabi_refs/libproducer.dylib | \
+  grep 'NimAbiInit_producer\|NimMain'
 ```
 
 Validate that direct C access is limited to ABI-POD field names:

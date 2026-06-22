@@ -1968,8 +1968,27 @@ proc nimAbiNimModulePath(conf: ConfigRef): AbsoluteFile =
   let projectBase = splitFile(conf.projectFull.string).name
   result = getNimcacheDir(conf) / RelativeFile(projectBase & "_abi.nim")
 
+proc nimAbiCInitPath(conf: ConfigRef): AbsoluteFile =
+  result = toGeneratedFile(conf, conf.projectFull, ".abi.c")
+
 proc nimAbiInitName(conf: ConfigRef): string =
   result = conf.nimMainPrefix & "NimMain"
+
+proc nimAbiInitProcName(conf: ConfigRef): string =
+  let projectBase = splitFile(conf.projectFull.string).name
+  result = "NimAbiInit_" & nimAbiSanitizeName(projectBase)
+
+proc nimAbiInitializedName(conf: ConfigRef): string =
+  let projectBase = splitFile(conf.projectFull.string).name
+  result = "NimAbiInitialized_" & nimAbiSanitizeName(projectBase)
+
+proc nimAbiFingerprintName(conf: ConfigRef): string =
+  let projectBase = splitFile(conf.projectFull.string).name
+  result = "NimAbiFingerprint_" & nimAbiSanitizeName(projectBase)
+
+proc nimAbiNimInitName(conf: ConfigRef): string =
+  result = "init" & nimAbiCapitalizeAscii(
+    nimAbiSanitizeName(splitFile(conf.projectFull.string).name)) & "Abi"
 
 proc nimAbiManagedFieldName(field: PSym): string =
   result = "nimAbiManaged_"
@@ -2514,31 +2533,68 @@ proc nimAbiProcBackendName(m: BModule; s: PSym): string =
   else:
     result = nimAbiSanitizeName(s.name.s)
 
-proc nimAbiProcNimDecl(m: BModule; info: NimAbiArtifactInfo; s: PSym): string =
-  result = "proc "
-  result.add nimAbiNimProcName(s.name.s)
-  result.add "*("
-  if s.typ != nil and s.typ.n != nil:
-    var needsComma = false
-    for i in 1..<s.typ.n.len:
-      if s.typ.n[i].kind != nkSym: continue
-      let param = s.typ.n[i].sym
-      if isCompileTimeOnly(param.typ): continue
-      if needsComma: result.add ", "
-      needsComma = true
-      let pname =
-        if param.name.s.len == 0 or param.name.s[0] == ':': "p" & $i
-        else: nimAbiSanitizeName(param.name.s)
-      result.add pname
-      result.add ": "
-      result.add nimAbiNimTypeName(info, param.typ)
-  result.add ")"
-  if s.typ != nil and s.typ.returnType != nil:
+proc nimAbiProcImportName(s: PSym): string =
+  result = "nimAbiProc_" & nimAbiSanitizeName(s.name.s) & "_" & $s.id
+
+proc nimAbiProcNimFormals(info: NimAbiArtifactInfo; s: PSym;
+                          callArgs: var string): string =
+  result = ""
+  callArgs = ""
+  if s.typ == nil or s.typ.n == nil: return
+  var needsComma = false
+  for i in 1..<s.typ.n.len:
+    if s.typ.n[i].kind != nkSym: continue
+    let param = s.typ.n[i].sym
+    if isCompileTimeOnly(param.typ): continue
+    if needsComma:
+      result.add ", "
+      callArgs.add ", "
+    needsComma = true
+    let pname =
+      if param.name.s.len == 0 or param.name.s[0] == ':': "p" & $i
+      else: nimAbiSanitizeName(param.name.s)
+    result.add pname
     result.add ": "
-    result.add nimAbiNimTypeName(info, s.typ.returnType)
+    result.add nimAbiNimTypeName(info, param.typ)
+    callArgs.add pname
+
+proc nimAbiProcNimDecl(m: BModule; info: NimAbiArtifactInfo; s: PSym): string =
+  var callArgs = ""
+  let formals = nimAbiProcNimFormals(info, s, callArgs)
+  let returnType =
+    if s.typ != nil and s.typ.returnType != nil:
+      nimAbiNimTypeName(info, s.typ.returnType)
+    else:
+      ""
+  let importName = nimAbiProcImportName(s)
+  result = "proc "
+  result.add importName
+  result.add "("
+  result.add formals
+  result.add ")"
+  if returnType.len != 0:
+    result.add ": "
+    result.add returnType
   result.add " {.importc: \""
   result.add nimAbiJsonEscape(nimAbiProcBackendName(m, s))
   result.add "\".}\n"
+  result.add "proc "
+  result.add nimAbiNimProcName(s.name.s)
+  result.add "*("
+  result.add formals
+  result.add ")"
+  if returnType.len != 0:
+    result.add ": "
+    result.add returnType
+  result.add " =\n"
+  result.add "  nimAbiEnsureInitialized()\n"
+  result.add "  "
+  if returnType.len != 0:
+    result.add "result = "
+  result.add importName
+  result.add "("
+  result.add callArgs
+  result.add ")\n"
 
 proc nimAbiRewriteCTypeNames(text: string; m: BModule;
                              info: NimAbiArtifactInfo): string =
@@ -2915,6 +2971,176 @@ proc nimAbiAppendJsonFields(dest: var string; info: NimAbiArtifactInfo;
              ", \"kind\": \"" & nimAbiJsonEscape(field.kind) & "\"}"
   dest.add "]"
 
+proc nimAbiJsonString(s: string): string =
+  result = "\"" & nimAbiJsonEscape(s) & "\""
+
+proc nimAbiJsonBool(value: bool): string =
+  result = if value: "true" else: "false"
+
+proc nimAbiOptionSetJson[T](options: set[T]): string =
+  result = "["
+  var needsComma = false
+  for opt in options:
+    if needsComma: result.add ", "
+    needsComma = true
+    result.add nimAbiJsonString($opt)
+  result.add "]"
+
+proc nimAbiAllocatorName(conf: ConfigRef): string =
+  if isDefined(conf, "useMalloc"):
+    result = "malloc"
+  elif isDefined(conf, "nimAllocPagesViaMalloc"):
+    result = "nimAllocPagesViaMalloc"
+  elif isDefined(conf, "useNimRtl"):
+    result = "nimrtl"
+  else:
+    result = "nim-default"
+
+proc nimAbiEndianName(conf: ConfigRef): string =
+  case CPU[conf.target.targetCPU].endian
+  of littleEndian: result = "little"
+  of bigEndian: result = "big"
+
+proc nimAbiAppendJsonConfig(dest: var string; conf: ConfigRef) =
+  dest.add "  \"compiler\": {"
+  dest.add "\"version\": " & nimAbiJsonString(VersionAsString)
+  dest.add ", \"rodFileVersion\": " & nimAbiJsonString(RodFileVersion)
+  dest.add ", \"compilerApiVersion\": " & $NimCompilerApiVersion
+  dest.add "},\n"
+  dest.add "  \"target\": {"
+  dest.add "\"os\": " & nimAbiJsonString(OS[conf.target.targetOS].name)
+  dest.add ", \"cpu\": " & nimAbiJsonString(CPU[conf.target.targetCPU].name)
+  dest.add ", \"endian\": " & nimAbiJsonString(nimAbiEndianName(conf))
+  dest.add ", \"bits\": " & $CPU[conf.target.targetCPU].bit
+  dest.add "},\n"
+  dest.add "  \"backend\": {"
+  dest.add "\"kind\": " & nimAbiJsonString($conf.backend)
+  dest.add ", \"cCompiler\": " & nimAbiJsonString(CC[conf.cCompiler].name)
+  dest.add "},\n"
+  dest.add "  \"runtime\": {"
+  dest.add "\"memoryManager\": " & nimAbiJsonString($conf.selectedGC)
+  dest.add ", \"allocator\": " & nimAbiJsonString(nimAbiAllocatorName(conf))
+  dest.add ", \"exceptionSystem\": " & nimAbiJsonString($conf.exc)
+  dest.add ", \"strings\": " & nimAbiJsonString($conf.selectedStrings)
+  dest.add ", \"threads\": " & nimAbiJsonBool(optThreads in conf.globalOptions)
+  dest.add "},\n"
+  dest.add "  \"flags\": {"
+  dest.add "\"options\": " & nimAbiOptionSetJson(conf.options)
+  dest.add ", \"globalOptions\": " & nimAbiOptionSetJson(conf.globalOptions)
+  dest.add ", \"compileOptions\": " & nimAbiJsonString(conf.compileOptions)
+  dest.add ", \"compileOptionsCmd\": " & nimAbiJsonString($conf.compileOptionsCmd)
+  dest.add ", \"linkOptionsCmd\": " & nimAbiJsonString($conf.linkOptionsCmd)
+  dest.add "},\n"
+
+proc nimAbiAppendJsonTypes(dest: var string; info: NimAbiArtifactInfo;
+                           conf: ConfigRef) =
+  dest.add "  \"types\": [\n"
+  for i, obj in info.objects:
+    if i != 0: dest.add ",\n"
+    dest.add "    {\"name\": \"" & nimAbiJsonEscape(obj.nimName) &
+             "\", \"cName\": \"" & nimAbiJsonEscape(obj.cName) &
+             "\", \"sizeof\": " & $getSize(conf, obj.typ) &
+             ", \"alignof\": " & $getAlign(conf, obj.typ) &
+             ", \"layoutFingerprint\": \"" & $hashType(obj.typ, conf) & "\""
+    nimAbiAppendJsonFields(dest, info, obj)
+    dest.add "}"
+  dest.add "\n  ],\n"
+
+proc nimAbiAppendJsonHooks(dest: var string; info: NimAbiArtifactInfo;
+                           mainModule: BModule) =
+  dest.add "  \"hooks\": [\n"
+  for i, h in info.hooks:
+    if i != 0: dest.add ",\n"
+    dest.add "    {\"type\": \"" & nimAbiJsonEscape(h.typeName) &
+             "\", \"op\": \"" & nimAbiJsonEscape(AttachedOpToStr[h.op]) &
+             "\", \"symbol\": \"" & nimAbiJsonEscape(nimAbiHookThunkName(mainModule, h)) &
+             "\", \"unavailable\": " & (if sfError in h.hook.flags: "true" else: "false") & "}"
+  dest.add "\n  ],\n"
+
+proc nimAbiAppendJsonProcs(dest: var string; info: NimAbiArtifactInfo;
+                           mainModule: BModule; conf: ConfigRef) =
+  dest.add "  \"procs\": [\n"
+  for i, s in info.procs:
+    if i != 0: dest.add ",\n"
+    dest.add "    {\"name\": \"" & nimAbiJsonEscape(s.name.s) &
+             "\", \"symbol\": \"" & nimAbiJsonEscape(nimAbiProcBackendName(mainModule, s)) &
+             "\", \"signatureFingerprint\": \"" & $hashType(s.typ, conf) & "\"}"
+  dest.add "\n  ]\n"
+
+proc nimAbiBuildMetadataCore(info: NimAbiArtifactInfo; mainModule: BModule;
+                             nimPath, headerPath: AbsoluteFile;
+                             nimModuleHash, headerHash,
+                             initSymbol: string): string =
+  let conf = info.config
+  result = ""
+  result.add "  \"format\": \"nim-exportnimabi-v1\",\n"
+  result.add "  \"nimHeader\": \"" & nimAbiJsonEscape(nimPath.string) & "\",\n"
+  result.add "  \"cHeader\": \"" & nimAbiJsonEscape(headerPath.string) & "\",\n"
+  result.add "  \"nimModuleHash\": \"" & nimModuleHash & "\",\n"
+  result.add "  \"cHeaderHash\": \"" & headerHash & "\",\n"
+  result.add "  \"initSymbol\": \"" & nimAbiJsonEscape(initSymbol) & "\",\n"
+  nimAbiAppendJsonConfig(result, conf)
+  nimAbiAppendJsonTypes(result, info, conf)
+  nimAbiAppendJsonHooks(result, info, mainModule)
+  nimAbiAppendJsonProcs(result, info, mainModule, conf)
+
+proc nimAbiBuildMetadataText(core, fingerprint: string): string =
+  result = "{\n"
+  result.add "  \"abiFingerprint\": \"" & fingerprint & "\",\n"
+  result.add core
+  result.add "}\n"
+
+proc nimAbiWriteCInit(conf: ConfigRef; cPath: AbsoluteFile;
+                      initSymbol, fingerprint: string) =
+  var text = "/* Generated by Nim for exportnimabi; do not edit. */\n"
+  text.add "#define NIM_INTBITS "
+  text.add $CPU[conf.target.targetCPU].bit
+  text.add "\n"
+  text.add "#include <string.h>\n"
+  text.add "#include \"nimbase.h\"\n\n"
+  text.add "extern void "
+  text.add nimAbiInitName(conf)
+  text.add "(void);\n"
+  text.add "static int "
+  text.add nimAbiInitializedName(conf)
+  text.add " = 0;\n"
+  text.add "static const char "
+  text.add nimAbiFingerprintName(conf)
+  text.add "[] = \""
+  text.add nimAbiJsonEscape(fingerprint)
+  text.add "\";\n\n"
+  text.add "N_LIB_EXPORT int "
+  text.add initSymbol
+  text.add "(const char* expectedFingerprint, const char** mismatch) {\n"
+  text.add "\tif (mismatch) *mismatch = (const char*)0;\n"
+  text.add "\tif (!expectedFingerprint) {\n"
+  text.add "\t\tif (mismatch) *mismatch = \"missing ABI fingerprint\";\n"
+  text.add "\t\treturn 1;\n"
+  text.add "\t}\n"
+  text.add "\tif (strcmp(expectedFingerprint, "
+  text.add nimAbiFingerprintName(conf)
+  text.add ") != 0) {\n"
+  text.add "\t\tif (mismatch) *mismatch = \"ABI fingerprint mismatch\";\n"
+  text.add "\t\treturn 2;\n"
+  text.add "\t}\n"
+  text.add "\tif (!"
+  text.add nimAbiInitializedName(conf)
+  text.add ") {\n"
+  text.add "\t\t"
+  text.add nimAbiInitName(conf)
+  text.add "();\n"
+  text.add "\t\t"
+  text.add nimAbiInitializedName(conf)
+  text.add " = 1;\n"
+  text.add "\t}\n"
+  text.add "\treturn 0;\n"
+  text.add "}\n"
+  writeFile(cPath, text)
+  var cf = Cfile(nimname: splitFile(cPath.string).name, cname: cPath,
+                 obj: toObjFile(conf, completeCfilePath(conf, cPath, false)),
+                 flags: {})
+  addFileToCompile(conf, cf)
+
 proc nimAbiWriteArtifacts(g: BModuleList) =
   var info = nimAbiCollect(g)
   if info.procs.len == 0: return
@@ -2923,7 +3149,10 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   let nimPath = nimAbiNimModulePath(conf)
   let headerPath = toGeneratedFile(conf, conf.projectFull, ".abi.h")
   let metaPath = toGeneratedFile(conf, conf.projectFull, ".abi.json")
+  let cInitPath = nimAbiCInitPath(conf)
   let headerBase = nimAbiCHeaderBasename(conf)
+  let initSymbol = nimAbiInitProcName(conf)
+  const fingerprintPlaceholder = "@NIM_EXPORTNIMABI_FINGERPRINT@"
   createDir(splitFile(headerPath.string).dir)
   var mainModule: BModule = nil
   for candidate in g.modulesClosed:
@@ -2954,10 +3183,40 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   nimText.add "proc NimMain*() {.importc: \""
   nimText.add nimAbiInitName(conf)
   nimText.add "\".}\n"
+  nimText.add "const nimAbiFingerprint* = \""
+  nimText.add fingerprintPlaceholder
+  nimText.add "\"\n"
+  nimText.add "const nimAbiNimModuleHash* = \""
+  nimText.add "@NIM_EXPORTNIMABI_NIM_MODULE_HASH@"
+  nimText.add "\"\n"
+  nimText.add "const nimAbiCHeaderHash* = \""
+  nimText.add "@NIM_EXPORTNIMABI_C_HEADER_HASH@"
+  nimText.add "\"\n"
+  nimText.add "proc nimAbiInitRaw(expectedFingerprint: cstring; mismatch: ptr cstring): cint {.importc: \""
+  nimText.add nimAbiJsonEscape(initSymbol)
+  nimText.add "\".}\n"
+  nimText.add "var nimAbiValidated = false\n"
+  nimText.add "proc "
+  nimText.add nimAbiNimInitName(conf)
+  nimText.add "*() =\n"
+  nimText.add "  var mismatch: cstring\n"
+  nimText.add "  let code = nimAbiInitRaw(nimAbiFingerprint, addr mismatch)\n"
+  nimText.add "  if code != 0:\n"
+  nimText.add "    if mismatch == nil:\n"
+  nimText.add "      raise newException(ValueError, \"Nim ABI mismatch\")\n"
+  nimText.add "    else:\n"
+  nimText.add "      raise newException(ValueError, \"Nim ABI mismatch: \" & $mismatch)\n"
+  nimText.add "  nimAbiValidated = true\n"
+  nimText.add "proc nimAbiEnsureInitialized*() =\n"
+  nimText.add "  if not nimAbiValidated:\n"
+  nimText.add "    "
+  nimText.add nimAbiNimInitName(conf)
+  nimText.add "()\n"
   for h in info.hooks:
     nimText.add nimAbiHookDecl(mainModule, h)
   for s in info.procs:
     nimText.add nimAbiProcNimDecl(mainModule, info, s)
+  let nimModuleHash = getMD5(nimText)
 
   var headerText = "/* Generated by Nim for exportnimabi; do not edit. */\n"
   let headerGuard = nimAbiCHeaderGuard(conf)
@@ -2967,6 +3226,7 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   headerText.add headerGuard
   headerText.add "\n\n"
   headerText.add "#define NIM_EXPORTNIMABI_GENERATED 1\n"
+  headerText.add "#define NIM_EXPORTNIMABI_HAS_EXPLICIT_INIT 1\n"
   headerText.add "#define "
   headerText.add headerGuard
   headerText.add "_GENERATED 1\n"
@@ -2994,6 +3254,9 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   headerText.add "N_LIB_IMPORT void "
   headerText.add nimAbiInitName(conf)
   headerText.add "(void);\n"
+  headerText.add "N_LIB_IMPORT int "
+  headerText.add initSymbol
+  headerText.add "(const char* expectedFingerprint, const char** mismatch);\n"
   for s in info.procs:
     headerText.add nimAbiProcCDecl(mainModule, info, s)
   for h in info.hooks:
@@ -3004,43 +3267,18 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   headerText.add " */\n"
 
   let headerHash = getMD5(headerText)
-  var metaText = "{\n"
-  metaText.add "  \"format\": \"nim-exportnimabi-v1\",\n"
-  metaText.add "  \"nimHeader\": \"" & nimAbiJsonEscape(nimPath.string) & "\",\n"
-  metaText.add "  \"cHeader\": \"" & nimAbiJsonEscape(headerPath.string) & "\",\n"
-  metaText.add "  \"cHeaderHash\": \"" & headerHash & "\",\n"
-  metaText.add "  \"initSymbol\": \"" & nimAbiJsonEscape(nimAbiInitName(conf)) & "\",\n"
-  metaText.add "  \"types\": [\n"
-  for i, obj in info.objects:
-    if i != 0: metaText.add ",\n"
-    metaText.add "    {\"name\": \"" & nimAbiJsonEscape(obj.nimName) &
-                 "\", \"cName\": \"" & nimAbiJsonEscape(obj.cName) &
-                 "\", \"sizeof\": " & $getSize(conf, obj.typ) &
-                 ", \"alignof\": " & $getAlign(conf, obj.typ) &
-                 ", \"layoutFingerprint\": \"" & $hashType(obj.typ, conf) & "\""
-    nimAbiAppendJsonFields(metaText, info, obj)
-    metaText.add "}"
-  metaText.add "\n  ],\n"
-  metaText.add "  \"hooks\": [\n"
-  for i, h in info.hooks:
-    if i != 0: metaText.add ",\n"
-    metaText.add "    {\"type\": \"" & nimAbiJsonEscape(h.typeName) &
-                 "\", \"op\": \"" & nimAbiJsonEscape(AttachedOpToStr[h.op]) &
-                 "\", \"symbol\": \"" & nimAbiJsonEscape(nimAbiHookThunkName(mainModule, h)) &
-                 "\", \"unavailable\": " & (if sfError in h.hook.flags: "true" else: "false") & "}"
-  metaText.add "\n  ],\n"
-  metaText.add "  \"procs\": [\n"
-  for i, s in info.procs:
-    if i != 0: metaText.add ",\n"
-    metaText.add "    {\"name\": \"" & nimAbiJsonEscape(s.name.s) &
-                 "\", \"symbol\": \"" & nimAbiJsonEscape(nimAbiProcBackendName(mainModule, s)) &
-                 "\", \"signatureFingerprint\": \"" & $hashType(s.typ, conf) & "\"}"
-  metaText.add "\n  ]\n"
-  metaText.add "}\n"
+  let metadataCore = nimAbiBuildMetadataCore(info, mainModule, nimPath,
+    headerPath, nimModuleHash, headerHash, initSymbol)
+  let abiFingerprint = getMD5(metadataCore)
+  var metaText = nimAbiBuildMetadataText(metadataCore, abiFingerprint)
+  nimText = nimText.replace(fingerprintPlaceholder, abiFingerprint)
+  nimText = nimText.replace("@NIM_EXPORTNIMABI_NIM_MODULE_HASH@", nimModuleHash)
+  nimText = nimText.replace("@NIM_EXPORTNIMABI_C_HEADER_HASH@", headerHash)
 
   writeFile(nimPath, nimText)
   writeFile(headerPath, headerText)
   writeFile(metaPath, metaText)
+  nimAbiWriteCInit(conf, cInitPath, initSymbol, abiFingerprint)
 
 proc getSomeNameForModule*(m: BModule): Rope =
   ## Returns a mangled module name.
@@ -3225,6 +3463,9 @@ proc genComponentConstruct(m: BModule) =
             m.s[cfsProcs].addCallStmt("nim_component_construct", cAddr("env"))
   m.s[cfsProcs].addNewline()
 
+proc nimAbiUsesExplicitInit(g: BModuleList): bool =
+  result = optGenDynLib in g.config.globalOptions and nimAbiCollect(g).procs.len != 0
+
 proc genMainProc(m: BModule) =
   ## this function is called in cgenWriteModules after all modules are closed,
   ## it means raising dependency on the symbols is too late as it will not propagate
@@ -3282,7 +3523,7 @@ proc genMainProc(m: BModule) =
   else:
     genNimMainBody(m, preMainCode)
 
-  if optNoMain notin m.config.globalOptions:
+  if optNoMain notin m.config.globalOptions and not nimAbiUsesExplicitInit(m.g):
     if m.config.cppCustomNamespace.len > 0:
       closeNamespaceNim(m.s[cfsProcs])
       m.s[cfsProcs].add "using namespace " & m.config.cppCustomNamespace & ";\L"

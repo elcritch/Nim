@@ -1,8 +1,12 @@
 discard """
   targets: "c"
+  cmd: "nim c --app:lib --compileOnly $options $file"
   ccodecheck: "'_ZN30texportnimabi_transparent_refs12makeRendererE'"
   ccodecheck: "'_ZN30texportnimabi_transparent_refs13rendererScaleE3refIN30texportnimabi_transparent_refs24RenderercolonObjectType_EE'"
   ccodecheck: "'TokenNimAbiHookDestroy'"
+  ccodecheck: "'N_LIB_EXPORT N_CDECL\\(void, NimMain\\)\\(void\\)'"
+  ccodecheck: "! @'NimMainInit'"
+  ccodecheck: "! @'DllMain'"
 """
 
 type
