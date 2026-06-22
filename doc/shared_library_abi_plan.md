@@ -21,14 +21,14 @@
 - [ ] Record the header hash and layout fingerprint in ABI metadata.
 - [ ] Reject hand-written or stale headers with clear diagnostics.
 
-### Milestone 3: ARC Hook Wrappers and Validation
+### Milestone 3: ARC Hook Wrappers
 
 - [ ] Let ordinary Nim ARC lowering perform managed field reads, writes, copies, sinks, and destruction.
-- [ ] Record hook identity and availability for ABI-visible managed types.
 - [ ] Generate producer-side exported hook thunks that wrap user-defined custom hooks.
 - [ ] Generate importer-side attached hooks that forward to imported producer hook thunks.
+- [ ] Generate unavailable `{.error.}` hooks for no-copy operations.
 - [ ] Use local compiler-generated hooks when they are valid under the ABI check.
-- [ ] Reject signatures that require unavailable, incompatible, or no-copy hooks.
+- [ ] Reject signatures that require unavailable or unsupported hooks.
 
 ### Milestone 4: Transparent Ref Object Prototype
 
@@ -40,7 +40,7 @@
 
 ### Milestone 5: Explicit Init and Metadata Validation
 
-- [ ] Generate ABI metadata for compiler, target, backend, memory manager, allocator, flags, Nim ABI module hash, C header hash, proc signatures, `sizeof`, alignment, offsets, layout hashes, and hook descriptors.
+- [ ] Generate ABI metadata for compiler, target, backend, memory manager, allocator, flags, Nim ABI module hash, C header hash, proc signatures, `sizeof`, alignment, offsets, and layout hashes.
 - [ ] Generate explicit `nimAbiInit` entry point.
 - [ ] Suppress automatic shared-library constructors for explicit-init builds.
 - [ ] Bind mangled proc and hook symbols only after ABI validation.
@@ -49,9 +49,9 @@
 ### Milestone 6: Importer Integration
 
 - [ ] Generate or support importer-side ABI expectations from generated Nim ABI modules plus generated C headers.
-- [ ] Teach importer-side ARC lowering to use validated local hooks or imported hook thunks.
+- [ ] Ensure generated hook wrappers attach before importer-side ARC lowering.
 - [ ] Add end-to-end shared-library tests with direct field access.
-- [ ] Add forced mismatch tests for layout, hook, compiler, allocator, and memory-manager differences.
+- [ ] Add forced mismatch tests for layout, generated hook wrappers, compiler, allocator, and memory-manager differences.
 
 ### Milestone 7: Later Compatibility Modes
 
@@ -69,10 +69,10 @@ The initial implementation uses transparent refs instead of opaque handles. The 
 - Itanium-style mangled exported symbols.
 - A generated Nim ABI module for Nim consumers.
 - A generated C ABI header for exported types and procs.
-- Structured ABI metadata for compiler/runtime settings, type sizes, field offsets, and ownership hooks.
+- Structured ABI metadata for compiler/runtime settings, generated artifact hashes, type sizes, field offsets, and optional diagnostics.
 - Explicit initialization and validation entry points.
 
-The importer treats the generated Nim ABI module, generated C header, and metadata as the dynlib contract. The Nim ABI module gives the compiler real Nim declarations for type checking, field access, and hook attachment. The C header lets the C backend compile against the same physical type declarations, so the C compiler computes `sizeof`, alignment, and field offsets in the usual C ABI way. Metadata verifies that the loaded library matches those generated artifacts and hook assumptions. After validation, the importer compiles ordinary Nim field access and ARC operations for exported transparent types.
+The importer treats the generated Nim ABI module, generated C header, and metadata as the dynlib contract. The Nim ABI module gives the compiler real Nim declarations for type checking, field access, and hook attachment. The C header lets the C backend compile against the same physical type declarations, so the C compiler computes `sizeof`, alignment, and field offsets in the usual C ABI way. Metadata verifies that the loaded library matches those generated artifacts. After validation, the importer compiles ordinary Nim field access and ARC operations for exported transparent types.
 
 ## Non-Goals for the Initial Version
 
@@ -98,9 +98,9 @@ The first version targets this combination:
 - Generated C ABI header for exported types and procs.
 - Transparent `object` and `ref object` layout for supported types.
 - `sizeof`, alignment, field offset, and layout-hash validation.
-- Hook validation for all ABI-visible managed types.
 - Exported hook thunks for producer-owned custom hooks.
 - Importer-side generated hook wrappers that attach those thunks to ABI-visible types.
+- Generated `{.error.}` hooks for unavailable operations.
 - Strict ABI metadata checks before binding proc or hook symbols.
 - Clear diagnostics for unsupported layouts, unsupported hooks, stale headers, missing metadata, or unsafe direct C access.
 
@@ -124,13 +124,12 @@ The field assignment remains a Nim operation. ARC inserts the required copies, s
 
 ### Generated Hook Wrappers
 
-For every ABI-visible managed type, the producer records the hook assumptions that ARC requires:
+For every ABI-visible managed type, the generated Nim ABI module encodes the hook behavior that ARC requires:
 
-- Plain or auto-managed: no custom hook required.
-- Move-only owner: `=destroy`, `=wasMoved`, and `=copy` marked unavailable.
-- Deep-owning value: `=destroy`, `=wasMoved`, `=copy`, and `=dup`.
-- Shared or refcounted value: `=destroy`, `=wasMoved`, `=copy`, and `=dup`.
-- Compiler-generated managed aggregate: generated hook identity plus the identities of field hooks.
+- Plain or auto-managed: emit no custom hook and let Nim generate the normal one.
+- Custom producer-owned hook: emit an imported thunk plus an attached wrapper hook.
+- No-copy operation: emit an unavailable `{.error.}` hook.
+- Unsupported hook shape: reject while generating the ABI module.
 
 Nim still performs ARC lowering normally. The ABI layer only makes sure the hooks that ARC calls are the right hooks.
 
@@ -150,20 +149,11 @@ proc `=destroy`(x: var RendererObj) =
   abiDestroyRendererObj(addr x)
 ```
 
-The exact wrapper ABI is compiler-defined so it can avoid accidental copies. The generated Nim hook has a valid Nim hook signature and forwards to a pointer or otherwise ABI-safe thunk. The same pattern applies to `=copy`, `=sink`, `=dup`, and `=wasMoved` when those hooks are custom or producer-owned. A no-copy hook is represented as unavailable metadata and an importer-side `{.error.}` hook, not as a thunk.
+The exact wrapper ABI is compiler-defined so it can avoid accidental copies. The generated Nim hook has a valid Nim hook signature and forwards to a pointer or otherwise ABI-safe thunk. The same pattern applies to `=copy`, `=sink`, `=dup`, and `=wasMoved` when those hooks are custom or producer-owned. A no-copy hook is represented as an importer-side `{.error.}` hook, not as a thunk.
 
 Generated hook wrappers must preserve Nim hook semantics. In particular, they must use the correct Nim hook signatures, keep `=destroy` non-raising, and avoid raw whole-object moves or `copyMem` for `=sink` and `=dup`.
 
-For each relevant hook, metadata records:
-
-- Hook kind: `destroy`, `wasMoved`, `copy`, `sink`, or `dup`.
-- Type identity and type layout hash.
-- Mangled hook symbol when an imported hook thunk is available.
-- Hook signature hash.
-- Whether the hook is compiler-generated, user-defined, unavailable, or imported.
-- Ownership flags such as no-copy, deep-copy, shared, move-only, and no-destroy result.
-- Effect information needed by ARC, especially that `=destroy` is non-raising.
-- Implementation identity or body hash when the compiler can compute one.
+The generated Nim ABI module hash covers the hook wrappers, imported thunk symbols, and unavailable hook declarations. Metadata may mirror hook decisions for diagnostics, but it is not the source of truth.
 
 ## Generated Nim ABI Module
 
@@ -238,9 +228,9 @@ The producer and importer must agree on:
 - Packing and alignment pragmas.
 - Managed-field representation.
 - Type descriptor identity needed for ARC destruction.
-- Hook descriptors for the payload type and any managed fields with custom hooks.
+- Generated Nim ABI module hook declarations for the payload type and any managed fields with custom hooks.
 
-After validation, a Nim importer may read and write exported fields directly in source code. The resulting C code uses the generated layout, and Nim ARC uses the validated hook model.
+After validation, a Nim importer may read and write exported fields directly in source code. The resulting C code uses the generated layout, and Nim ARC uses the hook declarations from the generated Nim ABI module.
 
 Direct C callers are more restricted. They may inspect or pass ABI-POD fields, but they must not mutate Nim-managed fields such as `string`, `seq`, `ref`, closures, or fields whose assignment depends on custom hooks.
 
@@ -253,7 +243,7 @@ Initial support should allow:
 - ABI-POD structs by value.
 - Plain objects with ARC-managed fields when the importer can validate or import all required hooks.
 - `string` fields under the strict ARC same-build contract.
-- Nested supported object values with recursive layout and hook metadata.
+- Nested supported object values with recursive layout and generated hook wrappers where needed.
 
 Initial support should reject:
 
@@ -282,7 +272,7 @@ proc newRenderer*(name: string): Renderer {.exportnimabi.}
 proc draw*(r: Renderer) {.exportnimabi.}
 ```
 
-The importer sees `Renderer` as a real ref type with a validated payload layout. It does not need a manual retain/release API for ordinary ARC ownership. ARC-generated code increments, decrements, copies, sinks, and destroys according to the validated hook descriptors.
+The importer sees `Renderer` as a real ref type with a validated payload layout. It does not need a manual retain/release API for ordinary ARC ownership. ARC-generated code increments, decrements, copies, sinks, and destroys through the generated or local hook declarations in the Nim ABI module.
 
 The producer must export hook thunks for custom behavior that cannot be safely regenerated in the importer. For example, a custom `=destroy` for `RendererObj` must be available if imported ARC code can drop the last reference.
 
@@ -303,7 +293,6 @@ The producer and consumer must match on:
 - Generated Nim ABI module hash.
 - Generated C header hash.
 - Exported proc signature hashes.
-- Exported hook descriptor hashes.
 - Type `sizeof`, alignment, field offsets, field sizes, discriminants, inheritance, and layout hashes.
 - Managed runtime representation hashes for `string`, `ref`, and any supported managed aggregate.
 - Calling convention.
@@ -323,7 +312,7 @@ This proc must:
 1. Check the consumer-provided ABI expectations against the library metadata.
 2. Check the generated Nim ABI module hash.
 3. Check the generated C header hash.
-4. Check `sizeof`, alignment, field offsets, layout hashes, and hook descriptors before any imported ARC operation can run.
+4. Check `sizeof`, alignment, field offsets, and layout hashes before any imported ARC operation can run.
 5. Return a structured mismatch error before any runtime-dependent use.
 6. Call `NimMain` exactly once on success.
 7. Run any user-declared library initialization code.
@@ -370,7 +359,7 @@ may export concrete `get(Box[int])` and `get(Box[string])` symbols.
 
 The compiler should not promise that an importer can instantiate new generic combinations against an already-built shared library unless the library explicitly exports those instantiations.
 
-Generic type layout metadata and hook metadata must be per instantiation.
+Generic type layout metadata and generated hook declarations must be per instantiation.
 
 ## Importer Behavior
 
@@ -381,7 +370,7 @@ A Nim importer module should:
 3. Have generated backend code include or reference the generated C ABI header.
 4. Construct expected ABI metadata from the generated Nim module, importing compilation, and header-derived C layout constants.
 5. Call `nimAbiInit`.
-6. Reject the library if metadata, `sizeof`, alignment, offsets, Nim module hash, C header hash, or hook descriptors mismatch.
+6. Reject the library if metadata, `sizeof`, alignment, offsets, Nim module hash, or C header hash mismatch.
 7. Bind mangled proc and hook symbols only after successful validation.
 8. Compile high-level Nim calls, field access, and ARC lowering against the validated transparent layout.
 9. Use generated attached hooks for producer-owned custom hooks and normal local ARC hooks for compatible compiler-generated hooks.
@@ -406,7 +395,6 @@ Likely compiler areas:
 - Emit generated C ABI headers for exported types, layout constants, procs, and any required hook thunks.
 - Classify ABI-visible types into transparent refs, transparent values, ABI-POD values, and unsupported forms.
 - Compute `sizeof`, alignment, field offsets, field sizes, and layout hashes for transparent `object` and `ref object` payloads.
-- Compute hook descriptors and hook compatibility hashes.
 - Export producer-side hook thunks for user-defined custom hooks.
 - Generate importer-side attached hook wrappers that forward to imported hook thunks.
 - Generate structured ABI metadata.
@@ -430,9 +418,9 @@ Relevant existing compiler machinery:
 ## Risks
 
 - Transparent refs expose layout, so this mode is not an encapsulation boundary.
-- Hook compatibility is the hardest part; a layout match is unsafe if copy, sink, or destroy semantics differ.
+- Generated hook wrappers are critical; a layout match is unsafe if copy, sink, or destroy semantics are forwarded incorrectly.
 - Imported ARC code may drop the last reference, so finalization must be validated and callable.
-- Header and metadata generation must describe compiler-generated hooks as well as user-defined hooks.
+- Nim ABI module generation must describe compiler-generated, unavailable, and user-defined hook paths correctly.
 - Compile-time defines can affect type layout or proc bodies in ways that are hard to fingerprint completely.
 - Direct C callers can corrupt Nim-managed fields if they bypass Nim assignment semantics.
 - Runtime initialization order may be fragile if callers use exported symbols before `nimAbiInit`.
@@ -457,6 +445,6 @@ Use a small shared library test case with:
 - Exported producer hook thunks plus importer-side attached hook wrappers.
 - Explicit `nimAbiInit`.
 - A forced ABI mismatch test for layout.
-- A forced ABI mismatch test for hook metadata.
+- A forced ABI mismatch test for generated hook wrappers or unavailable hook declarations.
 
 This exercises the simplified first dynlib model: a generated Nim ABI module, a generated C layout header, transparent refs, ARC-only ownership reasoning, Itanium-mangled symbols, and explicit ABI validation.
