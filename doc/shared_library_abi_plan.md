@@ -23,12 +23,12 @@
 
 ### Milestone 3: ARC Hook Wrappers
 
-- [ ] Let ordinary Nim ARC lowering perform managed field reads, writes, copies, sinks, and destruction.
-- [ ] Generate producer-side exported hook thunks that wrap user-defined custom hooks.
-- [ ] Generate importer-side attached hooks that forward to imported producer hook thunks.
-- [ ] Generate unavailable `{.error.}` hooks for no-copy operations.
-- [ ] Use local compiler-generated hooks when they are valid under the ABI check.
-- [ ] Reject signatures that require unavailable or unsupported hooks.
+- [x] Let ordinary Nim ARC lowering perform managed field reads, writes, copies, sinks, and destruction.
+- [x] Generate producer-side exported hook thunks that wrap user-defined custom hooks.
+- [x] Generate importer-side attached hooks that forward to imported producer hook thunks.
+- [x] Generate unavailable `{.error.}` hooks for no-copy operations.
+- [x] Use local compiler-generated hooks when they are valid under the ABI check.
+- [x] Reject signatures that require unavailable or unsupported hooks.
 
 ### Milestone 4: Transparent Ref Object Prototype
 
@@ -234,7 +234,7 @@ This is a layout bridge, not a replacement for Nim semantics. The Nim ABI module
 
 The compiler should reject or warn when an ABI-imported proc uses a local type that merely looks like an ABI type. ABI imports should use the canonical type declarations from the generated Nim ABI module so hook attachment and metadata validation apply to the same type identity.
 
-Current status: the producer emits the generated Nim ABI module as `<project>_abi.nim`. Custom attached hooks are mirrored as normal Nim hook-name wrappers that forward to private generated imports, and unavailable hooks are mirrored as `{.error.}` hooks. Importer-side validation helpers and stale-header diagnostics are not implemented yet.
+Current status: the producer emits the generated Nim ABI module as `<project>_abi.nim`. Custom attached hooks are mirrored as normal Nim hook-name wrappers that forward to private generated imports of producer-side ABI hook thunks. Unavailable hooks are mirrored as `{.error.}` hooks. Importer-side validation helpers and stale-header diagnostics are not implemented yet.
 
 ## Generated C ABI Header
 
@@ -256,7 +256,7 @@ The header can expose private layout details because transparent mode is a same-
 
 The header alone is not the runtime trust boundary. C linkers resolve symbol names; they do not check that two shared objects used the same struct definitions. The producer should publish a compact layout fingerprint, and optionally structured `sizeof`, alignment, and offset values for diagnostics. The importer rejects a library if the loaded producer's metadata does not match the generated header it compiled against.
 
-Current status: the producer emits the generated C ABI header as `<project>.abi.h`, including backend runtime declarations, module-qualified Itanium-style object payload declarations, proc prototypes, layout constants, and C compile-time assertions. Importer-side rejection of hand-written or stale headers is still pending.
+Current status: the producer emits the generated C ABI header as `<project>.abi.h`, including backend runtime declarations, module-qualified Itanium-style object payload declarations, proc prototypes, hook thunk prototypes, layout constants, and C compile-time assertions. Importer-side rejection of hand-written or stale headers is still pending.
 
 ## Transparent `ref object` Rules
 
@@ -436,11 +436,11 @@ Likely compiler areas:
 - Reuse or extend the Itanium-style mangling path for exported symbols. Current status: exported Nim ABI procs use signature-mangled symbols.
 - Collect concrete exported generic instantiations. Current status: concrete exported instantiations are recorded when their backend names are finalized.
 - Emit generated Nim ABI modules for Nim consumers. Current status: producer-side `<project>_abi.nim` is emitted.
-- Emit generated C ABI headers for exported types, layout constants, procs, and any required hook thunks. Current status: producer-side `<project>.abi.h` is emitted for types, layout constants, procs, and init; hook thunk prototypes remain pending.
+- Emit generated C ABI headers for exported types, layout constants, procs, and any required hook thunks. Current status: producer-side `<project>.abi.h` is emitted for types, layout constants, procs, init, and hook thunk prototypes.
 - Classify ABI-visible types into transparent refs, transparent values, ABI-POD values, and unsupported forms.
 - Compute `sizeof`, alignment, field offsets, field sizes, and layout hashes for transparent `object` and `ref object` payloads. Current status: `sizeof`, alignment, field offsets, and layout fingerprints are emitted for supported generated objects.
-- Export producer-side hook thunks for user-defined custom hooks. Current status: custom attached hooks for ABI-visible object payloads are marked for export and emitted under their backend hook symbols.
-- Generate importer-side attached hook wrappers that forward to imported hook thunks. Current status: the generated Nim ABI module emits normal hook-name wrappers for custom hooks and `{.error.}` declarations for unavailable hooks.
+- Export producer-side hook thunks for user-defined custom hooks. Current status: custom attached hooks for ABI-visible object payloads remain private and producer-side exported ABI thunks wrap them.
+- Generate importer-side attached hook wrappers that forward to imported hook thunks. Current status: the generated Nim ABI module emits normal hook-name wrappers for custom hooks, imports producer-side ABI thunks, and emits `{.error.}` declarations for unavailable hooks.
 - Generate structured ABI metadata. Current status: producer-side `<project>.abi.json` is emitted with header hash, init symbol, type layout data, and proc signature fingerprints.
 - Generate explicit init and optional shutdown symbols.
 - Suppress automatic shared-library constructors for explicit-init builds.

@@ -1915,6 +1915,17 @@ proc nimAbiHookImportName(h: NimAbiHookInfo): string =
   result = "nimAbiHook" & nimAbiCapitalizeAscii(h.typeName) &
            nimAbiHookSuffix(h.op)
 
+proc nimAbiHookThunkName(m: BModule; h: NimAbiHookInfo): string =
+  result = "_Z"
+  result.add encodeSym(m, h.typ.sym, false,
+                       "NimAbiHook" & nimAbiHookSuffix(h.op))
+  var staticLists = ""
+  if h.hook.typ != nil and h.hook.typ.len > 1:
+    for i in 1..<h.hook.typ.len:
+      if h.hook.typ[i] == nil: continue
+      result.add encodeType(m, h.hook.typ[i], staticLists)
+  result.add staticLists
+
 proc nimAbiCHeaderBasename(conf: ConfigRef): string =
   result = splitFile(toGeneratedFile(conf, conf.projectFull, ".abi.h").string).name &
            splitFile(toGeneratedFile(conf, conf.projectFull, ".abi.h").string).ext
@@ -2092,7 +2103,6 @@ proc nimAbiMarkHookExports(g: BModuleList) =
     if sfError in h.hook.flags: continue
     backendEnsureMutable h.hook
     incl(h.hook.flagsImpl, sfUsed)
-    incl(h.hook.locImpl.flags, lfExportLib)
     let moduleId = h.hook.itemId.module
     if moduleId >= 0 and moduleId < g.mods.len and g.mods[moduleId] != nil:
       genProc(g.mods[moduleId], h.hook)
@@ -2100,6 +2110,124 @@ proc nimAbiMarkHookExports(g: BModuleList) =
       for m in g.modulesClosed:
         if m != nil:
           genProc(m, h.hook)
+          break
+
+proc nimAbiUnsupportedHook(conf: ConfigRef; h: NimAbiHookInfo; reason: string) =
+  localError(conf, h.hook.info,
+    "exportnimabi hook '" & AttachedOpToStr[h.op] & "' for type '" &
+    h.typeName & "' is unsupported: " & reason)
+
+proc nimAbiCheckHookSignature(conf: ConfigRef; h: NimAbiHookInfo) =
+  if h.hook == nil or h.hook.typ == nil:
+    nimAbiUnsupportedHook(conf, h, "missing hook type")
+    return
+  let t = h.hook.typ
+  if t.callConv notin {ccNimCall, ccInline}:
+    nimAbiUnsupportedHook(conf, h, "only Nim-call hooks are supported")
+  case h.op
+  of attachedWasMoved, attachedDestructor:
+    if t.len != 2 or t.returnType != nil:
+      nimAbiUnsupportedHook(conf, h, "expected one parameter and no result")
+  of attachedAsgn, attachedSink:
+    if t.len != 3 or t.returnType != nil:
+      nimAbiUnsupportedHook(conf, h, "expected destination and source parameters with no result")
+  of attachedDup:
+    if t.len != 2 or t.returnType == nil:
+      nimAbiUnsupportedHook(conf, h, "expected one source parameter and a result")
+  of attachedTrace, attachedDeepCopy:
+    nimAbiUnsupportedHook(conf, h, "operation is outside the initial ARC ABI")
+  for i in 1..<t.len:
+    if t.n == nil or t.n[i].kind != nkSym: continue
+    let ptyp = t.n[i].sym.typ.skipTypes({tyGenericInst, tySink})
+    if ptyp.kind in {tyOpenArray, tyVarargs}:
+      nimAbiUnsupportedHook(conf, h, "openArray and varargs hook parameters are not supported")
+    elif ptyp.kind in {tyVar, tyLent}:
+      let elem = ptyp.elementType.skipTypes({tyGenericInst, tySink})
+      if elem.kind in {tyOpenArray, tyVarargs}:
+        nimAbiUnsupportedHook(conf, h, "openArray and varargs hook parameters are not supported")
+
+proc nimAbiProcCallArgs(t: PType): string =
+  result = ""
+  if t == nil or t.n == nil: return
+  var needsComma = false
+  for i in 1..<t.n.len:
+    if t.n[i].kind != nkSym: continue
+    let param = t.n[i].sym
+    if isCompileTimeOnly(param.typ): continue
+    if needsComma: result.add ", "
+    needsComma = true
+    result.add stripCnifMarks($param.loc.snippet)
+    var arr = param.typ.skipTypes({tyGenericInst})
+    if arr.kind in {tyVar, tyLent, tySink}: arr = arr.elementType
+    var j = 0
+    while arr.kind in {tyOpenArray, tyVarargs}:
+      result.add ", "
+      result.add stripCnifMarks($param.loc.snippet)
+      result.add "Len_"
+      result.add $j
+      inc j
+      arr = arr[0].skipTypes({tySink})
+
+proc nimAbiProcBackendName(m: BModule; s: PSym): string
+proc nimAbiRewriteCTypeNames(text: string; m: BModule;
+                             info: NimAbiArtifactInfo): string
+
+proc nimAbiHookThunkCDecl(m: BModule; h: NimAbiHookInfo;
+                          info: NimAbiArtifactInfo): string =
+  var check = initIntSet()
+  var ret: Rope = ""
+  var params = newBuilder("")
+  genProcParams(m, h.hook.typ, ret, params, check)
+  result = "N_LIB_IMPORT "
+  result.add nimAbiRewriteCTypeNames($ret, m, info)
+  result.add " "
+  result.add nimAbiHookThunkName(m, h)
+  result.add nimAbiRewriteCTypeNames(extract(params), m, info)
+  result.add ";\n"
+
+proc nimAbiEmitHookThunk(m: BModule; h: NimAbiHookInfo) =
+  var check = initIntSet()
+  var ret: Rope = ""
+  var params = newBuilder("")
+  genProcParams(m, h.hook.typ, ret, params, check)
+  let thunkName = nimAbiHookThunkName(m, h)
+  let hookName = nimAbiProcBackendName(m, h.hook)
+  let callArgs = nimAbiProcCallArgs(h.hook.typ)
+  m.s[cfsProcs].add "N_LIB_EXPORT "
+  m.s[cfsProcs].add CallingConvToStr[h.hook.typ.callConv]
+  m.s[cfsProcs].add "("
+  m.s[cfsProcs].add ret
+  m.s[cfsProcs].add ", "
+  m.s[cfsProcs].add thunkName
+  m.s[cfsProcs].add ")"
+  m.s[cfsProcs].add extract(params)
+  m.s[cfsProcs].add " {\n"
+  if h.hook.typ.returnType == nil or h.hook.typ.returnType.kind == tyVoid:
+    m.s[cfsProcs].add "\t"
+    m.s[cfsProcs].add hookName
+    m.s[cfsProcs].add "("
+    m.s[cfsProcs].add callArgs
+    m.s[cfsProcs].add ");\n"
+  else:
+    m.s[cfsProcs].add "\treturn "
+    m.s[cfsProcs].add hookName
+    m.s[cfsProcs].add "("
+    m.s[cfsProcs].add callArgs
+    m.s[cfsProcs].add ");\n"
+  m.s[cfsProcs].add "}\n\n"
+
+proc nimAbiEmitProducerHookThunks(g: BModuleList) =
+  let info = nimAbiCollect(g)
+  for h in info.hooks:
+    nimAbiCheckHookSignature(g.config, h)
+    if sfError in h.hook.flags: continue
+    let moduleId = h.hook.itemId.module
+    if moduleId >= 0 and moduleId < g.mods.len and g.mods[moduleId] != nil:
+      nimAbiEmitHookThunk(g.mods[moduleId], h)
+    else:
+      for m in g.modulesClosed:
+        if m != nil:
+          nimAbiEmitHookThunk(m, h)
           break
 
 proc nimAbiNimTypeName(info: NimAbiArtifactInfo; typ: PType): string =
@@ -2258,7 +2386,7 @@ proc nimAbiHookDecl(m: BModule; h: NimAbiHookInfo): string =
     result.add ": "
     result.add h.typeName
   result.add " {.importc: \""
-  result.add nimAbiJsonEscape(nimAbiProcBackendName(m, h.hook))
+  result.add nimAbiJsonEscape(nimAbiHookThunkName(m, h))
   result.add "\".}\n"
   result.add "proc `"
   result.add opName
@@ -2429,6 +2557,9 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   headerText.add "(void);\n"
   for s in info.procs:
     headerText.add nimAbiProcCDecl(mainModule, info, s)
+  for h in info.hooks:
+    if sfError notin h.hook.flags:
+      headerText.add nimAbiHookThunkCDecl(mainModule, h, info)
   headerText.add "\n#endif /* "
   headerText.add headerGuard
   headerText.add " */\n"
@@ -2454,7 +2585,7 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
     if i != 0: metaText.add ",\n"
     metaText.add "    {\"type\": \"" & nimAbiJsonEscape(h.typeName) &
                  "\", \"op\": \"" & nimAbiJsonEscape(AttachedOpToStr[h.op]) &
-                 "\", \"symbol\": \"" & nimAbiJsonEscape(nimAbiProcBackendName(mainModule, h.hook)) &
+                 "\", \"symbol\": \"" & nimAbiJsonEscape(nimAbiHookThunkName(mainModule, h)) &
                  "\", \"unavailable\": " & (if sfError in h.hook.flags: "true" else: "false") & "}"
   metaText.add "\n  ],\n"
   metaText.add "  \"procs\": [\n"
@@ -3530,6 +3661,7 @@ proc cgenWriteModules*(backend: RootRef, config: ConfigRef) =
   # order anyway)
   genForwardedProcs(g)
   nimAbiMarkHookExports(g)
+  nimAbiEmitProducerHookThunks(g)
 
   if config.cmd == cmdNifC and not isDefined(config, "icNoCDce"):
     # Two-phase write: produce every module's marked text and artifact

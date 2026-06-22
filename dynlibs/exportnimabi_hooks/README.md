@@ -14,7 +14,7 @@ Then compile the example as a shared library and emit ABI artifacts:
 ```sh
 rm -rf dynlibs/exportnimabi_hooks/nimcache \
   dynlibs/exportnimabi_hooks/importcache
-/tmp/nim-abi-test c --app:lib --compileOnly \
+./compiler/nim-abi-test c --app:lib --compileOnly \
   --nimcache:dynlibs/exportnimabi_hooks/nimcache \
   dynlibs/exportnimabi_hooks/producer.nim
 ```
@@ -30,7 +30,7 @@ producer.abi.json
 Validate the generated Nim ABI module:
 
 ```sh
-/tmp/nim-abi-test check \
+./compiler/nim-abi-test check \
   --nimcache:dynlibs/exportnimabi_hooks/importcache \
   --path:dynlibs/exportnimabi_hooks/nimcache \
   dynlibs/exportnimabi_hooks/nimcache/producer_abi.nim
@@ -51,4 +51,6 @@ sed -n '1,120p' dynlibs/exportnimabi_hooks/nimcache/producer_abi.nim
 ```
 
 You should see a normal attached hook wrapper named `=destroy` for `Resource`,
-plus an unavailable `=copy` hook.
+plus an unavailable `=copy` hook. The wrapper imports a generated
+`NimAbiHookDestroy` thunk; the producer C keeps the real `=destroy` hook private
+and exports the thunk.

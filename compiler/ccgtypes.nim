@@ -103,104 +103,10 @@ proc isSharedInstanceCName(m: BModule; s: PSym): bool =
     (s.disamb and InstanceDisambBit) != 0'i32 and
     stripCnifMarks(s.loc.snippet) == s.name.s.mangle & "_i" & $s.disamb
 
-const
-  CcgExportNimAbiHookOps = {attachedWasMoved, attachedDestructor,
-                            attachedAsgn, attachedDup, attachedSink}
-
-proc ccgNimAbiTypeUsesHook(graph: ModuleGraph; typ: PType; hook: PSym): bool =
-  result = false
-  if typ == nil or hook == nil: return false
-  let t = typ.skipTypes({tyAlias, tySink, tyOwned, tyLent, tyVar, tyDistinct})
-  if t == nil: return false
-  proc recordUsesHook(n: PNode): bool =
-    result = false
-    if n == nil: return false
-    case n.kind
-    of nkRecList:
-      for i in 0..<n.len:
-        if recordUsesHook(n[i]): return true
-    of nkRecCase:
-      if n.len > 0 and recordUsesHook(n[0]): return true
-      for i in 1..<n.len:
-        if n[i].len > 0 and recordUsesHook(n[i].lastSon): return true
-    of nkSym:
-      result = ccgNimAbiTypeUsesHook(graph, n.sym.typ, hook)
-    else:
-      discard
-  case t.kind
-  of tyGenericInst:
-    result = ccgNimAbiTypeUsesHook(graph, t.skipTypes({tyGenericInst}), hook)
-  of tyRef:
-    result = getAttachedOp(graph, t, attachedDestructor) == hook or
-             ccgNimAbiTypeUsesHook(graph, t.elementType, hook)
-  of tyObject:
-    for op in CcgExportNimAbiHookOps:
-      if getAttachedOp(graph, t, op) == hook:
-        return true
-    if recordUsesHook(t.n): return true
-  of tyPtr:
-    result = ccgNimAbiTypeUsesHook(graph, t.elementType, hook)
-  of tyArray, tyUncheckedArray, tySequence, tyOpenArray, tyVarargs:
-    result = ccgNimAbiTypeUsesHook(graph, t.elementType, hook)
-  of tyTuple:
-    for i in 0..<t.len:
-      if ccgNimAbiTypeUsesHook(graph, t[i], hook):
-        return true
-  of tyProc:
-    if ccgNimAbiTypeUsesHook(graph, t.returnType, hook):
-      return true
-    for i in 1..<t.n.len:
-      if t.n[i].kind == nkSym and
-          ccgNimAbiTypeUsesHook(graph, t.n[i].sym.typ, hook):
-        return true
-  else:
-    discard
-
-proc ccgNimAbiProcUsesHook(graph: ModuleGraph; prc, hook: PSym): bool =
-  result = false
-  if prc == nil or prc.typ == nil: return false
-  if ccgNimAbiTypeUsesHook(graph, prc.typ.returnType, hook): return true
-  if prc.typ.n != nil:
-    for i in 1..<prc.typ.n.len:
-      if prc.typ.n[i].kind == nkSym and
-          ccgNimAbiTypeUsesHook(graph, prc.typ.n[i].sym.typ, hook):
-        return true
-
-proc ccgNimAbiNodeExportsHook(graph: ModuleGraph; n: PNode; hook: PSym): bool =
-  result = false
-  if n == nil: return false
-  case n.kind
-  of nkProcDef, nkFuncDef, nkMethodDef, nkConverterDef:
-    if n.len > namePos and n[namePos].kind == nkSym:
-      let prc = n[namePos].sym
-      if sfExportNimAbi in prc.flags and ccgNimAbiProcUsesHook(graph, prc, hook):
-        return true
-  else:
-    discard
-  for i in 0..<n.safeLen:
-    if ccgNimAbiNodeExportsHook(graph, n[i], hook):
-      return true
-
-proc ccgNimAbiShouldExportHook(m: BModule; hook: PSym): bool =
-  result = false
-  if hook == nil or hook.kind notin routineKinds: return false
-  if sfError in hook.flags: return false
-  if sfOverridden notin hook.flags or sfGeneratedOp in hook.flags: return false
-  for prc in m.g.exportedNimAbiProcs:
-    if ccgNimAbiProcUsesHook(m.g.graph, prc, hook):
-      return true
-  for cmod in m.g.mods:
-    if cmod != nil and cmod.module != nil and
-        ccgNimAbiNodeExportsHook(m.g.graph, cmod.module.ast, hook):
-      return true
-
 proc fillBackendName(m: BModule; s: PSym) =
   if s.kind in routineKinds and sfExportNimAbi in s.flags:
     if not containsOrIncl(m.g.exportedNimAbiSeen, s.id):
       m.g.exportedNimAbiProcs.add s
-  if ccgNimAbiShouldExportHook(m, s):
-    backendEnsureMutable s
-    incl(s.locImpl.flags, lfExportLib)
   if s.loc.snippet == "":
     var result: Rope
     if s.kind in routineKinds and (sfExportNimAbi in s.flags or
