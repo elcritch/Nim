@@ -141,6 +141,8 @@ type
                             # nimtvDeps is VERY hard to cache because it's
                             # not a list of IDs nor can it be made to be one.
     mangledPrcs*: HashSet[string]
+    exportedNimAbiProcs*: seq[PSym]
+    exportedNimAbiSeen*: IntSet
 
   TCGen = object of PPassContext # represents a C source file
     s*: TCFileSections        # sections of the C file
@@ -234,7 +236,8 @@ proc newProc*(prc: PSym, module: BModule): BProc =
 
 proc newModuleList*(g: ModuleGraph): BModuleList =
   BModuleList(typeInfoMarker: initTable[SigHash, tuple[str: Rope, owner: int32]](),
-    config: g.config, graph: g, nimtvDeclared: initIntSet())
+    config: g.config, graph: g, nimtvDeclared: initIntSet(),
+    exportedNimAbiSeen: initIntSet())
 
 iterator cgenModules*(g: BModuleList): BModule =
   for m in g.modulesClosed:

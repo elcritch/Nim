@@ -11,15 +11,15 @@
 
 ### Milestone 2: Generated Nim ABI Module and C Layout Header
 
-- [ ] Emit a generated Nim ABI module for ABI-visible types, imported procs, init, and hook wrappers.
-- [ ] Emit a compiler-generated C header for ABI-visible types and procs.
-- [ ] Have the generated Nim ABI module import or reference the generated C header for backend layout.
-- [ ] Emit transparent `object` and `ref object` payload declarations in the header.
-- [ ] Emit ABI-visible runtime representation declarations needed by those types.
-- [ ] Rely on the C compiler and platform C ABI for `sizeof`, alignment, and field offsets from that header.
-- [ ] Emit optional layout constants and compile-time C assertions for diagnostics.
-- [ ] Record the header hash and layout fingerprint in ABI metadata.
-- [ ] Reject hand-written or stale headers with clear diagnostics.
+- [x] Emit a generated Nim ABI module for ABI-visible types, imported procs, and init.
+- [x] Emit a compiler-generated C header for ABI-visible types and procs.
+- [x] Have the generated Nim ABI module import or reference the generated C header for backend layout.
+- [x] Emit transparent `object` and `ref object` payload declarations in the header.
+- [x] Emit ABI-visible runtime representation declarations needed by those types.
+- [x] Rely on the C compiler and platform C ABI for `sizeof`, alignment, and field offsets from that header.
+- [x] Emit layout constants and compile-time C assertions for diagnostics.
+- [x] Record the header hash and layout fingerprints in ABI metadata.
+- [x] Emit hook wrappers in the generated Nim ABI module.
 
 ### Milestone 3: ARC Hook Wrappers
 
@@ -69,7 +69,7 @@ The initial implementation uses transparent refs instead of opaque handles. The 
 - Itanium-style mangled exported symbols.
 - A generated Nim ABI module for Nim consumers.
 - A generated C ABI header for exported types and procs.
-- Structured ABI metadata for compiler/runtime settings, generated artifact hashes, type sizes, field offsets, and optional diagnostics.
+- Structured ABI metadata for generated artifact hashes, proc signatures, type sizes, field offsets, and layout fingerprints.
 - Explicit initialization and validation entry points.
 
 The importer treats the generated Nim ABI module, generated C header, and metadata as the dynlib contract. The Nim ABI module gives the compiler real Nim declarations for type checking, field access, and hook attachment. The C header lets the C backend compile against the same physical type declarations, so the C compiler computes `sizeof`, alignment, and field offsets in the usual C ABI way. Metadata verifies that the loaded library matches those generated artifacts. After validation, the importer compiles ordinary Nim field access and ARC operations for exported transparent types.
@@ -155,6 +155,46 @@ Generated hook wrappers must preserve Nim hook semantics. In particular, they mu
 
 The generated Nim ABI module hash covers the hook wrappers, imported thunk symbols, and unavailable hook declarations. Metadata may mirror hook decisions for diagnostics, but it is not the source of truth.
 
+## Current Milestone 2 Artifact Emission
+
+Producer-side artifact emission now exists for `{.exportnimabi.}` with the C backend.
+
+For a project named `figdraw.nim`, the compiler emits these files in the nimcache:
+
+- `figdraw_abi.nim`: generated Nim ABI module.
+- `figdraw.abi.h`: generated C layout header.
+- `figdraw.abi.json`: generated ABI metadata.
+
+The generated Nim ABI module currently contains:
+
+- ABI-visible transparent object declarations.
+- Transparent `ref object` aliases through generated payload object declarations.
+- Imported exported procs using the final Itanium-style backend symbols.
+- An imported `NimMain` init declaration.
+- `importc`/`header` annotations that make generated C include the generated ABI C header for layout.
+- Attached hook wrappers named with the normal Nim hook names, such as `=destroy` and `=copy`, for custom producer hooks and unavailable hooks.
+
+The generated C header currently contains:
+
+- Nim C prelude defines needed by `nimbase.h`.
+- ABI-visible runtime representation declarations emitted from the backend type sections.
+- Transparent object and ref payload declarations.
+- Proc prototypes using final backend names.
+- A `NimMain` prototype.
+- `sizeof`, alignment, field-offset constants, and `sizeof`/`offsetof` compile-time assertions.
+- A generated marker define so importer diagnostics can distinguish compiler-generated headers from ordinary hand-written headers.
+
+The generated metadata currently contains:
+
+- Generated Nim ABI module path.
+- Generated C header path.
+- Generated C header hash.
+- Init symbol.
+- Type `sizeof`, alignment, and layout fingerprints.
+- Proc symbols and signature fingerprints.
+
+This is still producer-side artifact emission only. Importer-side validation, stale-header rejection, broader hook coverage, and explicit `nimAbiInit` metadata negotiation remain to be implemented.
+
 ## Generated Nim ABI Module
 
 The generated Nim ABI module is the primary header for Nim consumers. User code imports this module instead of redeclaring lookalike types:
@@ -194,6 +234,8 @@ This is a layout bridge, not a replacement for Nim semantics. The Nim ABI module
 
 The compiler should reject or warn when an ABI-imported proc uses a local type that merely looks like an ABI type. ABI imports should use the canonical type declarations from the generated Nim ABI module so hook attachment and metadata validation apply to the same type identity.
 
+Current status: the producer emits the generated Nim ABI module as `<project>_abi.nim`. Custom attached hooks are mirrored as normal Nim hook-name wrappers that forward to private generated imports, and unavailable hooks are mirrored as `{.error.}` hooks. Importer-side validation helpers and stale-header diagnostics are not implemented yet.
+
 ## Generated C ABI Header
 
 The generated header is a compiler artifact, not a stable human-maintained C API. It should be emitted next to the shared library and referenced by importer-side generated code or by an explicit import pragma.
@@ -213,6 +255,8 @@ The header should contain:
 The header can expose private layout details because transparent mode is a same-build Nim ABI, not an encapsulation boundary. Nim source visibility rules still control which fields are accessible from Nim code through the generated Nim ABI module. The C header is the physical layout source the importing C compiler uses for local layout. For example, `sizeof(T)` and `offsetof(T, field)` come directly from compiling against this header.
 
 The header alone is not the runtime trust boundary. C linkers resolve symbol names; they do not check that two shared objects used the same struct definitions. The producer should publish a compact layout fingerprint, and optionally structured `sizeof`, alignment, and offset values for diagnostics. The importer rejects a library if the loaded producer's metadata does not match the generated header it compiled against.
+
+Current status: the producer emits the generated C ABI header as `<project>.abi.h`, including backend runtime declarations, object payload declarations, proc prototypes, layout constants, and C compile-time assertions. Importer-side rejection of hand-written or stale headers is still pending.
 
 ## Transparent `ref object` Rules
 
@@ -387,17 +431,17 @@ Automatic module-init loading can come later after failure reporting and load or
 
 Likely compiler areas:
 
-- Add a new exported-Nim-ABI pragma or module-level mode.
-- Track ABI-exported symbols separately from `exportc`.
-- Reuse or extend the Itanium-style mangling path for exported symbols.
-- Collect concrete exported generic instantiations.
-- Emit generated Nim ABI modules for Nim consumers.
-- Emit generated C ABI headers for exported types, layout constants, procs, and any required hook thunks.
+- Add a new exported-Nim-ABI pragma or module-level mode. Current status: proc-level `{.exportnimabi.}` exists.
+- Track ABI-exported symbols separately from `exportc`. Current status: the C backend records ABI-exported procs during backend name finalization.
+- Reuse or extend the Itanium-style mangling path for exported symbols. Current status: exported Nim ABI procs use signature-mangled symbols.
+- Collect concrete exported generic instantiations. Current status: concrete exported instantiations are recorded when their backend names are finalized.
+- Emit generated Nim ABI modules for Nim consumers. Current status: producer-side `<project>_abi.nim` is emitted.
+- Emit generated C ABI headers for exported types, layout constants, procs, and any required hook thunks. Current status: producer-side `<project>.abi.h` is emitted for types, layout constants, procs, and init; hook thunk prototypes remain pending.
 - Classify ABI-visible types into transparent refs, transparent values, ABI-POD values, and unsupported forms.
-- Compute `sizeof`, alignment, field offsets, field sizes, and layout hashes for transparent `object` and `ref object` payloads.
-- Export producer-side hook thunks for user-defined custom hooks.
-- Generate importer-side attached hook wrappers that forward to imported hook thunks.
-- Generate structured ABI metadata.
+- Compute `sizeof`, alignment, field offsets, field sizes, and layout hashes for transparent `object` and `ref object` payloads. Current status: `sizeof`, alignment, field offsets, and layout fingerprints are emitted for supported generated objects.
+- Export producer-side hook thunks for user-defined custom hooks. Current status: custom attached hooks for ABI-visible object payloads are marked for export and emitted under their backend hook symbols.
+- Generate importer-side attached hook wrappers that forward to imported hook thunks. Current status: the generated Nim ABI module emits normal hook-name wrappers for custom hooks and `{.error.}` declarations for unavailable hooks.
+- Generate structured ABI metadata. Current status: producer-side `<project>.abi.json` is emitted with header hash, init symbol, type layout data, and proc signature fingerprints.
 - Generate explicit init and optional shutdown symbols.
 - Suppress automatic shared-library constructors for explicit-init builds.
 - Generate or support importer-side ABI expectations.
