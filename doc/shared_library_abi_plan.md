@@ -178,8 +178,8 @@ The generated C header currently contains:
 
 - Nim C prelude defines needed by `nimbase.h`.
 - ABI-visible runtime representation declarations emitted from the backend type sections.
-- Transparent object and ref payload declarations.
-- Proc prototypes using final backend names.
+- Transparent object and ref payload declarations using module-qualified Itanium-style C identifiers.
+- Proc prototypes using final module-qualified Itanium-style backend names.
 - A `NimMain` prototype.
 - `sizeof`, alignment, field-offset constants, and `sizeof`/`offsetof` compile-time assertions.
 - A generated marker define so importer diagnostics can distinguish compiler-generated headers from ordinary hand-written headers.
@@ -256,7 +256,7 @@ The header can expose private layout details because transparent mode is a same-
 
 The header alone is not the runtime trust boundary. C linkers resolve symbol names; they do not check that two shared objects used the same struct definitions. The producer should publish a compact layout fingerprint, and optionally structured `sizeof`, alignment, and offset values for diagnostics. The importer rejects a library if the loaded producer's metadata does not match the generated header it compiled against.
 
-Current status: the producer emits the generated C ABI header as `<project>.abi.h`, including backend runtime declarations, object payload declarations, proc prototypes, layout constants, and C compile-time assertions. Importer-side rejection of hand-written or stale headers is still pending.
+Current status: the producer emits the generated C ABI header as `<project>.abi.h`, including backend runtime declarations, module-qualified Itanium-style object payload declarations, proc prototypes, layout constants, and C compile-time assertions. Importer-side rejection of hand-written or stale headers is still pending.
 
 ## Transparent `ref object` Rules
 
