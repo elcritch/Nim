@@ -32,11 +32,11 @@
 
 ### Milestone 4: Transparent Ref Object Prototype
 
-- [ ] Support transparent `ref object` layout access after ABI validation.
-- [ ] Check ref payload size, alignment, field offsets, inheritance, discriminants, and managed-field layout.
-- [ ] Allow Nim-compiled public field reads and writes after the generated header and ABI metadata match.
-- [ ] Reject unsupported direct field access from C for Nim-managed fields.
-- [ ] Add tests for transparent refs with POD fields, `string` fields, nested refs, and custom hooks.
+- [x] Support transparent `ref object` layout access after ABI validation.
+- [x] Check ref payload size, alignment, field offsets, inheritance, discriminants, and managed-field layout.
+- [x] Allow Nim-compiled public field reads and writes after the generated header and ABI metadata match.
+- [x] Reject unsupported direct field access from C for Nim-managed fields.
+- [x] Add tests for transparent refs with POD fields, `string` fields, nested refs, and custom hooks.
 
 ### Milestone 5: Explicit Init and Metadata Validation
 
@@ -234,7 +234,7 @@ This is a layout bridge, not a replacement for Nim semantics. The Nim ABI module
 
 The compiler should reject or warn when an ABI-imported proc uses a local type that merely looks like an ABI type. ABI imports should use the canonical type declarations from the generated Nim ABI module so hook attachment and metadata validation apply to the same type identity.
 
-Current status: the producer emits the generated Nim ABI module as `<project>_abi.nim`. Custom attached hooks are mirrored as normal Nim hook-name wrappers that forward to private generated imports of producer-side ABI hook thunks. Unavailable hooks are mirrored as `{.error.}` hooks. Importer-side validation helpers and stale-header diagnostics are not implemented yet.
+Current status: the producer emits the generated Nim ABI module as `<project>_abi.nim`. Custom attached hooks are mirrored as normal Nim hook-name wrappers that forward to private generated imports of producer-side ABI hook thunks. Unavailable hooks are mirrored as `{.error.}` hooks. ABI object payload declarations preserve public/private field visibility, inheritance, and managed-field import names so Nim consumers can compile ordinary public field access after importing the generated module. Importer-side runtime validation helpers and stale-header diagnostics are not implemented yet.
 
 ## Generated C ABI Header
 
@@ -256,7 +256,7 @@ The header can expose private layout details because transparent mode is a same-
 
 The header alone is not the runtime trust boundary. C linkers resolve symbol names; they do not check that two shared objects used the same struct definitions. The producer should publish a compact layout fingerprint, and optionally structured `sizeof`, alignment, and offset values for diagnostics. The importer rejects a library if the loaded producer's metadata does not match the generated header it compiled against.
 
-Current status: the producer emits the generated C ABI header as `<project>.abi.h`, including backend runtime declarations, module-qualified Itanium-style object payload declarations, proc prototypes, hook thunk prototypes, layout constants, and C compile-time assertions. Importer-side rejection of hand-written or stale headers is still pending.
+Current status: the producer emits the generated C ABI header as `<project>.abi.h`, including backend runtime declarations, module-qualified Itanium-style object payload declarations, proc prototypes, hook thunk prototypes, layout constants, and C compile-time assertions. The header can be included standalone with runtime declarations, or from generated Nim C after local runtime declarations through a guarded include mode. Importer-side rejection of hand-written or stale headers is still pending.
 
 ## Transparent `ref object` Rules
 
@@ -276,7 +276,7 @@ The producer and importer must agree on:
 
 After validation, a Nim importer may read and write exported fields directly in source code. The resulting C code uses the generated layout, and Nim ARC uses the hook declarations from the generated Nim ABI module.
 
-Direct C callers are more restricted. They may inspect or pass ABI-POD fields, but they must not mutate Nim-managed fields such as `string`, `seq`, `ref`, closures, or fields whose assignment depends on custom hooks.
+Direct C callers are more restricted. They may inspect or pass ABI-POD fields, but they must not mutate Nim-managed fields such as `string`, `seq`, `ref`, closures, or fields whose assignment depends on custom hooks. Current generated headers expose POD fields under their source names and emit managed fields under compiler-owned names such as `nimAbiManaged_name`, so direct C code using the Nim source field name is rejected by the C compiler. This is a diagnostic guard, not a C encapsulation boundary.
 
 ## Plain Object and Value Rules
 
@@ -438,7 +438,7 @@ Likely compiler areas:
 - Emit generated Nim ABI modules for Nim consumers. Current status: producer-side `<project>_abi.nim` is emitted.
 - Emit generated C ABI headers for exported types, layout constants, procs, and any required hook thunks. Current status: producer-side `<project>.abi.h` is emitted for types, layout constants, procs, init, and hook thunk prototypes.
 - Classify ABI-visible types into transparent refs, transparent values, ABI-POD values, and unsupported forms.
-- Compute `sizeof`, alignment, field offsets, field sizes, and layout hashes for transparent `object` and `ref object` payloads. Current status: `sizeof`, alignment, field offsets, and layout fingerprints are emitted for supported generated objects.
+- Compute `sizeof`, alignment, field offsets, field sizes, and layout hashes for transparent `object` and `ref object` payloads. Current status: `sizeof`, alignment, field offsets, field sizes, inheritance paths, discriminant presence, managed-field classification, and layout fingerprints are emitted for supported generated objects.
 - Export producer-side hook thunks for user-defined custom hooks. Current status: custom attached hooks for ABI-visible object payloads remain private and producer-side exported ABI thunks wrap them.
 - Generate importer-side attached hook wrappers that forward to imported hook thunks. Current status: the generated Nim ABI module emits normal hook-name wrappers for custom hooks, imports producer-side ABI thunks, and emits `{.error.}` declarations for unavailable hooks.
 - Generate structured ABI metadata. Current status: producer-side `<project>.abi.json` is emitted with header hash, init symbol, type layout data, and proc signature fingerprints.

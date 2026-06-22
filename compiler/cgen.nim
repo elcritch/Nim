@@ -1123,18 +1123,27 @@ proc cgsymValue(m: BModule, name: string): Rope =
   if m.hcrOn and sym != nil and sym.kind in {skProc..skIterator}:
     result.addActualSuffixForHCR(m.module, sym)
 
+proc nimAbiIsLateHeader(header: string): bool =
+  if header.len == 0 or header[0] == '#': return false
+  let normalized = header.strip(chars = {'"', '<', '>'})
+  result = normalized.endsWith(".abi.h")
+
+proc addConfiguredHeader(dest: var Builder; header: string) =
+  if header[0] == '#':
+    dest.add(rope(header.replace('`', '"') & "\L"))
+  elif header[0] notin {'"', '<'}:
+    dest.addInclude('"' & $header & '"')
+  else:
+    dest.addInclude($header)
+
 proc generateHeaders(m: BModule) =
   var nimbase = m.config.nimbasePattern
   if nimbase == "": nimbase = "nimbase.h"
   m.s[cfsHeaders].addInclude('"' & nimbase & '"')
 
   for it in m.headerFiles:
-    if it[0] == '#':
-      m.s[cfsHeaders].add(rope(it.replace('`', '"') & "\L"))
-    elif it[0] notin {'"', '<'}:
-      m.s[cfsHeaders].addInclude('"' & $it & '"')
-    else:
-      m.s[cfsHeaders].addInclude($it)
+    if not nimAbiIsLateHeader(it):
+      m.s[cfsHeaders].addConfiguredHeader(it)
   m.s[cfsHeaders].add("""#undef LANGUAGE_C
 #undef MIPSEB
 #undef MIPSEL
@@ -1149,6 +1158,13 @@ proc generateHeaders(m: BModule) =
 #undef powerpc
 #undef unix
 """)
+
+proc generateLateHeaders(m: BModule; dest: var Builder) =
+  for it in m.headerFiles:
+    if nimAbiIsLateHeader(it):
+      dest.add "#define NIM_EXPORTNIMABI_SKIP_RUNTIME_DECLS 1\n"
+      dest.addConfiguredHeader(it)
+      dest.add "#undef NIM_EXPORTNIMABI_SKIP_RUNTIME_DECLS\n"
 
 proc openNamespaceNim(namespace: string; result: var Builder) =
   result.add("namespace ")
@@ -1799,6 +1815,19 @@ proc getSomeNameForModule(conf: ConfigRef, filename: AbsoluteFile): Rope =
   result = mangleModuleName(conf, filename).mangle
 
 type
+  NimAbiFieldInfo = object
+    sym: PSym
+    nimName: string
+    cName: string
+    cPath: string
+    exported: bool
+    inherited: bool
+    managed: bool
+    kind: string
+    offset: BiggestInt
+    size: BiggestInt
+    align: BiggestInt
+
   NimAbiObjectInfo = object
     typ: PType
     nimName: string
@@ -1818,6 +1847,7 @@ type
 
   NimAbiArtifactInfo = object
     config: ConfigRef
+    graph: ModuleGraph
     procs: seq[PSym]
     objects: seq[NimAbiObjectInfo]
     refs: seq[NimAbiRefInfo]
@@ -1941,11 +1971,92 @@ proc nimAbiNimModulePath(conf: ConfigRef): AbsoluteFile =
 proc nimAbiInitName(conf: ConfigRef): string =
   result = conf.nimMainPrefix & "NimMain"
 
+proc nimAbiManagedFieldName(field: PSym): string =
+  result = "nimAbiManaged_"
+  result.add nimAbiSanitizeName(field.name.s)
+
+proc nimAbiHasCustomHook(graph: ModuleGraph; typ: PType): bool =
+  result = false
+  if typ == nil: return
+  let t = typ.skipTypes({tyAlias, tyGenericInst, tyDistinct})
+  if t == nil or t.kind notin {tyObject, tySequence, tyString}: return false
+  for op in NimAbiHookOps:
+    let hook = getAttachedOp(graph, t, op)
+    if hook != nil and sfOverridden in hook.flags and sfGeneratedOp notin hook.flags:
+      return true
+
+proc nimAbiFieldKind(graph: ModuleGraph; typ: PType): string
+
+proc nimAbiRecordHasManagedLayout(graph: ModuleGraph; n: PNode): bool =
+  result = false
+  if n == nil: return false
+  case n.kind
+  of nkRecList:
+    for i in 0..<n.len:
+      if nimAbiRecordHasManagedLayout(graph, n[i]): return true
+  of nkRecCase:
+    if n.len > 0 and nimAbiRecordHasManagedLayout(graph, n[0]): return true
+    for i in 1..<n.len:
+      if n[i].len > 0 and nimAbiRecordHasManagedLayout(graph, n[i].lastSon):
+        return true
+  of nkSym:
+    result = nimAbiFieldKind(graph, n.sym.typ) != "pod"
+  else:
+    discard
+
+proc nimAbiFieldKind(graph: ModuleGraph; typ: PType): string =
+  if typ == nil: return "unsupported"
+  let t = typ.skipTypes({tyAlias, tySink, tyOwned, tyLent, tyVar})
+  if t == nil: return "unsupported"
+  case t.kind
+  of tyString:
+    result = "string"
+  of tySequence:
+    result = "seq"
+  of tyRef:
+    result = "ref"
+  of tyProc:
+    result = "closure"
+  of tyArray, tyUncheckedArray:
+    let elemKind = nimAbiFieldKind(graph, t.elementType)
+    result = if elemKind == "pod": "pod" else: "arrayManaged"
+  of tyTuple:
+    result = "pod"
+    for i in 0..<t.len:
+      if nimAbiFieldKind(graph, t[i]) != "pod":
+        result = "tupleManaged"
+        break
+  of tyObject:
+    if nimAbiHasCustomHook(graph, t):
+      result = "customHook"
+    elif t.baseClass != nil and
+        nimAbiFieldKind(graph, t.baseClass.skipTypes(skipPtrs)) != "pod":
+      result = "objectManaged"
+    elif nimAbiRecordHasManagedLayout(graph, t.n):
+      result = "objectManaged"
+    else:
+      result = "pod"
+  of tyGenericInst:
+    result = nimAbiFieldKind(graph, t.skipTypes({tyGenericInst}))
+  of tyDistinct:
+    result = nimAbiFieldKind(graph, t.elementType)
+  else:
+    result = "pod"
+
+proc nimAbiFieldIsManaged(graph: ModuleGraph; field: PSym): bool =
+  result = nimAbiFieldKind(graph, field.typ) != "pod"
+
 proc nimAbiAddObject(info: var NimAbiArtifactInfo; typ: PType;
                      nimName: string; isRefPayload: bool) =
   let raw = typ.skipTypes({tyAlias})
   let obj = raw.skipTypes({tyGenericInst})
   if obj == nil or obj.kind != tyObject: return
+  if obj.baseClass != nil:
+    let base = obj.baseClass.skipTypes(skipPtrs+{tyAlias, tyGenericInst})
+    if base != nil and base.kind == tyObject and base.sym != nil and
+        base.sym.name.s != "RootObj":
+      nimAbiAddObject(info, base, nimAbiSymName(base.sym, "AbiObject" & $base.id),
+                      isRefPayload = false)
   var cleanName = nimAbiSanitizeName(nimName)
   for existing in info.objects:
     if existing.nimName == cleanName and existing.typ.id != obj.id:
@@ -1970,7 +2081,75 @@ proc nimAbiCTypeName(m: BModule; obj: NimAbiObjectInfo): string =
   else:
     result = "NimAbi_" & obj.nimName
 
+proc nimAbiValueObjectDepIds(typ: PType; deps: var IntSet) =
+  if typ == nil: return
+  let t = typ.skipTypes({tyAlias, tySink, tyOwned, tyLent, tyVar, tyDistinct})
+  if t == nil: return
+  case t.kind
+  of tyGenericInst:
+    nimAbiValueObjectDepIds(t.skipTypes({tyGenericInst}), deps)
+  of tyObject:
+    deps.incl t.id
+  of tyArray, tyUncheckedArray:
+    nimAbiValueObjectDepIds(t.elementType, deps)
+  of tyTuple:
+    for i in 0..<t.len:
+      nimAbiValueObjectDepIds(t[i], deps)
+  else:
+    discard
+
+proc nimAbiCollectObjectDepsFromNode(n: PNode; deps: var IntSet) =
+  if n == nil: return
+  case n.kind
+  of nkRecList:
+    for i in 0..<n.len:
+      nimAbiCollectObjectDepsFromNode(n[i], deps)
+  of nkRecCase:
+    if n.len > 0:
+      nimAbiCollectObjectDepsFromNode(n[0], deps)
+    for i in 1..<n.len:
+      if n[i].len > 0:
+        nimAbiCollectObjectDepsFromNode(n[i].lastSon, deps)
+  of nkSym:
+    nimAbiValueObjectDepIds(n.sym.typ, deps)
+  else:
+    discard
+
+proc nimAbiCollectObjectDeps(obj: PType; deps: var IntSet) =
+  if obj == nil: return
+  if obj.baseClass != nil:
+    let base = obj.baseClass.skipTypes(skipPtrs+{tyAlias, tyGenericInst})
+    if base != nil and base.kind == tyObject:
+      deps.incl base.id
+  nimAbiCollectObjectDepsFromNode(obj.n, deps)
+
+proc nimAbiOrderObjects(info: var NimAbiArtifactInfo) =
+  let objects = info.objects
+  var byId = initTable[int, int]()
+  for i, obj in objects:
+    byId[obj.typ.id] = i
+  var visiting = initIntSet()
+  var done = initIntSet()
+  var ordered: seq[NimAbiObjectInfo] = @[]
+  proc visit(i: int) =
+    let id = objects[i].typ.id
+    if id in done: return
+    if id in visiting: return
+    visiting.incl id
+    var deps = initIntSet()
+    nimAbiCollectObjectDeps(objects[i].typ, deps)
+    for depId in deps:
+      if depId != id and depId in byId:
+        visit(byId[depId])
+    visiting.excl id
+    done.incl id
+    ordered.add objects[i]
+  for i in 0..<objects.len:
+    visit(i)
+  info.objects = ordered
+
 proc nimAbiAssignCTypeNames(info: var NimAbiArtifactInfo; m: BModule) =
+  nimAbiOrderObjects(info)
   var seen = initTable[string, int]()
   for i in 0..<info.objects.len:
     let baseName = nimAbiCTypeName(m, info.objects[i])
@@ -2083,6 +2262,7 @@ proc nimAbiCollectHooks(info: var NimAbiArtifactInfo; graph: ModuleGraph) =
 proc nimAbiCollect(g: BModuleList): NimAbiArtifactInfo =
   result = NimAbiArtifactInfo()
   result.config = g.config
+  result.graph = g.graph
   result.seenProcs = initIntSet()
   result.seenObjects = initIntSet()
   result.seenRefs = initIntSet()
@@ -2258,19 +2438,38 @@ proc nimAbiNimTypeName(info: NimAbiArtifactInfo; typ: PType): string =
   else:
     result = typeToString(t)
 
+proc nimAbiFieldCName(info: NimAbiArtifactInfo; field: PSym): string =
+  if field == nil: return ""
+  if nimAbiFieldIsManaged(info.graph, field):
+    return nimAbiManagedFieldName(field)
+  result = nimAbiSanitizeName(field.name.s)
+  if field.loc.snippet.len != 0:
+    result = stripCnifMarks($field.loc.snippet)
+
+proc nimAbiAppendNimField(dest: var string; info: NimAbiArtifactInfo;
+                          field: PSym) =
+  if field.typ == nil or field.typ.kind == tyVoid: return
+  let nimName = nimAbiSanitizeName(field.name.s)
+  let cName = nimAbiFieldCName(info, field)
+  dest.add "    "
+  dest.add nimName
+  if sfExported in field.flags:
+    dest.add "*"
+  if cName.len != 0 and cName != nimName:
+    dest.add " {.importc: \""
+    dest.add nimAbiJsonEscape(cName)
+    dest.add "\".}"
+  dest.add ": "
+  dest.add nimAbiNimTypeName(info, field.typ)
+  dest.add "\n"
+
 proc nimAbiAppendNimFields(dest: var string; info: NimAbiArtifactInfo; n: PNode) =
   if n == nil: return
   case n.kind
   of nkRecList:
     for i in 0..<n.len: nimAbiAppendNimFields(dest, info, n[i])
   of nkSym:
-    let field = n.sym
-    if field.typ == nil or field.typ.kind == tyVoid: return
-    dest.add "    "
-    dest.add nimAbiSanitizeName(field.name.s)
-    dest.add "*: "
-    dest.add nimAbiNimTypeName(info, field.typ)
-    dest.add "\n"
+    nimAbiAppendNimField(dest, info, n.sym)
   of nkRecCase:
     # Variant objects are represented faithfully in the generated C header.
     # The Nim header leaves branch fields to typed accessors/imported procs
@@ -2278,6 +2477,35 @@ proc nimAbiAppendNimFields(dest: var string; info: NimAbiArtifactInfo; n: PNode)
     dest.add "    # variant object layout is provided by the generated C header\n"
   else:
     discard
+
+proc nimAbiObjectBaseTypeName(info: NimAbiArtifactInfo; typ: PType): string =
+  result = ""
+  if typ == nil or typ.baseClass == nil: return ""
+  let base = typ.baseClass.skipTypes(skipPtrs+{tyAlias, tyGenericInst})
+  if base == nil or base.kind != tyObject: return ""
+  if base.id in info.nimTypeNames:
+    result = info.nimTypeNames[base.id]
+  elif base.sym != nil and base.sym.name.s == "RootObj":
+    result = "RootObj"
+
+proc nimAbiAppendObjectHeader(dest: var string; info: NimAbiArtifactInfo;
+                              obj: NimAbiObjectInfo; headerBase: string) =
+  dest.add "  "
+  dest.add obj.nimName
+  dest.add "* {.importc: \""
+  dest.add obj.cName
+  dest.add "\", header: \""
+  dest.add headerBase
+  dest.add "\".} = object"
+  let baseName = nimAbiObjectBaseTypeName(info, obj.typ)
+  if baseName.len != 0:
+    dest.add " of "
+    dest.add baseName
+  dest.add "\n"
+  let before = dest.len
+  nimAbiAppendNimFields(dest, info, obj.typ.n)
+  if dest.len == before:
+    dest.add "    discard\n"
 
 proc nimAbiProcBackendName(m: BModule; s: PSym): string =
   fillBackendName(m, s)
@@ -2331,6 +2559,84 @@ proc nimAbiProcCDecl(m: BModule; info: NimAbiArtifactInfo; s: PSym): string =
   result.add nimAbiProcBackendName(m, s)
   result.add nimAbiRewriteCTypeNames(extract(params), m, info)
   result.add ";\n"
+
+proc nimAbiHasVariantFields(n: PNode): bool =
+  result = false
+  if n == nil: return false
+  case n.kind
+  of nkRecList:
+    for i in 0..<n.len:
+      if nimAbiHasVariantFields(n[i]): return true
+  of nkRecCase:
+    result = true
+  else:
+    discard
+
+proc nimAbiBaseCTypeName(m: BModule; info: NimAbiArtifactInfo; typ: PType): string =
+  result = ""
+  if typ == nil or typ.baseClass == nil: return ""
+  let base = typ.baseClass.skipTypes(skipPtrs+{tyAlias, tyGenericInst})
+  if base == nil or base.kind != tyObject: return ""
+  if base.id in info.cTypeNames:
+    result = info.cTypeNames[base.id]
+  else:
+    result = stripCnifMarks($getTypeDesc(m, base, dkField))
+
+proc nimAbiFieldCType(m: BModule; info: NimAbiArtifactInfo; field: PSym;
+                      check: var IntSet): string =
+  if field.typ == nil: return ""
+  let fieldType = field.typ.skipTypes(abstractInst)
+  var typ: Rope = ""
+  if fieldType.kind == tyUncheckedArray:
+    typ = getTypeDescAux(m, fieldType.elemType, check, dkField)
+  elif fieldType.kind == tySequence:
+    typ = getTypeDescWeak(m, field.typ, check, dkField)
+  else:
+    typ = getTypeDescAux(m, field.typ, check, dkField)
+  result = nimAbiRewriteCTypeNames(stripCnifMarks($typ), m, info)
+
+proc nimAbiAppendCRecordFields(dest: var Builder; m: BModule;
+                               info: NimAbiArtifactInfo; obj: NimAbiObjectInfo;
+                               n: PNode; check: var IntSet) =
+  if n == nil: return
+  case n.kind
+  of nkRecList:
+    for i in 0..<n.len:
+      nimAbiAppendCRecordFields(dest, m, info, obj, n[i], check)
+  of nkRecCase:
+    if n.len > 0:
+      nimAbiAppendCRecordFields(dest, m, info, obj, n[0], check)
+    var unionBody = newBuilder("")
+    for i in 1..<n.len:
+      case n[i].kind
+      of nkOfBranch, nkElse:
+        let branch = lastSon(n[i])
+        if branch.kind != nkSym:
+          let discrimName =
+            if n[0].kind == nkSym: nimAbiFieldCName(info, n[0].sym)
+            else: "case"
+          let structName = "_" & discrimName & "_" & $i
+          var nested = newBuilder("")
+          nimAbiAppendCRecordFields(nested, m, info, obj, branch, check)
+          if nested.buf.len != 0:
+            unionBody.addFieldWithStructType(m, obj.typ, structName):
+              unionBody.add(extract(nested))
+        else:
+          nimAbiAppendCRecordFields(unionBody, m, info, obj, branch, check)
+      else:
+        internalError(m.config, "nimAbiAppendCRecordFields(record case branch)")
+    if unionBody.buf.len != 0:
+      dest.addAnonUnion:
+        dest.add(extract(unionBody))
+  of nkSym:
+    let field = n.sym
+    if field.typ == nil or field.typ.kind == tyVoid: return
+    let cName = nimAbiFieldCName(info, field)
+    let cTyp = nimAbiFieldCType(m, info, field, check)
+    let fieldType = field.typ.skipTypes(abstractInst)
+    dest.addField(field, cName, cTyp, isFlexArray = fieldType.kind == tyUncheckedArray)
+  else:
+    internalError(m.config, n.info, "nimAbiAppendCRecordFields")
 
 proc nimAbiHookFormal(h: NimAbiHookInfo): string =
   let typ = h.typeName
@@ -2408,22 +2714,38 @@ proc nimAbiHookDecl(m: BModule; h: NimAbiHookInfo): string =
     result.add nimAbiHookCallArgs(h)
     result.add ")\n"
 
-proc nimAbiAppendCFieldOffsetAsserts(dest: var string; obj: NimAbiObjectInfo;
-                                     n: PNode) =
+proc nimAbiAppendCFieldLayoutAsserts(dest: var string; info: NimAbiArtifactInfo;
+                                     obj: NimAbiObjectInfo; n: PNode;
+                                     prefix = ""; macroPrefix = "") =
   if n == nil: return
   case n.kind
   of nkRecList:
-    for i in 0..<n.len: nimAbiAppendCFieldOffsetAsserts(dest, obj, n[i])
+    for i in 0..<n.len:
+      nimAbiAppendCFieldLayoutAsserts(dest, info, obj, n[i], prefix, macroPrefix)
   of nkRecCase:
-    if n.len > 0: nimAbiAppendCFieldOffsetAsserts(dest, obj, n[0])
+    if n.len > 0:
+      nimAbiAppendCFieldLayoutAsserts(dest, info, obj, n[0], prefix, macroPrefix)
     for i in 1..<n.len:
       if n[i].len > 0:
-        nimAbiAppendCFieldOffsetAsserts(dest, obj, n[i].lastSon)
+        let branchPrefix =
+          if n[0].kind == nkSym:
+            prefix & "_" & nimAbiFieldCName(info, n[0].sym) & "_" & $i & "."
+          else:
+            prefix & "_case_" & $i & "."
+        let branchMacro =
+          if n[0].kind == nkSym:
+            macroPrefix & nimAbiSanitizeName(nimAbiFieldCName(info, n[0].sym)) & "_" & $i & "_"
+          else:
+            macroPrefix & "case_" & $i & "_"
+        nimAbiAppendCFieldLayoutAsserts(dest, info, obj, n[i].lastSon,
+                                        branchPrefix, branchMacro)
   of nkSym:
     let field = n.sym
     if field.typ == nil or field.typ.kind == tyVoid: return
-    if field.loc.snippet.len == 0: return
-    let offsetName = obj.cName & "_offset_" & nimAbiSanitizeName(field.name.s)
+    let cName = nimAbiFieldCName(info, field)
+    let cPath = prefix & cName
+    let suffix = macroPrefix & nimAbiSanitizeName(field.name.s)
+    let offsetName = obj.cName & "_offset_" & suffix
     dest.add "#define "
     dest.add offsetName
     dest.add " "
@@ -2434,28 +2756,57 @@ proc nimAbiAppendCFieldOffsetAsserts(dest: var string; obj: NimAbiObjectInfo;
     dest.add "_check[(offsetof("
     dest.add obj.cName
     dest.add ", "
-    dest.add stripCnifMarks($field.loc.snippet)
+    dest.add cPath
     dest.add ") == "
     dest.add offsetName
     dest.add ") ? 1 : -1];\n"
+    let fieldSize = getSize(info.config, field.typ)
+    if fieldSize != szUnknownSize and field.bitsize == 0:
+      let sizeName = obj.cName & "_field_sizeof_" & suffix
+      dest.add "#define "
+      dest.add sizeName
+      dest.add " "
+      dest.add $fieldSize
+      dest.add "\n"
+      dest.add "typedef char "
+      dest.add sizeName
+      dest.add "_check[(sizeof((("
+      dest.add obj.cName
+      dest.add "*)0)->"
+      dest.add cPath
+      dest.add ") == "
+      dest.add sizeName
+      dest.add ") ? 1 : -1];\n"
   else:
     discard
 
-proc nimAbiAppendCObject(dest: var string; m: BModule; obj: NimAbiObjectInfo) =
+proc nimAbiAppendInheritedCFieldLayoutAsserts(dest: var string;
+                                              info: NimAbiArtifactInfo;
+                                              obj: NimAbiObjectInfo;
+                                              typ: PType;
+                                              prefix = "Sup.";
+                                              macroPrefix = "base_") =
+  if typ == nil: return
+  let base = typ.skipTypes(skipPtrs+{tyAlias, tyGenericInst})
+  if base == nil or base.kind != tyObject: return
+  if base.baseClass != nil:
+    let parent = base.baseClass.skipTypes(skipPtrs+{tyAlias, tyGenericInst})
+    if parent != nil and parent.kind == tyObject:
+      nimAbiAppendInheritedCFieldLayoutAsserts(dest, info, obj, parent,
+        prefix & "Sup.", macroPrefix & "base_")
+  nimAbiAppendCFieldLayoutAsserts(dest, info, obj, base.n, prefix, macroPrefix)
+
+proc nimAbiAppendCObject(dest: var string; m: BModule;
+                         info: NimAbiArtifactInfo; obj: NimAbiObjectInfo) =
   var check = initIntSet()
   var fields = newBuilder("")
   fillObjectFields(m, obj.typ)
-  addRecordFields(fields, m, obj.typ, check)
-  dest.add "typedef struct "
-  dest.add obj.cName
-  dest.add " "
-  dest.add obj.cName
-  dest.add ";\n"
-  dest.add "struct "
-  dest.add obj.cName
-  dest.add " {\n"
-  dest.add extract(fields)
-  dest.add "};\n"
+  nimAbiAppendCRecordFields(fields, m, info, obj, obj.typ.n, check)
+  var structBody = newBuilder("")
+  let baseType = nimAbiBaseCTypeName(m, info, obj.typ)
+  structBody.addStruct(m, obj.typ, obj.cName, baseType):
+    structBody.add extract(fields)
+  dest.add extract(structBody)
   dest.add "#define "
   dest.add obj.cName
   dest.add "_sizeof "
@@ -2465,7 +2816,11 @@ proc nimAbiAppendCObject(dest: var string; m: BModule; obj: NimAbiObjectInfo) =
   dest.add "_alignof "
   dest.add $getAlign(m.config, obj.typ)
   dest.add "\n"
-  nimAbiAppendCFieldOffsetAsserts(dest, obj, obj.typ.n)
+  if obj.typ.baseClass != nil:
+    let base = obj.typ.baseClass.skipTypes(skipPtrs+{tyAlias, tyGenericInst})
+    if base != nil and base.kind == tyObject:
+      nimAbiAppendInheritedCFieldLayoutAsserts(dest, info, obj, base)
+  nimAbiAppendCFieldLayoutAsserts(dest, info, obj, obj.typ.n)
   dest.add "typedef char "
   dest.add obj.cName
   dest.add "_sizeof_check[(sizeof("
@@ -2474,6 +2829,91 @@ proc nimAbiAppendCObject(dest: var string; m: BModule; obj: NimAbiObjectInfo) =
   dest.add obj.cName
   dest.add "_sizeof) ? 1 : -1];\n"
   dest.add "\n"
+
+proc nimAbiCollectFieldInfos(info: NimAbiArtifactInfo; typ: PType; n: PNode;
+                             inherited: bool; prefix = "";
+                             result: var seq[NimAbiFieldInfo]) =
+  if n == nil: return
+  case n.kind
+  of nkRecList:
+    for i in 0..<n.len:
+      nimAbiCollectFieldInfos(info, typ, n[i], inherited, prefix, result)
+  of nkRecCase:
+    if n.len > 0:
+      nimAbiCollectFieldInfos(info, typ, n[0], inherited, prefix, result)
+    for i in 1..<n.len:
+      if n[i].len > 0:
+        let branchPrefix =
+          if n[0].kind == nkSym:
+            prefix & "_" & nimAbiFieldCName(info, n[0].sym) & "_" & $i & "."
+          else:
+            prefix & "_case_" & $i & "."
+        nimAbiCollectFieldInfos(info, typ, n[i].lastSon, inherited,
+                                branchPrefix, result)
+  of nkSym:
+    let field = n.sym
+    if field.typ == nil or field.typ.kind == tyVoid: return
+    let cName = nimAbiFieldCName(info, field)
+    result.add NimAbiFieldInfo(
+      sym: field,
+      nimName: field.name.s,
+      cName: cName,
+      cPath: prefix & cName,
+      exported: sfExported in field.flags,
+      inherited: inherited,
+      managed: nimAbiFieldIsManaged(info.graph, field),
+      kind: nimAbiFieldKind(info.graph, field.typ),
+      offset: field.offset,
+      size: getSize(info.config, field.typ),
+      align: getAlign(info.config, field.typ))
+  else:
+    discard
+
+proc nimAbiCollectInheritedFieldInfos(info: NimAbiArtifactInfo; typ: PType;
+                                      prefix = "Sup.";
+                                      result: var seq[NimAbiFieldInfo]) =
+  if typ == nil: return
+  let base = typ.skipTypes(skipPtrs+{tyAlias, tyGenericInst})
+  if base == nil or base.kind != tyObject: return
+  if base.baseClass != nil:
+    let parent = base.baseClass.skipTypes(skipPtrs+{tyAlias, tyGenericInst})
+    if parent != nil and parent.kind == tyObject:
+      nimAbiCollectInheritedFieldInfos(info, parent, prefix & "Sup.", result)
+  nimAbiCollectFieldInfos(info, base, base.n, inherited = true, prefix, result)
+
+proc nimAbiObjectFieldInfos(info: NimAbiArtifactInfo;
+                            obj: NimAbiObjectInfo): seq[NimAbiFieldInfo] =
+  result = @[]
+  if obj.typ.baseClass != nil:
+    let base = obj.typ.baseClass.skipTypes(skipPtrs+{tyAlias, tyGenericInst})
+    if base != nil and base.kind == tyObject:
+      nimAbiCollectInheritedFieldInfos(info, base, result = result)
+  nimAbiCollectFieldInfos(info, obj.typ, obj.typ.n, inherited = false,
+                          result = result)
+
+proc nimAbiAppendJsonFields(dest: var string; info: NimAbiArtifactInfo;
+                            obj: NimAbiObjectInfo) =
+  let fields = nimAbiObjectFieldInfos(info, obj)
+  dest.add ", \"hasInheritance\": "
+  dest.add(if obj.typ.baseClass != nil: "true" else: "false")
+  dest.add ", \"hasDiscriminant\": "
+  dest.add(if nimAbiHasVariantFields(obj.typ.n): "true" else: "false")
+  dest.add ", \"isRefPayload\": "
+  dest.add(if obj.isRefPayload: "true" else: "false")
+  dest.add ", \"fields\": ["
+  for i, field in fields:
+    if i != 0: dest.add ", "
+    dest.add "{\"name\": \"" & nimAbiJsonEscape(field.nimName) &
+             "\", \"cName\": \"" & nimAbiJsonEscape(field.cName) &
+             "\", \"cPath\": \"" & nimAbiJsonEscape(field.cPath) &
+             "\", \"offset\": " & $field.offset &
+             ", \"sizeof\": " & $field.size &
+             ", \"alignof\": " & $field.align &
+             ", \"exported\": " & (if field.exported: "true" else: "false") &
+             ", \"inherited\": " & (if field.inherited: "true" else: "false") &
+             ", \"managed\": " & (if field.managed: "true" else: "false") &
+             ", \"kind\": \"" & nimAbiJsonEscape(field.kind) & "\"}"
+  dest.add "]"
 
 proc nimAbiWriteArtifacts(g: BModuleList) =
   var info = nimAbiCollect(g)
@@ -2503,17 +2943,7 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   if info.objects.len != 0 or info.refs.len != 0:
     nimText.add "type\n"
     for obj in info.objects:
-      nimText.add "  "
-      nimText.add obj.nimName
-      nimText.add "* {.importc: \""
-      nimText.add obj.cName
-      nimText.add "\", header: \""
-      nimText.add headerBase
-      nimText.add "\".} = object\n"
-      let before = nimText.len
-      nimAbiAppendNimFields(nimText, info, obj.typ.n)
-      if nimText.len == before:
-        nimText.add "    discard\n"
+      nimAbiAppendObjectHeader(nimText, info, obj, headerBase)
     for refInfo in info.refs:
       nimText.add "  "
       nimText.add refInfo.nimName
@@ -2546,12 +2976,21 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   headerText.add extract(headerDefines)
   headerText.add "#include <stddef.h>\n"
   headerText.add "#include \"nimbase.h\"\n\n"
+  headerText.add "#ifndef NIM_EXPORTNIMABI_SKIP_RUNTIME_DECLS\n"
   headerText.add extract(mainModule.s[cfsForwardTypes])
   headerText.add extract(mainModule.s[cfsTypes])
   headerText.add extract(mainModule.s[cfsSeqTypes])
-  headerText.add "\n"
+  headerText.add "#endif\n\n"
   for obj in info.objects:
-    nimAbiAppendCObject(headerText, mainModule, obj)
+    headerText.add "typedef struct "
+    headerText.add obj.cName
+    headerText.add " "
+    headerText.add obj.cName
+    headerText.add ";\n"
+  if info.objects.len != 0:
+    headerText.add "\n"
+  for obj in info.objects:
+    nimAbiAppendCObject(headerText, mainModule, info, obj)
   headerText.add "N_LIB_IMPORT void "
   headerText.add nimAbiInitName(conf)
   headerText.add "(void);\n"
@@ -2578,7 +3017,9 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
                  "\", \"cName\": \"" & nimAbiJsonEscape(obj.cName) &
                  "\", \"sizeof\": " & $getSize(conf, obj.typ) &
                  ", \"alignof\": " & $getAlign(conf, obj.typ) &
-                 ", \"layoutFingerprint\": \"" & $hashType(obj.typ, conf) & "\"}"
+                 ", \"layoutFingerprint\": \"" & $hashType(obj.typ, conf) & "\""
+    nimAbiAppendJsonFields(metaText, info, obj)
+    metaText.add "}"
   metaText.add "\n  ],\n"
   metaText.add "  \"hooks\": [\n"
   for i, h in info.hooks:
@@ -3268,6 +3709,8 @@ proc genModule(m: BModule, cfile: Cfile): Rope =
     if m.s[i].buf.len > 0:
       moduleIsEmpty = false
       res.add(extract(m.s[i]))
+    if i == cfsSeqTypes:
+      m.generateLateHeaders(res)
 
   # what `registerModuleToMain` will announce for this module; recorded in
   # the artifact's meta head so a later run can reuse the TU
@@ -3393,6 +3836,8 @@ proc writeHeader(m: BModule) =
     result.add(extract(m.s[i]))
     if m.config.cppCustomNamespace.len > 0 and i == cfsHeaders:
       openNamespaceNim(m.config.cppCustomNamespace, result)
+    if i == cfsSeqTypes:
+      m.generateLateHeaders(result)
   result.add(extract(m.s[cfsInitProc]))
 
   let vis = if optGenDynLib in m.config.globalOptions: ImportLib else: None
