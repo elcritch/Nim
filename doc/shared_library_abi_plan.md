@@ -9,197 +9,219 @@
 - [x] Export concrete generic instantiations with distinct signature-mangled symbols.
 - [x] Add codegen coverage that checks generated exported symbols.
 
-### Milestone 2: Opaque Ref Object Handles and Accessors
+### Milestone 2: Generated C ABI Header and Layout Checks
 
-- [x] Classify exported `ref object` types as opaque ABI handles.
-- [x] Generate producer-side accessor exports for public fields on opaque refs.
-- [ ] Generate importer-side wrapper accessors so public fields remain source-level ergonomic.
-- [x] Define accessor return policy for POD values, managed copies, borrowed views, and nested handles.
-- [x] Keep allocation, destruction, ARC retain/release, managed fields, and invariants inside the producer library.
-- [ ] Require exported constructor, accessor, and destructor or retain/release procs for handle-backed APIs.
-- [ ] Reject direct cross-library layout access with clear diagnostics.
-- [x] Reject unsupported accessor shapes with clear diagnostics.
-- [x] Add tests for opaque handle signatures and rejection paths.
+- [ ] Emit a compiler-generated C header for ABI-visible types and procs.
+- [ ] Emit transparent `object` and `ref object` payload declarations in the header.
+- [ ] Emit ABI-visible runtime representation declarations needed by those types.
+- [ ] Rely on the C compiler and platform C ABI for `sizeof`, alignment, and field offsets from that header.
+- [ ] Emit optional layout constants and compile-time C assertions for diagnostics.
+- [ ] Record the header hash and layout fingerprint in ABI metadata.
+- [ ] Reject hand-written or stale headers with clear diagnostics.
 
-### Milestone 3: Explicit Init and Metadata
+### Milestone 3: ARC Hook Validation
 
-- [ ] Generate ABI metadata for compiler, target, backend, memory manager, allocator, flags, proc signatures, opaque handle identities, and accessor return modes.
+- [ ] Let ordinary Nim ARC lowering perform managed field reads, writes, copies, sinks, and destruction.
+- [ ] Record hook identity and availability for ABI-visible managed types.
+- [ ] Export hook thunks only when the importer cannot compile a compatible local hook.
+- [ ] Reject signatures that require unavailable, incompatible, or no-copy hooks.
+
+### Milestone 4: Transparent Ref Object Prototype
+
+- [ ] Support transparent `ref object` layout access after ABI validation.
+- [ ] Check ref payload size, alignment, field offsets, inheritance, discriminants, and managed-field layout.
+- [ ] Allow Nim-compiled public field reads and writes after the generated header and ABI metadata match.
+- [ ] Reject unsupported direct field access from C for Nim-managed fields.
+- [ ] Add tests for transparent refs with POD fields, `string` fields, nested refs, and custom hooks.
+
+### Milestone 5: Explicit Init and Metadata Validation
+
+- [ ] Generate ABI metadata for compiler, target, backend, memory manager, allocator, flags, proc signatures, `sizeof`, alignment, offsets, layout hashes, and hook descriptors.
 - [ ] Generate explicit `nimAbiInit` entry point.
 - [ ] Suppress automatic shared-library constructors for explicit-init builds.
+- [ ] Bind mangled proc and hook symbols only after ABI validation.
 - [ ] Add ABI mismatch diagnostics and tests.
 
-### Milestone 4: ABI-POD and Plain Object Layout
+### Milestone 6: Importer Integration
 
-- [ ] Emit layout metadata for exported ABI-POD and supported plain object value types.
-- [ ] Check size, alignment, field offsets, and layout hashes.
-- [ ] Support ABI-POD structs by value.
-- [ ] Reject unsupported object layouts with clear diagnostics.
+- [ ] Generate or support importer-side ABI expectations from Nim source plus generated C headers.
+- [ ] Teach importer-side ARC lowering to use validated local hooks or imported hook thunks.
+- [ ] Add end-to-end shared-library tests with direct field access.
+- [ ] Add forced mismatch tests for layout, hook, compiler, allocator, and memory-manager differences.
 
-### Milestone 5: Importer Integration
+### Milestone 7: Later Compatibility Modes
 
-- [ ] Generate or support importer-side ABI expectations.
-- [ ] Bind mangled proc symbols only after ABI validation.
-- [ ] Support high-level wrapper types over opaque handles.
-- [ ] Add end-to-end shared-library tests.
-
-### Milestone 6: Transparent Managed Types
-
-- [ ] Allow managed plain object fields under strict ABI match.
-- [ ] Validate type hook hashes and managed runtime assumptions.
-- [ ] Add ARC and atomicArc coverage.
-- [ ] Revisit transparent `ref object` access as an advanced opt-in mode.
-
-### Milestone 7: Exported Hooks Follow-Up
-
-- [ ] Re-evaluate exported lifecycle hooks after opaque handles and strict same-runtime ABI work.
-- [ ] Export lifecycle hooks where cross-build compatibility or plugin isolation requires it.
+- [ ] Revisit `atomicArc` after ARC-only support is stable.
+- [ ] Revisit ORC after trace metadata and cycle handling are designed.
+- [ ] Revisit opaque handles and generated accessors as a separate opt-in isolation mode.
+- [ ] Revisit broader cross-version compatibility after strict same-build metadata works.
 
 ## Goal
 
-Add a compiler-supported Nim-to-Nim shared library ABI for the C backend that can export overloaded procs, concrete generic instantiations, high-level Nim types, and module initialization in a checked way.
+Add a compiler-supported Nim-to-Nim shared library ABI for the C backend that can export overloaded procs, concrete generic instantiations, high-level Nim types, transparent `ref object` layouts, ownership hooks, and module initialization in a checked way.
 
-The initial implementation assumes both the producer library and the consumer are compiled with matching Nim compiler/runtime settings. It starts with opaque `ref object` handles so the producer library owns internal object layout, lifetime, hooks, managed fields, and invariants. Generated accessors provide field-like Nim ergonomics without exposing object layout. Transparent `ref object` layout access is deferred to a later advanced mode.
+The initial implementation uses transparent refs instead of opaque handles. The producer library emits:
+
+- Itanium-style mangled exported symbols.
+- A generated C ABI header for exported types and procs.
+- Structured ABI metadata for compiler/runtime settings, type sizes, field offsets, and ownership hooks.
+- Explicit initialization and validation entry points.
+
+The importer treats the generated header and metadata as the dynlib contract. The header lets the C backend compile against the same type declarations, so the C compiler computes `sizeof`, alignment, and field offsets in the usual C ABI way. Metadata verifies that the loaded library matches that header and the same hook assumptions. After validation, the importer compiles ordinary Nim field access and ARC operations for exported transparent types.
 
 ## Non-Goals for the Initial Version
 
 - Do not define a stable ABI across arbitrary Nim compiler versions.
-- Do not support mismatched memory managers, allocators, backends, or target ABIs.
-- Do not make the ABI safe for direct C mutation of Nim-managed fields.
-- Do not expose layout-transparent `ref object` field access in the first implementation.
-- Do not make the importer responsible for internal `ref object` allocation, destruction, or custom hooks.
-- Do not support every field type through generated accessors initially; reject unsupported shapes instead.
-- Do not export open-ended generics. Only concrete generic instantiations are exported.
+- Do not support mismatched memory managers, allocators, C backends, target ABIs, or relevant compiler flags.
+- Do not support ORC in the first implementation.
+- Do not support `atomicArc` in the first implementation unless it is treated as a separate ABI mode.
+- Do not make hand-written C headers part of the contract.
+- Do not make direct C mutation of Nim-managed fields safe.
+- Do not hide the layout of transparent exported refs; this mode deliberately exposes layout.
 - Do not support exceptions crossing the shared library boundary until there is an explicit exception ABI contract.
-- Do not support ORC in the first implementation. Start with ARC and atomicArc.
-
-## ABI Model Options
-
-There are two viable ownership/runtime models.
-
-### Option 1: Same Type Definitions and Runtime
-
-Both sides compile the same public type definitions and use the same runtime, allocator, backend, target ABI, and relevant compiler flags.
-
-For transparent value types, this allows the importer to compile normal Nim field access, constructors, destructors, copies, sinks, and managed-field assignments using the same compiler logic as the library.
-
-The library still exports ABI metadata so the importer can reject a mismatch before using any exported symbol.
-
-This remains the initial runtime assumption for exported procs, ABI-POD values, and wrapper code. It is not used to justify transparent `ref object` internals in the first version.
-
-### Option 2: Exported Lifecycle Hooks
-
-The library exports lifecycle hooks for every exported managed type, and the importer uses those imported hooks instead of locally compiled hooks.
-
-Required hooks include destroy, copy, sink, duplicate, default initialization, and possibly field-level assignment helpers for managed fields.
-
-This model is more robust across compiler/runtime differences, but it is substantially more work. It is a later-stage design unless Option 1 proves too fragile.
-
-## `ref object` Options
-
-There are also two viable `ref object` exposure models.
-
-### Option A: Opaque Handle
-
-The caller receives an opaque handle and only retains, releases, or calls methods through exported hooks.
-
-This is the easiest and safest model. It is close to what C-style bindings and tools like Genny generate today. The ABI representation can be modeled as:
-
-```nim
-type RendererHandle = distinct pointer
-```
-
-or effectively:
-
-```nim
-type RendererHandle = ptr OpaqueRenderer
-```
-
-The library owns:
-
-- Allocation.
-- Destruction.
-- ARC retain/release behavior.
-- Field layout.
-- Custom hooks.
-- Managed fields such as `string`, `seq`, and `ref`.
-- Object invariants.
-- Thread-affinity checks.
-
-It keeps object layout private and avoids direct caller mutation of managed fields.
-
-The importer only calls exported procs:
-
-```nim
-let r = newRenderer()
-draw(r)
-rendererUnref(r)
-```
-
-This is the initial plan for `ref object` values.
-
-### Option A Plus Generated Accessors
-
-Opaque handles do not have to mean a low-level public API. For exported `ref object` fields, the producer can synthesize ABI exports:
-
-```nim
-type
-  Renderer* = ref object
-    name*: string
-    size*: Vec2
-    scale*: float32
-
-proc `name`*(r: Renderer): string {.exportnimabi.}
-proc `name=`*(r: Renderer; value: string) {.exportnimabi.}
-
-proc `size`*(r: Renderer): Vec2 {.exportnimabi.}
-proc `size=`*(r: Renderer; value: Vec2) {.exportnimabi.}
-```
-
-The importer represents the producer object as a handle-backed wrapper and forwards field-like calls:
-
-```nim
-type
-  Renderer* = ref object
-    handle: RendererHandle
-
-proc name*(r: Renderer): string =
-  imported_renderer_name(r.handle)
-
-proc `name=`*(r: Renderer; value: string) =
-  imported_renderer_set_name(r.handle, value)
-```
-
-This gives most of the ergonomics of transparent field access while keeping object layout, managed assignment, custom hooks, and invariants inside the producer library. ABI metadata needs accessor signatures and return policy, not field offsets for opaque refs.
-
-### Option B: Transparent Ref Object
-
-The caller can dereference fields directly.
-
-This is possible only when both sides use the same compiler, flags, target ABI, layout hash, memory manager, allocator contract, and runtime configuration.
-
-Every managed field access must be compiled by Nim so ARC or atomicArc inserts the correct copies, sinks, assignments, and destroys.
-
-Custom hooks make this especially sharp: the importer either needs to compile identical hooks or call hooks exported by the producer library. Once hooks are imported, the design has moved toward the exported-lifecycle-hook model.
-
-This is a later advanced mode, not the first implementation.
+- Do not export open-ended generics. Only concrete generic instantiations are exported.
 
 ## Initial Scope
 
 The first version targets this combination:
 
-- Option 1: same compiler/runtime/allocator contract for exported procs and supported value types.
-- Option A: opaque `ref object` handles.
-- Generated accessors for supported public fields on opaque `ref object` types.
-- Transparent access only for supported plain object values, starting with ABI-POD structs.
-- No transparent cross-library `ref object` layout access.
 - C backend only.
-- ARC or atomicArc only.
-- Explicit shared-library initialization.
+- ARC only.
+- Explicit `nimAbiInit` before any exported Nim ABI use.
 - Itanium-style exported names for overloads and concrete generic instantiations.
-- ABI metadata checked before any exported API use.
-- Clear diagnostics for missing lifetime/accessor procs or unsupported direct layout access.
+- Generated C ABI header for exported types and procs.
+- Transparent `object` and `ref object` layout for supported types.
+- `sizeof`, alignment, field offset, and layout-hash validation.
+- Hook validation for all ABI-visible managed types.
+- Exported hook thunks only when imported ARC code cannot compile a compatible local hook.
+- Strict ABI metadata checks before binding proc or hook symbols.
+- Clear diagnostics for unsupported layouts, unsupported hooks, stale headers, missing metadata, or unsafe direct C access.
 
-The compiler should reject unsupported signatures instead of silently exporting an unsafe ABI.
+This intentionally starts with the strict same-build model. The producer and importer must agree on the compiler build, C backend, target ABI, allocator/runtime configuration, ARC mode, type layouts, and hook behavior.
+
+## ABI Model
+
+### Transparent Same-Build ABI
+
+Both sides use the same Nim compiler/runtime model and the same generated ABI contract. The generated C header gives the importer C declarations for exported types. The C compiler then handles layout exactly as it does for any C translation unit using that header. Metadata only checks that the header, importer, and loaded producer library are the same ABI instance.
+
+This allows the Nim importer to compile normal source-level operations:
+
+```nim
+let r = newRenderer()
+r.name = "main"
+draw(r)
+```
+
+The field assignment remains a Nim operation. ARC inserts the required copies, sinks, destroys, refcount operations, and hook calls. The ABI layer does not hand-roll managed access; it only proves that Nim's normal lowering is valid for the loaded library.
+
+### ARC Hook Validation
+
+For every ABI-visible managed type, the producer records the hook assumptions that ARC requires:
+
+- Plain or auto-managed: no custom hook required.
+- Move-only owner: `=destroy`, `=wasMoved`, and `=copy` marked unavailable.
+- Deep-owning value: `=destroy`, `=wasMoved`, `=copy`, and `=dup`.
+- Shared or refcounted value: `=destroy`, `=wasMoved`, `=copy`, and `=dup`.
+- Compiler-generated managed aggregate: generated hook identity plus the identities of field hooks.
+
+This is mostly validation. If the importer compiles the same type definitions and the hooks are compiler-generated or otherwise proven identical, imported code can use normal local ARC lowering. If a custom hook is producer-owned or cannot be proven identical, the producer must export a hook thunk and the importer must call that thunk. If ARC lowering would require an unavailable or incompatible hook, the compiler rejects the imported API.
+
+For each relevant hook, metadata records:
+
+- Hook kind: `destroy`, `wasMoved`, `copy`, `sink`, or `dup`.
+- Type identity and type layout hash.
+- Mangled hook symbol when an imported hook thunk is available.
+- Hook signature hash.
+- Whether the hook is compiler-generated, user-defined, unavailable, or imported.
+- Ownership flags such as no-copy, deep-copy, shared, move-only, and no-destroy result.
+- Effect information needed by ARC, especially that `=destroy` is non-raising.
+- Implementation identity or body hash when the compiler can compute one.
+
+## Generated C ABI Header
+
+The generated header is a compiler artifact, not a stable human-maintained C API. It should be emitted next to the shared library and referenced by importer-side generated code or by an explicit import pragma.
+
+The header should contain:
+
+- Version and ABI fingerprint comments or constants.
+- Runtime representation declarations needed by exported types.
+- C declarations for transparent ABI-visible `object` payloads.
+- C declarations for transparent ABI-visible `ref object` payloads.
+- Optional layout constants for diagnostics: `sizeof`, alignment, field offsets, and layout hash.
+- Optional static assertions such as `sizeof(T)`, `alignof(T)`, and `offsetof(T, field)` checks where the C compiler supports them.
+- Proc prototypes using the final exported backend names.
+- Hook thunk prototypes only for hooks that the importer may need to call.
+- Type and proc identifiers that connect header declarations to structured metadata.
+- Field visibility and privacy metadata so Nim source rules still apply.
+
+The header can expose private layout details because transparent mode is a same-build Nim ABI, not an encapsulation boundary. Nim source visibility rules still control which fields are accessible from Nim code. The header is the source of truth the importing C compiler uses for local layout. For example, `sizeof(T)` and `offsetof(T, field)` come directly from compiling against this header.
+
+The header alone is not the runtime trust boundary. C linkers resolve symbol names; they do not check that two shared objects used the same struct definitions. The producer should publish a compact layout fingerprint, and optionally structured `sizeof`, alignment, and offset values for diagnostics. The importer rejects a library if the loaded producer's metadata does not match the generated header it compiled against.
+
+## Transparent `ref object` Rules
+
+An exported `ref object` is represented as a real Nim ref whose payload layout is visible through the generated C header and checked through metadata. It is not lowered to `distinct pointer` in the initial mode.
+
+The producer and importer must agree on:
+
+- Ref payload `sizeof` and alignment.
+- Object header/runtime fields required by ARC.
+- Field order, offsets, sizes, and alignment.
+- Inheritance layout.
+- Variant object discriminants and branch layouts.
+- Packing and alignment pragmas.
+- Managed-field representation.
+- Type descriptor identity needed for ARC destruction.
+- Hook descriptors for the payload type and any managed fields with custom hooks.
+
+After validation, a Nim importer may read and write exported fields directly in source code. The resulting C code uses the generated layout, and Nim ARC uses the validated hook model.
+
+Direct C callers are more restricted. They may inspect or pass ABI-POD fields, but they must not mutate Nim-managed fields such as `string`, `seq`, `ref`, closures, or fields whose assignment depends on custom hooks.
+
+## Plain Object and Value Rules
+
+Plain `object` values can cross the boundary by value only when their layout and hook model are fully described.
+
+Initial support should allow:
+
+- ABI-POD structs by value.
+- Plain objects with ARC-managed fields when the importer can validate or import all required hooks.
+- `string` fields under the strict ARC same-build contract.
+- Nested supported object values with recursive layout and hook metadata.
+
+Initial support should reject:
+
+- `seq[T]` unless its element type and sequence operations have explicit metadata.
+- Closures.
+- `lent T` and `var T` across the dynlib boundary.
+- Types whose custom hook bodies cannot be matched or imported.
+- Types whose copy behavior is marked unavailable but whose exported signatures require copying.
+
+## Constructors, Destructors, and Allocation
+
+Constructors can be exported normally and return transparent refs:
+
+```nim
+type
+  Vec2* = object
+    x*, y*: float32
+
+  RendererObj* = object
+    name*: string
+    size*: Vec2
+
+  Renderer* = ref RendererObj
+
+proc newRenderer*(name: string): Renderer {.exportnimabi.}
+proc draw*(r: Renderer) {.exportnimabi.}
+```
+
+The importer sees `Renderer` as a real ref type with a validated payload layout. It does not need a manual retain/release API for ordinary ARC ownership. ARC-generated code increments, decrements, copies, sinks, and destroys according to the validated hook descriptors.
+
+The producer must export hook thunks for custom behavior that cannot be safely regenerated in the importer. For example, a custom `=destroy` for `RendererObj` must be available if imported ARC code can drop the last reference.
+
+Library shutdown is optional in the initial design. A generated shutdown proc must not run while exported refs or values owned by the library can still be live.
 
 ## ABI Compatibility Requirements
 
@@ -209,17 +231,18 @@ The producer and consumer must match on:
 - C backend.
 - Target OS, CPU, ABI family, pointer size, and integer sizes.
 - C compiler ABI family where observable.
-- Memory manager: ARC or atomicArc.
+- ARC memory manager mode.
 - Threading mode and TLS configuration.
 - Allocator/runtime configuration.
 - Relevant compile-time defines that affect exported type layout or behavior.
-- Exported ABI-POD and supported plain object layout hashes.
-- Opaque handle type identities and ownership protocol.
-- Generated accessor signatures and return modes.
+- Generated C header hash.
 - Exported proc signature hashes.
+- Exported hook descriptor hashes.
+- Type `sizeof`, alignment, field offsets, field sizes, discriminants, inheritance, and layout hashes.
+- Managed runtime representation hashes for `string`, `ref`, and any supported managed aggregate.
 - Calling convention.
 
-The ABI check should prefer a single computed ABI fingerprint, but the metadata should also expose enough structured fields for diagnostics. Opaque `ref object` internals do not require importer-visible field layout or hook hashes in the first implementation because the producer library owns those operations. Public field compatibility is represented by generated accessor signatures and their return policies.
+The ABI check should prefer a single computed ABI fingerprint for fast rejection, but metadata should expose structured fields for diagnostics.
 
 ## Explicit Initialization
 
@@ -232,14 +255,14 @@ proc nimAbiInit(expected: ptr NimAbiExpected): NimAbiInitResult {.cdecl, exportc
 This proc must:
 
 1. Check the consumer-provided ABI expectations against the library metadata.
-2. Return a structured mismatch error before any runtime-dependent use.
-3. Call `NimMain` exactly once on success.
-4. Run any user-declared library initialization code.
-5. Mark the library initialized.
+2. Check the generated C header hash.
+3. Check `sizeof`, alignment, field offsets, layout hashes, and hook descriptors before any imported ARC operation can run.
+4. Return a structured mismatch error before any runtime-dependent use.
+5. Call `NimMain` exactly once on success.
+6. Run any user-declared library initialization code.
+7. Mark the library initialized.
 
 The compiler should support suppressing automatic shared-library constructors so initialization is explicit. Existing `--noMain:on` behavior is a useful starting point because it still emits `NimMain` while omitting the shared-library constructor.
-
-An optional generated shutdown proc can call `NimDestroyGlobals`, but only after the design accounts for outstanding exported refs and global object lifetime.
 
 ## Exported Symbol Naming
 
@@ -249,6 +272,7 @@ Requirements:
 
 - Exported overloads must get distinct symbols.
 - Concrete generic instantiations must get distinct symbols.
+- Hook thunks must get distinct symbols.
 - Module and type identity must be encoded in the name or ABI metadata.
 - The ABI should not require manually written `{.exportc: "...".}` names.
 
@@ -261,143 +285,6 @@ proc draw*(fig: Fig; box: ScreenBox) {.exportnimabi.}
 ```
 
 or a module-level pragma that exports selected public symbols.
-
-## Type Layout
-
-For layout portions, use the platform C ABI where possible.
-
-Plain object fields that lower to C-compatible fields can use C struct layout, including size, alignment, and field offsets.
-
-The compiler must still record and check:
-
-- Type size.
-- Type alignment.
-- Field order.
-- Field offsets.
-- Variant object layout.
-- Packing/alignment pragmas.
-- Object inheritance layout.
-- Managed-field presence.
-
-For opaque `ref object` types, the compiler must not expose the object layout to the importer. Metadata should record the handle representation, type identity, ownership protocol, and proc signatures that operate on the handle. Internal fields, custom hooks, managed fields, and invariants remain producer-owned.
-
-For transparent managed values, layout compatibility is not enough. The importing side must compile all reads, writes, copies, moves, and destruction with matching Nim semantics. This is deferred until after opaque handles and ABI-POD values work.
-
-## Generated Ref Accessors
-
-For opaque `ref object` types, public fields can be projected through generated accessor exports instead of exposing field offsets. This is the middle ground for the first implementation: object layout stays private, but Nim callers keep property-style source ergonomics.
-
-Accessor metadata should classify each generated accessor:
-
-```nim
-type
-  AccessorMode = enum
-    abiPodValue       # plain value
-    abiManagedCopy    # Nim-managed copy, same-runtime only
-    abiBorrowed       # lent/read-only view, short lifetime
-    abiHandle         # opaque ref handle
-```
-
-Initial accessor support should allow:
-
-- `abiPodValue` get/set for plain fields.
-- `abiHandle` get/set for `ref object` fields through retain/release rules.
-- `abiManagedCopy` get/set for `string` under the strict same-runtime ABI check.
-
-Initial accessor support should reject or require an explicit future annotation for:
-
-- `seq[T]`.
-- `lent T`.
-- `var T`.
-- `openArray[T]`.
-- Closure fields.
-- Any field whose copy, borrow, or lifetime cannot be described by the current metadata.
-
-For `abiHandle` getters, the initial policy should return a retained handle so the importer wrapper can own and release it predictably. Setters should run inside the producer library so managed assignment, old-value release, custom hooks, and invariants remain producer-owned.
-
-## Constructors and Destructors
-
-High-level Nim constructors are allowed in the initial design, but `ref object` results cross the ABI as opaque handles.
-
-Examples:
-
-```nim
-proc initFont*(name: string; size: float32): Font {.exportnimabi.}
-proc newRenderer*(target: ref Window): ref Renderer {.exportnimabi.}
-```
-
-The producer library must also expose an ownership path for handles, such as:
-
-```nim
-proc rendererRef*(r: ref Renderer): ref Renderer {.exportnimabi.}
-proc rendererUnref*(r: ref Renderer) {.exportnimabi.}
-```
-
-or a single destroy/free proc when the handle is uniquely owned.
-
-The importer can still expose a high-level Nim wrapper:
-
-```nim
-type Renderer* = ref object
-  handle: RendererHandle
-
-proc draw*(r: Renderer)
-proc name*(r: Renderer): string
-proc `name=`*(r: Renderer; value: string)
-proc size*(r: Renderer): Vec2
-proc `size=`*(r: Renderer; value: Vec2)
-```
-
-The wrapper forwards constructors, operations, getters, and setters to exported library procs. It does not dereference the producer's `Renderer` object layout.
-
-Returned managed value types must be destroyed by Nim code compiled under the same ABI contract. Direct C callers are not part of the initial high-level ABI.
-
-Generated ABI metadata should include type hook identities or hashes for:
-
-- `=destroy`
-- `=copy`
-- `=sink`
-- `=dup`, if relevant
-- assignment behavior for managed fields
-
-The initial implementation may validate hook hashes for transparent value types without exporting hooks. Opaque `ref object` internals do not need importer-visible hook hashes. Exported hooks belong to Option 2.
-
-## Field Access Rules
-
-Layout-transparent field access is allowed only for supported value types in Nim consumers that passed the ABI check.
-
-Opaque `ref object` layout access is not allowed across the ABI boundary. Public field syntax can still be supported by generated getter and setter wrappers:
-
-```nim
-r.name = "main"
-let s = r.size
-```
-
-which lowers to calls such as:
-
-```nim
-rendererSetName(r.handle, "main")
-rendererSize(r.handle)
-```
-
-Direct C field access is only safe for ABI-POD fields and must not mutate Nim-managed fields.
-
-For a transparent managed value type in a later milestone, this must be compiled by Nim:
-
-```nim
-obj.name = "Inter"
-```
-
-because it may need to release the old `string`, copy or sink the new `string`, and update ARC state.
-
-The compiler should classify exported types:
-
-- `AbiPod`: C-compatible by-value layout and no Nim-managed fields.
-- `AbiOpaqueRef`: handle identity only; producer owns allocation, layout, hooks, and managed fields.
-- `AbiAccessor`: generated getter/setter surface over an opaque ref field, with an explicit `AccessorMode`.
-- `AbiManagedValue`: layout can be checked, but Nim-managed operations are required.
-- `AbiRefTransparent`: transparent `ref object` allowed under strict ABI match in a later opt-in mode.
-- `AbiUnsupported`: rejected with a diagnostic.
 
 ## Generic Support
 
@@ -416,20 +303,20 @@ may export concrete `get(Box[int])` and `get(Box[string])` symbols.
 
 The compiler should not promise that an importer can instantiate new generic combinations against an already-built shared library unless the library explicitly exports those instantiations.
 
-Generic type layout metadata must be per-instantiation.
+Generic type layout metadata and hook metadata must be per instantiation.
 
 ## Importer Behavior
 
 A Nim importer module should:
 
 1. Load or link the shared library.
-2. Read exported ABI metadata.
-3. Construct expected ABI metadata from the importing compilation.
+2. Include or import the generated C ABI header.
+3. Construct expected ABI metadata from the importing compilation and the header-derived C layout constants.
 4. Call `nimAbiInit`.
-5. Bind mangled proc symbols only after successful initialization.
-6. Compile high-level calls normally after validation.
-7. Represent producer `ref object` values as opaque handles.
-8. Generate or import wrapper accessors that route field-like APIs through exported getters, setters, and operations.
+5. Reject the library if metadata, `sizeof`, alignment, offsets, header hash, or hook descriptors mismatch.
+6. Bind mangled proc and hook symbols only after successful validation.
+7. Compile high-level Nim calls, field access, and ARC lowering against the validated transparent layout.
+8. Use normal local ARC hooks when metadata proves they are compatible; otherwise call imported hook thunks if available.
 
 The first implementation can require an explicit user call such as:
 
@@ -447,17 +334,16 @@ Likely compiler areas:
 - Track ABI-exported symbols separately from `exportc`.
 - Reuse or extend the Itanium-style mangling path for exported symbols.
 - Collect concrete exported generic instantiations.
-- Classify ABI-visible types into opaque handles, ABI-POD values, managed values, and unsupported forms.
-- Generate and consume opaque handle identity metadata.
-- Generate producer-side accessor exports for supported public fields on opaque refs.
-- Generate or support importer-side wrapper accessors over opaque handles.
-- Classify accessor return policy as POD value, managed copy, borrowed view, or handle.
+- Emit generated C ABI headers for exported types, layout constants, procs, and any required hook thunks.
+- Classify ABI-visible types into transparent refs, transparent values, ABI-POD values, and unsupported forms.
+- Compute `sizeof`, alignment, field offsets, field sizes, and layout hashes for transparent `object` and `ref object` payloads.
+- Compute hook descriptors and hook compatibility hashes.
+- Export hook thunks only where imported ARC lowering needs producer-owned hook behavior.
 - Generate structured ABI metadata.
-- Compute type layout and signature hashes.
 - Generate explicit init and optional shutdown symbols.
 - Suppress automatic shared-library constructors for explicit-init builds.
 - Generate or support importer-side ABI expectations.
-- Add diagnostics for unsupported exported signatures, unsupported accessor shapes, and direct layout access into opaque refs.
+- Add diagnostics for unsupported exported signatures, unsupported layouts, missing hooks, no-copy violations, stale headers, and unsafe C field access.
 
 Relevant existing compiler machinery:
 
@@ -468,74 +354,17 @@ Relevant existing compiler machinery:
 - GC mode/options in `compiler/options.nim`.
 - Type/proc hashes in `compiler/sighashes.nim`.
 - Size, alignment, and layout computation in `compiler/types.nim` and `compiler/sizealignoffsetimpl.nim`.
-
-## Milestones
-
-### Milestone 1: Mangled Export Prototype
-
-- Add an export mode that marks procs as shared Nim ABI exports without forcing a manual C name.
-- Export overloaded procs with distinct mangled symbols.
-- Export concrete generic instantiations with distinct mangled symbols.
-- Add compile tests that inspect generated symbols.
-
-### Milestone 2: Opaque Ref Object Handles and Accessors
-
-- Classify exported `ref object` types as opaque handles.
-- Define the ABI representation for handles, such as `distinct pointer` or `ptr OpaqueType`.
-- Generate producer-side getter/setter exports for supported public fields.
-- Generate importer-side wrapper accessors so callers can keep property-style source code.
-- Define accessor return modes: POD value, managed copy, borrowed view, and handle.
-- Require a producer-owned lifetime path: constructor plus destroy, or retain plus release.
-- Reject direct imported layout access into opaque refs.
-- Reject unsupported accessor shapes with clear diagnostics.
-- Add focused diagnostics and tests.
-
-### Milestone 3: Explicit Init and Metadata
-
-- Generate ABI metadata for compiler version, target, backend, memory manager, allocator, flags, proc signatures, opaque handle identities, and accessor return modes.
-- Generate `nimAbiInit`.
-- Suppress automatic shared-library constructor when explicit init is enabled.
-- Call `NimMain` exactly once from `nimAbiInit`.
-- Add mismatch tests.
-
-### Milestone 4: ABI-POD and Plain Object Layout
-
-- Emit layout metadata for ABI-POD and supported plain object value types.
-- Check size, alignment, field offsets, and layout hashes.
-- Support ABI-POD structs by value.
-- Reject unsupported object layouts with clear diagnostics.
-
-### Milestone 5: Importer Integration
-
-- Generate or support importer-side metadata expectations.
-- Provide explicit initialization API for linked or dynamically loaded libraries.
-- Ensure high-level calls use mangled symbols after ABI validation.
-- Generate or support wrapper types and accessor procs over opaque handles.
-- Add end-to-end shared-library tests.
-
-### Milestone 6: Transparent Managed Types
-
-- Allow managed plain object fields under strict ABI match.
-- Validate type hook hashes.
-- Validate `string`, `seq`, and `ref` layout/runtime assumptions.
-- Add ARC and atomicArc test matrices.
-- Revisit transparent `ref object` access as a strict opt-in mode.
-
-### Milestone 7: Revisit Exported Hooks
-
-- Evaluate Option 2 after opaque handles and the strict same-runtime model work.
-- Export lifecycle hooks where cross-build compatibility or plugin isolation requires it.
+- ARC hook generation and lowering in the semantic and C backend pipeline.
 
 ## Risks
 
-- Nim runtime initialization order may be fragile if callers use exported symbols before `nimAbiInit`.
-- Opaque handles need a clear ownership protocol or wrappers can leak handles or release them too early.
-- Wrapper hooks for handle-backed types must be designed carefully so importer-side ARC does not imply ownership of producer internals.
-- Accessor return policy must be explicit; managed copies, borrowed views, and nested handles have different lifetime rules.
-- `string` accessors are feasible under the strict same-runtime ABI, but `seq`, `lent`, `var`, `openArray`, and closure-shaped fields should stay rejected until their ownership rules are specified.
-- Transparent `ref object` access remains dangerous because layout and hook mismatches can corrupt memory.
+- Transparent refs expose layout, so this mode is not an encapsulation boundary.
+- Hook compatibility is the hardest part; a layout match is unsafe if copy, sink, or destroy semantics differ.
+- Imported ARC code may drop the last reference, so finalization must be validated and callable.
+- Header and metadata generation must describe compiler-generated hooks as well as user-defined hooks.
 - Compile-time defines can affect type layout or proc bodies in ways that are hard to fingerprint completely.
-- AtomicArc may be required for cross-thread sharing even when ARC passes ABI checks.
+- Direct C callers can corrupt Nim-managed fields if they bypass Nim assignment semantics.
+- Runtime initialization order may be fragile if callers use exported symbols before `nimAbiInit`.
 - Shutdown semantics are difficult if exported refs outlive the library or if globals depend on external resources.
 - The C backend may emit ABI-relevant details that vary by C compiler and platform.
 
@@ -546,15 +375,16 @@ Use a small shared library test case with:
 - Two overloaded exported procs.
 - One concrete generic proc instantiated for two types.
 - One ABI-POD object passed by value.
-- One opaque `ref object` with public `string`, POD, and nested opaque-ref fields.
-- One constructor returning the opaque handle.
-- Generated getters, setters, and operations for that handle.
-- A string accessor using managed-copy same-runtime semantics.
-- A nested handle accessor using retain/release semantics.
-- One explicit destroy or retain/release path exercised by ARC-backed wrapper code.
-- A rejected direct layout-access case for the opaque ref.
-- Rejected `seq`, `lent`, `var`, `openArray`, or closure field accessors.
+- One transparent `ref object` with public `string`, POD, and nested `ref object` fields.
+- One constructor returning the transparent ref.
+- One operation that mutates a managed field from Nim source.
+- One type with a custom `=destroy`.
+- One type with custom `=copy` and `=dup`.
+- One no-copy type rejected from an exported signature that would require copying.
+- Generated C header and header-hash validation.
+- Exported hook thunk metadata.
 - Explicit `nimAbiInit`.
-- A forced ABI mismatch test.
+- A forced ABI mismatch test for layout.
+- A forced ABI mismatch test for hook metadata.
 
-This exercises the core feature without starting from a large real-world binding generator.
+This exercises the simplified first dynlib model: generated type headers, transparent refs, ARC-only ownership reasoning, Itanium-mangled symbols, and explicit ABI validation.
