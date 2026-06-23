@@ -3617,6 +3617,7 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   nimText.add "proc "
   nimText.add nimAbiNimInitName(conf)
   nimText.add "*() =\n"
+  nimText.add "  if nimAbiValidated: return\n"
   nimText.add "  var mismatch: cstring\n"
   nimText.add "  let code = nimAbiInitRaw(nimAbiExpectedFingerprint, nimAbiExpectedNimModuleHash, nimAbiExpectedCHeaderHash, nimAbiExpectedCompilerHash, nimAbiExpectedTargetHash, nimAbiExpectedBackendHash, nimAbiExpectedMemoryManager, nimAbiExpectedAllocator, nimAbiExpectedRuntimeHash, nimAbiExpectedFlagsHash, nimAbiExpectedLayoutHash, nimAbiExpectedHookHash, nimAbiExpectedProcHash, addr mismatch)\n"
   nimText.add "  if code != 0:\n"
@@ -3625,14 +3626,10 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   nimText.add "    else:\n"
   nimText.add "      raise newException(ValueError, \"Nim ABI mismatch: \" & $mismatch)\n"
   nimText.add "  nimAbiValidated = true\n"
-  nimText.add "proc nimAbiEnsureInitialized*() =\n"
-  nimText.add "  if not nimAbiValidated:\n"
-  nimText.add "    "
-  nimText.add nimAbiNimInitName(conf)
-  nimText.add "()\n"
   for h in info.hooks:
     nimText.add nimAbiHookDecl(mainModule, h)
-  nimText.add "nimAbiEnsureInitialized()\n"
+  nimText.add nimAbiNimInitName(conf)
+  nimText.add "()\n"
   for s in info.procs:
     nimText.add nimAbiProcNimDecl(mainModule, info, s)
   let nimModuleHash = getMD5(nimText)

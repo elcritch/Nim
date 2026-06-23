@@ -122,15 +122,17 @@ proc checkHookWrapperOrder(abiModule: string) =
 
 proc checkInitCallPlacement(abiModule: string) =
   let text = readFile(abiModule)
-  let ensurePos = text.find("\nnimAbiEnsureInitialized()\n")
+  let initPos = text.find("\ninitProducerAbi()\n")
   let procPos = text.find("proc makeRenderer*()")
-  doAssert ensurePos >= 0, "missing top-level ABI init call"
+  doAssert initPos >= 0, "missing top-level ABI init call"
   doAssert procPos >= 0, "missing imported proc wrapper"
-  doAssert ensurePos < procPos, "top-level ABI init must run before proc wrappers"
-  doAssert text.count("nimAbiEnsureInitialized()\n") == 1,
+  doAssert initPos < procPos, "top-level ABI init must run before proc wrappers"
+  doAssert text.count("initProducerAbi()\n") == 1,
     "expected exactly one top-level ABI init call"
-  doAssert "  nimAbiEnsureInitialized()\n" notin text,
-    "proc wrappers should not initialize ABI on every call"
+  doAssert "nimAbiEnsureInitialized" notin text,
+    "generated ABI module should use initProducerAbi directly"
+  doAssert "  if nimAbiValidated: return\n" in text,
+    "initProducerAbi should be idempotent"
 
 proc checkDirectProcImports(abiModule: string) =
   let text = readFile(abiModule)
