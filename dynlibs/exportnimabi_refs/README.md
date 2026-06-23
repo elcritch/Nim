@@ -9,13 +9,20 @@ From the repository root, build a compiler with the local changes:
 ./bin/nim c -d:release -o:compiler/nim-abi-test compiler/nim.nim
 ```
 
-Compile the producer and emit ABI artifacts:
+Build the producer shared library and emit ABI artifacts:
 
 ```sh
 rm -rf dynlibs/exportnimabi_refs/nimcache \
   dynlibs/exportnimabi_refs/importcache
-./compiler/nim-abi-test c --app:lib --compileOnly \
+
+case "$(uname -s)" in
+  Darwin) export LIBPRODUCER=libproducer.dylib ;;
+  *) export LIBPRODUCER=libproducer.so ;;
+esac
+
+./compiler/nim-abi-test c --app:lib \
   --nimcache:dynlibs/exportnimabi_refs/nimcache \
+  --out:dynlibs/exportnimabi_refs/$LIBPRODUCER \
   dynlibs/exportnimabi_refs/producer.nim
 ```
 
@@ -28,14 +35,23 @@ producer.abi.h
 producer.abi.json
 ```
 
-Compile the Nim consumer against the generated ABI module and C header:
+Run the Nim consumer end-to-end against the generated ABI module, generated C
+header, and shared library:
 
 ```sh
-./compiler/nim-abi-test c --compileOnly \
+./compiler/nim-abi-test c -r \
   --nimcache:dynlibs/exportnimabi_refs/importcache \
   --path:dynlibs/exportnimabi_refs/nimcache \
+  --cincludes:"$PWD/dynlibs/exportnimabi_refs/nimcache" \
+  --passL:"$PWD/dynlibs/exportnimabi_refs/$LIBPRODUCER" \
+  --passL:"-Wl,-rpath,$PWD/dynlibs/exportnimabi_refs" \
   dynlibs/exportnimabi_refs/consumer.nim
 ```
+
+The consumer calls `makeRenderer()` through the generated public proc wrapper,
+which validates ABI expectations and initializes the producer. It then performs
+ordinary Nim reads and writes on transparent `ref object` fields, including
+managed fields (`string`, nested `ref`, and a custom-hook object field).
 
 The generated Nim ABI module exposes `initProducerAbi()`. Public imported proc
 wrappers call it automatically before forwarding to private mangled imports. The
@@ -61,11 +77,10 @@ cc -fsyntax-only -I"$PWD/lib" -Idynlibs/exportnimabi_refs/nimcache \
 Build and inspect the shared library:
 
 ```sh
-./compiler/nim-abi-test c --app:lib \
-  --nimcache:dynlibs/exportnimabi_refs/nimcache \
-  dynlibs/exportnimabi_refs/producer.nim
-nm -gU dynlibs/exportnimabi_refs/libproducer.dylib | \
-  grep 'NimAbiInit_producer\|NimMain'
+case "$(uname -s)" in
+  Darwin) nm -gU dynlibs/exportnimabi_refs/$LIBPRODUCER ;;
+  *) nm -D dynlibs/exportnimabi_refs/$LIBPRODUCER ;;
+esac | grep 'NimAbiInit_producer\|NimMain'
 ```
 
 Validate that direct C access is limited to ABI-POD field names:
