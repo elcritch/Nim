@@ -38,7 +38,6 @@ proc rendererScale*(r: Renderer): float32 {.exportnimabi.} =
   r.scale
 
 proc `$`*(r: Renderer): string {.exportnimabi.} =
-  echo "TEST"
   result = "Renderer2(" & repr(r) & ")"
 
 proc makeIntBox*(): Box[int] {.exportnimabi.} =
