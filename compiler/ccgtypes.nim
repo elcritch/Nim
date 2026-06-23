@@ -104,10 +104,14 @@ proc isSharedInstanceCName(m: BModule; s: PSym): bool =
     stripCnifMarks(s.loc.snippet) == s.name.s.mangle & "_i" & $s.disamb
 
 proc fillBackendName(m: BModule; s: PSym) =
+  if s.kind in routineKinds and sfExportNimAbi in s.flags:
+    if not containsOrIncl(m.g.exportedNimAbiSeen, s.id):
+      m.g.exportedNimAbiProcs.add s
   if s.loc.snippet == "":
     var result: Rope
-    if s.kind in routineKinds and {optCDebug, optItaniumMangle} * m.g.config.globalOptions == {optCDebug, optItaniumMangle} and
-      m.g.config.symbolFiles == disabledSf:
+    if s.kind in routineKinds and (sfExportNimAbi in s.flags or
+        ({optCDebug, optItaniumMangle} * m.g.config.globalOptions == {optCDebug, optItaniumMangle} and
+          m.g.config.symbolFiles == disabledSf)):
       result = mangleProc(m, s, false).rope
     else:
       let shared = sharedInstanceCName(m, s)
