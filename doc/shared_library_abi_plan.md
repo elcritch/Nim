@@ -433,11 +433,13 @@ The compiler should not promise that an importer can instantiate new generic com
 Generic type layout metadata and generated hook declarations must be per instantiation.
 
 Current status: concrete generic object instantiations that appear in exported
-ABI proc signatures are emitted as distinct generated Nim ABI types. These
-types use the same module-qualified Itanium-style ABI spelling as the exported
-C header, for example `NimAbi_ZN8producer3BoxI3intEE` for `producer.Box[int]`.
-This is the initial reification mechanism: an instantiation becomes ABI-visible
-by being reachable from an exported concrete proc instantiation. A separate
+ABI proc signatures are emitted as distinct C ABI types using module-qualified
+Itanium-style spellings such as `NimAbi_ZN8producer3BoxI3intEE` for
+`producer.Box[int]`. The generated Nim ABI module also emits a public generic
+facade such as `Box[T]`, so Nim callers can write `Box[int]` while raw imported
+procs and the generated C header keep using the concrete Itanium ABI type. This
+is the initial reification mechanism: an instantiation becomes ABI-visible by
+being reachable from an exported concrete proc instantiation. A separate
 type-level spelling may still be needed later for type-only ABI modules that
 want to publish `Box[int]` without any exported proc using that exact type.
 
@@ -470,7 +472,7 @@ Likely compiler areas:
 - Add a new exported-Nim-ABI pragma or module-level mode. Current status: proc-level `{.exportnimabi.}` exists.
 - Track ABI-exported symbols separately from `exportc`. Current status: the C backend records ABI-exported procs during backend name finalization.
 - Reuse or extend the Itanium-style mangling path for exported symbols. Current status: exported Nim ABI procs use signature-mangled symbols.
-- Collect concrete exported generic instantiations. Current status: concrete exported proc instantiations are recorded when their backend names are finalized, and concrete generic object instantiations reachable from those signatures are emitted with module-qualified Itanium-style generated type names.
+- Collect concrete exported generic instantiations. Current status: concrete exported proc instantiations are recorded when their backend names are finalized, and concrete generic object instantiations reachable from those signatures are emitted with module-qualified Itanium-style C ABI type names plus generated Nim generic facades.
 - Emit generated Nim ABI modules for Nim consumers. Current status: producer-side `<project>_abi.nim` is emitted.
 - Emit generated C ABI headers for exported types, layout constants, procs, and any required hook thunks. Current status: producer-side `<project>.abi.h` is emitted for types, layout constants, procs, init, and hook thunk prototypes.
 - Classify ABI-visible types into transparent refs, transparent values, ABI-POD values, and unsupported forms.

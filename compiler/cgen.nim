@@ -1858,6 +1858,7 @@ type
     seenRefs: IntSet
     seenHooks: IntSet
     nimTypeNames: Table[int, string]
+    rawTypeNames: Table[int, string]
     cTypeNames: Table[int, string]
 
   NimAbiMetadataHashes = object
@@ -2124,6 +2125,13 @@ proc nimAbiGenericObjectCTypeName(m: BModule; typ: PType): string =
   result.add staticLists
   result.add "E"
 
+proc nimAbiIsGenericObjectInst(typ: PType): bool =
+  let inst = typ.skipTypes({tyAlias})
+  result = inst != nil and inst.kind == tyGenericInst and
+           inst.skipTypes({tyGenericInst}).kind == tyObject
+
+proc nimAbiGenericPublicTypeName(info: NimAbiArtifactInfo; typ: PType): string
+
 proc nimAbiCTypeName(m: BModule; obj: NimAbiObjectInfo): string =
   result = nimAbiGenericObjectCTypeName(m, obj.abiTyp)
   if result.len != 0:
@@ -2212,14 +2220,22 @@ proc nimAbiAssignCTypeNames(info: var NimAbiArtifactInfo; m: BModule) =
       cName.add nimAbiSanitizeName($hashType(info.objects[i].typ, info.config))
     seen[baseName] = i
     var nimName = info.objects[i].nimName
-    if nimAbiGenericObjectCTypeName(m, info.objects[i].abiTyp).len != 0:
+    if nimAbiIsGenericObjectInst(info.objects[i].abiTyp):
       nimName = cName
     info.objects[i].nimName = nimName
     info.objects[i].cName = cName
     info.cTypeNames[info.objects[i].typ.id] = cName
-    info.nimTypeNames[info.objects[i].typ.id] = nimName
+    if nimAbiIsGenericObjectInst(info.objects[i].abiTyp):
+      let publicName = nimAbiGenericPublicTypeName(info, info.objects[i].abiTyp)
+      info.nimTypeNames[info.objects[i].typ.id] = publicName
+      info.nimTypeNames[info.objects[i].abiTyp.id] = publicName
+      info.rawTypeNames[info.objects[i].typ.id] = nimName
+      info.rawTypeNames[info.objects[i].abiTyp.id] = nimName
+    else:
+      info.nimTypeNames[info.objects[i].typ.id] = nimName
     if info.objects[i].abiTyp != nil:
-      info.nimTypeNames[info.objects[i].abiTyp.id] = nimName
+      if info.objects[i].abiTyp.id notin info.nimTypeNames:
+        info.nimTypeNames[info.objects[i].abiTyp.id] = nimName
 
 proc nimAbiAddRef(info: var NimAbiArtifactInfo; typ: PType) =
   let refTyp = typ.skipTypes({tyAlias, tyGenericInst})
@@ -2328,6 +2344,7 @@ proc nimAbiCollect(g: BModuleList): NimAbiArtifactInfo =
   result.seenRefs = initIntSet()
   result.seenHooks = initIntSet()
   result.nimTypeNames = initTable[int, string]()
+  result.rawTypeNames = initTable[int, string]()
   result.cTypeNames = initTable[int, string]()
   for s in g.exportedNimAbiProcs:
     nimAbiCollectProc(result, s)
@@ -2470,33 +2487,60 @@ proc nimAbiEmitProducerHookThunks(g: BModuleList) =
           nimAbiEmitHookThunk(m, h)
           break
 
-proc nimAbiNimTypeName(info: NimAbiArtifactInfo; typ: PType): string =
+proc nimAbiNimTypeNameImpl(info: NimAbiArtifactInfo; typ: PType;
+                           raw: bool): string
+
+proc nimAbiGenericPublicTypeName(info: NimAbiArtifactInfo; typ: PType): string =
+  let inst = typ.skipTypes({tyAlias})
+  if inst == nil or inst.kind != tyGenericInst or inst.len == 0 or
+      inst[0] == nil or inst[0].sym == nil:
+    return typeToString(typ)
+  result = nimAbiSanitizeName(inst[0].sym.name.s)
+  result.add "["
+  var needsComma = false
+  for _, arg in inst.genericInstParams:
+    if needsComma: result.add ", "
+    needsComma = true
+    result.add nimAbiNimTypeNameImpl(info, arg, raw = false)
+  result.add "]"
+
+proc nimAbiNimTypeNameImpl(info: NimAbiArtifactInfo; typ: PType;
+                           raw: bool): string =
   if typ == nil: return "void"
+  if raw and typ.id in info.rawTypeNames: return info.rawTypeNames[typ.id]
   if typ.id in info.nimTypeNames: return info.nimTypeNames[typ.id]
   let t = typ.skipTypes({tyAlias, tySink, tyOwned})
+  if raw and t.id in info.rawTypeNames: return info.rawTypeNames[t.id]
   if t.id in info.nimTypeNames: return info.nimTypeNames[t.id]
   case t.kind
   of tyVar:
-    result = "var " & nimAbiNimTypeName(info, t.elementType)
+    result = "var " & nimAbiNimTypeNameImpl(info, t.elementType, raw)
   of tyLent:
-    result = "lent " & nimAbiNimTypeName(info, t.elementType)
+    result = "lent " & nimAbiNimTypeNameImpl(info, t.elementType, raw)
   of tyPtr:
-    result = "ptr " & nimAbiNimTypeName(info, t.elementType)
+    result = "ptr " & nimAbiNimTypeNameImpl(info, t.elementType, raw)
   of tyRef:
-    result = "ref " & nimAbiNimTypeName(info, t.elementType)
+    result = "ref " & nimAbiNimTypeNameImpl(info, t.elementType, raw)
   of tyArray:
     result = "array[" & typeToString(t.indexType) & ", " &
-             nimAbiNimTypeName(info, t.elementType) & "]"
+             nimAbiNimTypeNameImpl(info, t.elementType, raw) & "]"
   of tyUncheckedArray:
-    result = "UncheckedArray[" & nimAbiNimTypeName(info, t.elementType) & "]"
+    result = "UncheckedArray[" &
+             nimAbiNimTypeNameImpl(info, t.elementType, raw) & "]"
   of tySequence:
-    result = "seq[" & nimAbiNimTypeName(info, t.elementType) & "]"
+    result = "seq[" & nimAbiNimTypeNameImpl(info, t.elementType, raw) & "]"
   of tyOpenArray:
-    result = "openArray[" & nimAbiNimTypeName(info, t.elementType) & "]"
+    result = "openArray[" & nimAbiNimTypeNameImpl(info, t.elementType, raw) & "]"
   of tyVarargs:
-    result = "varargs[" & nimAbiNimTypeName(info, t.elementType) & "]"
+    result = "varargs[" & nimAbiNimTypeNameImpl(info, t.elementType, raw) & "]"
   else:
     result = typeToString(t)
+
+proc nimAbiNimTypeName(info: NimAbiArtifactInfo; typ: PType): string =
+  result = nimAbiNimTypeNameImpl(info, typ, raw = false)
+
+proc nimAbiNimRawTypeName(info: NimAbiArtifactInfo; typ: PType): string =
+  result = nimAbiNimTypeNameImpl(info, typ, raw = true)
 
 proc nimAbiFieldCName(info: NimAbiArtifactInfo; field: PSym): string =
   if field == nil: return ""
@@ -2567,6 +2611,107 @@ proc nimAbiAppendObjectHeader(dest: var string; info: NimAbiArtifactInfo;
   if dest.len == before:
     dest.add "    discard\n"
 
+proc nimAbiAppendGenericFacadeField(dest: var string; field: PSym) =
+  if field == nil or field.typ == nil or field.typ.kind == tyVoid: return
+  dest.add "    "
+  dest.add nimAbiSanitizeName(field.name.s)
+  if sfExported in field.flags:
+    dest.add "*"
+  dest.add ": "
+  dest.add typeToString(field.typ)
+  dest.add "\n"
+
+proc nimAbiAppendGenericFacadeFields(dest: var string; n: PNode) =
+  if n == nil: return
+  case n.kind
+  of nkRecList:
+    for i in 0..<n.len: nimAbiAppendGenericFacadeFields(dest, n[i])
+  of nkSym:
+    nimAbiAppendGenericFacadeField(dest, n.sym)
+  of nkRecCase:
+    dest.add "    # variant object layout is provided by concrete ABI types\n"
+  else:
+    discard
+
+proc nimAbiAppendGenericFacadeHeader(dest: var string; obj: NimAbiObjectInfo) =
+  let inst = obj.abiTyp.skipTypes({tyAlias})
+  if not nimAbiIsGenericObjectInst(inst): return
+  let root = inst.genericHead
+  if root == nil or root.sym == nil: return
+  let body = root.typeBodyImpl.skipTypes({tyAlias, tyGenericInst})
+  if body == nil or body.kind != tyObject: return
+  dest.add "  "
+  dest.add nimAbiSanitizeName(root.sym.name.s)
+  dest.add "*["
+  var needsComma = false
+  for _, param in root.genericBodyParams:
+    if needsComma: dest.add ", "
+    needsComma = true
+    dest.add typeToString(param, preferTypeName)
+  dest.add "] = object\n"
+  let before = dest.len
+  nimAbiAppendGenericFacadeFields(dest, body.n)
+  if dest.len == before:
+    dest.add "    discard\n"
+
+proc nimAbiAppendConversionField(dest: var string; field: PSym) =
+  if field == nil or field.typ == nil or field.typ.kind == tyVoid: return
+  let nimName = nimAbiSanitizeName(field.name.s)
+  dest.add "  result."
+  dest.add nimName
+  dest.add " = src."
+  dest.add nimName
+  dest.add "\n"
+
+proc nimAbiAppendConversionFields(dest: var string; n: PNode) =
+  if n == nil: return
+  case n.kind
+  of nkRecList:
+    for i in 0..<n.len: nimAbiAppendConversionFields(dest, n[i])
+  of nkSym:
+    nimAbiAppendConversionField(dest, n.sym)
+  else:
+    discard
+
+proc nimAbiConversionSuffix(rawName: string): string =
+  result = nimAbiSanitizeName(rawName)
+
+proc nimAbiToPublicName(rawName: string): string =
+  result = "nimAbiToPublic_" & nimAbiConversionSuffix(rawName)
+
+proc nimAbiToRawName(rawName: string): string =
+  result = "nimAbiToRaw_" & nimAbiConversionSuffix(rawName)
+
+proc nimAbiAppendGenericObjectConversions(dest: var string;
+                                          info: NimAbiArtifactInfo;
+                                          obj: NimAbiObjectInfo) =
+  if not nimAbiIsGenericObjectInst(obj.abiTyp): return
+  let publicName = nimAbiNimTypeName(info, obj.abiTyp)
+  let rawName = nimAbiNimRawTypeName(info, obj.abiTyp)
+  if publicName == rawName: return
+  dest.add "proc "
+  dest.add nimAbiToPublicName(rawName)
+  dest.add "(src: "
+  dest.add rawName
+  dest.add "): "
+  dest.add publicName
+  dest.add " =\n"
+  let beforePublic = dest.len
+  nimAbiAppendConversionFields(dest, obj.typ.n)
+  if dest.len == beforePublic:
+    dest.add "  discard\n"
+  dest.add "proc "
+  dest.add nimAbiToRawName(rawName)
+  dest.add "(src: "
+  dest.add publicName
+  dest.add "): "
+  dest.add rawName
+  dest.add " =\n"
+  let beforeRaw = dest.len
+  nimAbiAppendConversionFields(dest, obj.typ.n)
+  if dest.len == beforeRaw:
+    dest.add "  discard\n"
+
 proc nimAbiProcBackendName(m: BModule; s: PSym): string =
   fillBackendName(m, s)
   if s.locImpl.snippet.len != 0:
@@ -2577,8 +2722,22 @@ proc nimAbiProcBackendName(m: BModule; s: PSym): string =
 proc nimAbiProcImportName(s: PSym): string =
   result = "nimAbiProc_" & nimAbiSanitizeName(s.name.s) & "_" & $s.id
 
+proc nimAbiNeedsRawConversion(info: NimAbiArtifactInfo; typ: PType): bool =
+  if typ == nil: return false
+  if typ.id in info.rawTypeNames: return true
+  let t = typ.skipTypes({tyAlias, tySink, tyOwned})
+  result = t != nil and t.id in info.rawTypeNames
+
+proc nimAbiRawConversionTypeName(info: NimAbiArtifactInfo; typ: PType): string =
+  if typ != nil and typ.id in info.rawTypeNames:
+    return info.rawTypeNames[typ.id]
+  let t = typ.skipTypes({tyAlias, tySink, tyOwned})
+  if t != nil and t.id in info.rawTypeNames:
+    return info.rawTypeNames[t.id]
+  result = ""
+
 proc nimAbiProcNimFormals(info: NimAbiArtifactInfo; s: PSym;
-                          callArgs: var string): string =
+                          callArgs: var string; raw: bool): string =
   result = ""
   callArgs = ""
   if s.typ == nil or s.typ.n == nil: return
@@ -2596,26 +2755,43 @@ proc nimAbiProcNimFormals(info: NimAbiArtifactInfo; s: PSym;
       else: nimAbiSanitizeName(param.name.s)
     result.add pname
     result.add ": "
-    result.add nimAbiNimTypeName(info, param.typ)
-    callArgs.add pname
+    if raw:
+      result.add nimAbiNimRawTypeName(info, param.typ)
+      callArgs.add pname
+    else:
+      result.add nimAbiNimTypeName(info, param.typ)
+      if nimAbiNeedsRawConversion(info, param.typ):
+        callArgs.add nimAbiToRawName(nimAbiRawConversionTypeName(info, param.typ))
+        callArgs.add "("
+        callArgs.add pname
+        callArgs.add ")"
+      else:
+        callArgs.add pname
 
 proc nimAbiProcNimDecl(m: BModule; info: NimAbiArtifactInfo; s: PSym): string =
+  var rawCallArgs = ""
   var callArgs = ""
-  let formals = nimAbiProcNimFormals(info, s, callArgs)
+  let rawFormals = nimAbiProcNimFormals(info, s, rawCallArgs, raw = true)
+  let formals = nimAbiProcNimFormals(info, s, callArgs, raw = false)
   let returnType =
     if s.typ != nil and s.typ.returnType != nil:
       nimAbiNimTypeName(info, s.typ.returnType)
+    else:
+      ""
+  let rawReturnType =
+    if s.typ != nil and s.typ.returnType != nil:
+      nimAbiNimRawTypeName(info, s.typ.returnType)
     else:
       ""
   let importName = nimAbiProcImportName(s)
   result = "proc "
   result.add importName
   result.add "("
-  result.add formals
+  result.add rawFormals
   result.add ")"
-  if returnType.len != 0:
+  if rawReturnType.len != 0:
     result.add ": "
-    result.add returnType
+    result.add rawReturnType
   result.add " {.importc: \""
   result.add nimAbiJsonEscape(nimAbiProcBackendName(m, s))
   result.add "\".}\n"
@@ -2629,13 +2805,27 @@ proc nimAbiProcNimDecl(m: BModule; info: NimAbiArtifactInfo; s: PSym): string =
     result.add returnType
   result.add " =\n"
   result.add "  nimAbiEnsureInitialized()\n"
-  result.add "  "
   if returnType.len != 0:
-    result.add "result = "
-  result.add importName
-  result.add "("
-  result.add callArgs
-  result.add ")\n"
+    if rawReturnType != returnType:
+      result.add "  result = "
+      result.add nimAbiToPublicName(rawReturnType)
+      result.add "("
+      result.add importName
+      result.add "("
+      result.add callArgs
+      result.add "))\n"
+    else:
+      result.add "  result = "
+      result.add importName
+      result.add "("
+      result.add callArgs
+      result.add ")\n"
+  else:
+    result.add "  "
+    result.add importName
+    result.add "("
+    result.add callArgs
+    result.add ")\n"
 
 proc nimAbiRewriteCTypeNames(text: string; m: BModule;
                              info: NimAbiArtifactInfo): string =
@@ -3321,6 +3511,12 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   nimText.add "{.warning[UnusedImport]: off.}\n\n"
   if info.objects.len != 0 or info.refs.len != 0:
     nimText.add "type\n"
+    var seenGenericFacades = initIntSet()
+    for obj in info.objects:
+      if nimAbiIsGenericObjectInst(obj.abiTyp):
+        let root = obj.abiTyp.skipTypes({tyAlias}).genericHead
+        if root != nil and not containsOrIncl(seenGenericFacades, root.id):
+          nimAbiAppendGenericFacadeHeader(nimText, obj)
     for obj in info.objects:
       nimAbiAppendObjectHeader(nimText, info, obj, headerBase)
     for refInfo in info.refs:
@@ -3329,6 +3525,9 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
       nimText.add "* = ref "
       nimText.add refInfo.payloadName
       nimText.add "\n"
+    nimText.add "\n"
+    for obj in info.objects:
+      nimAbiAppendGenericObjectConversions(nimText, info, obj)
     nimText.add "\n"
   nimText.add "proc NimMain*() {.importc: \""
   nimText.add nimAbiInitName(conf)

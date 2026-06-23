@@ -11,8 +11,8 @@ doAssert r.token.id == 7
 
 let intBox = makeIntBox()
 let stringBox = makeStringBox()
-let localIntBox = NimAbi_ZN8producer3BoxI3intEE(value: 12)
-let localStringBox = NimAbi_ZN8producer3BoxI6stringEE(value: "local")
+let localIntBox = Box[int](value: 12)
+let localStringBox = Box[string](value: "local")
 doAssert intBox.value == 42
 doAssert stringBox.value == "generic"
 doAssert boxIntValue(localIntBox) == 12

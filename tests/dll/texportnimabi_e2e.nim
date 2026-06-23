@@ -78,8 +78,8 @@ r.token.id = 42
 let rendered = $r
 let intBox = makeIntBox()
 let stringBox = makeStringBox()
-let localIntBox = NimAbi_ZN8producer3BoxI3intEE(value: 12)
-let localStringBox = NimAbi_ZN8producer3BoxI6stringEE(value: "local")
+let localIntBox = Box[int](value: 12)
+let localStringBox = Box[string](value: "local")
 doAssert r.baseId == 11
 doAssert r.name == "consumer"
 doAssert r.size.x == 7'f32
@@ -127,8 +127,11 @@ proc checkGenericObjectNames(abiModule: string) =
     "missing concrete Box[int] ABI type"
   doAssert "NimAbi_ZN8producer3BoxI6stringEE*" in text,
     "missing concrete Box[string] ABI type"
-  doAssert "proc makeIntBox*(): NimAbi_ZN8producer3BoxI3intEE" in text
-  doAssert "proc makeStringBox*(): NimAbi_ZN8producer3BoxI6stringEE" in text
+  doAssert "Box*[T] = object" in text, "missing public generic Box facade"
+  doAssert "proc makeIntBox*(): Box[int]" in text
+  doAssert "proc makeStringBox*(): Box[string]" in text
+  doAssert "proc boxIntValue*(box: Box[int]): int" in text
+  doAssert "proc boxStringLen*(box: Box[string]): int" in text
 
 let root = getTempDir() / "nim_exportnimabi_e2e_" & $getCurrentProcessId()
 removeDir(root)
