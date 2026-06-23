@@ -2783,6 +2783,20 @@ proc nimAbiProcNimDecl(m: BModule; info: NimAbiArtifactInfo; s: PSym): string =
       nimAbiNimRawTypeName(info, s.typ.returnType)
     else:
       ""
+  let backendName = nimAbiProcBackendName(m, s)
+  if rawFormals == formals and rawReturnType == returnType:
+    result = "proc "
+    result.add nimAbiNimProcName(s.name.s)
+    result.add "*("
+    result.add formals
+    result.add ")"
+    if returnType.len != 0:
+      result.add ": "
+      result.add returnType
+    result.add " {.importc: \""
+    result.add nimAbiJsonEscape(backendName)
+    result.add "\".}\n"
+    return
   let importName = nimAbiProcImportName(s)
   result = "proc "
   result.add importName
@@ -2793,7 +2807,7 @@ proc nimAbiProcNimDecl(m: BModule; info: NimAbiArtifactInfo; s: PSym): string =
     result.add ": "
     result.add rawReturnType
   result.add " {.importc: \""
-  result.add nimAbiJsonEscape(nimAbiProcBackendName(m, s))
+  result.add nimAbiJsonEscape(backendName)
   result.add "\".}\n"
   result.add "proc "
   result.add nimAbiNimProcName(s.name.s)
@@ -2804,7 +2818,6 @@ proc nimAbiProcNimDecl(m: BModule; info: NimAbiArtifactInfo; s: PSym): string =
     result.add ": "
     result.add returnType
   result.add " =\n"
-  result.add "  nimAbiEnsureInitialized()\n"
   if returnType.len != 0:
     if rawReturnType != returnType:
       result.add "  result = "
@@ -3619,6 +3632,7 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   nimText.add "()\n"
   for h in info.hooks:
     nimText.add nimAbiHookDecl(mainModule, h)
+  nimText.add "nimAbiEnsureInitialized()\n"
   for s in info.procs:
     nimText.add nimAbiProcNimDecl(mainModule, info, s)
   let nimModuleHash = getMD5(nimText)

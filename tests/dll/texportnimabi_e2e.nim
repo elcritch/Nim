@@ -95,12 +95,6 @@ doAssert boxStringLen(localStringBox) == 5
 """
   mismatchSource = """
 import producer_abi
-
-try:
-  discard makeRenderer()
-  quit "expected ABI mismatch"
-except ValueError as e:
-  echo e.msg
 """
 
 when defined(macosx):
@@ -113,6 +107,11 @@ proc runCmd(cmd: string): string =
   doAssert exitCode == 0, cmd & "\n" & outp
   result = outp
 
+proc runCmdFailure(cmd: string): string =
+  let (outp, exitCode) = execCmdEx(cmd, options = {poStdErrToStdOut})
+  doAssert exitCode != 0, cmd & "\nexpected failure\n" & outp
+  result = outp
+
 proc checkHookWrapperOrder(abiModule: string) =
   let text = readFile(abiModule)
   let hookPos = text.find("proc `=destroy`(dest: var Token)")
@@ -120,6 +119,29 @@ proc checkHookWrapperOrder(abiModule: string) =
   doAssert hookPos >= 0, "missing imported hook wrapper"
   doAssert procPos >= 0, "missing imported proc wrapper"
   doAssert hookPos < procPos, "hook wrapper must attach before proc wrappers"
+
+proc checkInitCallPlacement(abiModule: string) =
+  let text = readFile(abiModule)
+  let ensurePos = text.find("\nnimAbiEnsureInitialized()\n")
+  let procPos = text.find("proc makeRenderer*()")
+  doAssert ensurePos >= 0, "missing top-level ABI init call"
+  doAssert procPos >= 0, "missing imported proc wrapper"
+  doAssert ensurePos < procPos, "top-level ABI init must run before proc wrappers"
+  doAssert text.count("nimAbiEnsureInitialized()\n") == 1,
+    "expected exactly one top-level ABI init call"
+  doAssert "  nimAbiEnsureInitialized()\n" notin text,
+    "proc wrappers should not initialize ABI on every call"
+
+proc checkDirectProcImports(abiModule: string) =
+  let text = readFile(abiModule)
+  doAssert "proc makeRenderer*(): Renderer {.importc:" in text,
+    "ordinary proc should import directly"
+  doAssert "proc rendererScale*(r: Renderer): float32 {.importc:" in text,
+    "ordinary proc should import directly"
+  doAssert "proc nimAbiProc_makeRenderer_" notin text,
+    "ordinary proc should not need a private import wrapper"
+  doAssert "proc nimAbiProc_boxIntValue_" in text,
+    "generic facade proc still needs a raw import wrapper"
 
 proc checkGenericObjectNames(abiModule: string) =
   let text = readFile(abiModule)
@@ -161,6 +183,8 @@ let linkOpts = fmt"--path:{prodCache.quoteShell} " &
 discard runCmd(fmt"{nim.quoteShell} c -r --hints:off " &
   fmt"--nimcache:{consCache.quoteShell} {linkOpts} {consumer.quoteShell}")
 checkHookWrapperOrder(prodCache / "producer_abi.nim")
+checkInitCallPlacement(prodCache / "producer_abi.nim")
+checkDirectProcImports(prodCache / "producer_abi.nim")
 checkGenericObjectNames(prodCache / "producer_abi.nim")
 
 for (define, expected) in [
@@ -170,7 +194,7 @@ for (define, expected) in [
   ("nimAbiMismatchAllocator", "Nim ABI allocator mismatch"),
   ("nimAbiMismatchMemoryManager", "Nim ABI memory manager mismatch")]:
   let cache = root / ("mismatch_" & define)
-  let outp = runCmd(fmt"{nim.quoteShell} c -r --hints:off " &
+  let outp = runCmdFailure(fmt"{nim.quoteShell} c -r --hints:off " &
     fmt"--nimcache:{cache.quoteShell} {linkOpts} -d:{define} " &
     mismatch.quoteShell)
   doAssert expected in outp, define & "\n" & outp
