@@ -39,8 +39,9 @@ Compile the Nim consumer against the generated ABI module and C header:
 
 The generated Nim ABI module exposes `initProducerAbi()`. Public imported proc
 wrappers call it automatically before forwarding to private mangled imports. The
-producer library also exports `NimAbiInit_producer`, which compares the expected
-ABI fingerprint and calls `NimMain` exactly once on success.
+producer library also exports `NimAbiInit_producer`, which compares generated
+ABI expectations for artifact hashes, compiler/backend/runtime settings, layout,
+hooks, and proc signatures, then calls `NimMain` exactly once on success.
 
 Validate the generated C ABI header:
 

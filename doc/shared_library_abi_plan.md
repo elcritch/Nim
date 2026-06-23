@@ -48,10 +48,10 @@
 
 ### Milestone 6: Importer Integration
 
-- [ ] Generate or support importer-side ABI expectations from generated Nim ABI modules plus generated C headers.
-- [ ] Ensure generated hook wrappers attach before importer-side ARC lowering.
-- [ ] Add end-to-end shared-library tests with direct field access.
-- [ ] Add forced mismatch tests for layout, generated hook wrappers, compiler, allocator, and memory-manager differences.
+- [x] Generate or support importer-side ABI expectations from generated Nim ABI modules plus generated C headers.
+- [x] Ensure generated hook wrappers attach before importer-side ARC lowering.
+- [x] Add end-to-end shared-library tests with direct field access.
+- [x] Add forced mismatch tests for layout, generated hook wrappers, compiler, allocator, and memory-manager differences.
 
 ### Milestone 7: Later Compatibility Modes
 
@@ -191,6 +191,7 @@ The generated metadata currently contains:
 - Generated Nim ABI module hash.
 - Generated C header hash.
 - ABI fingerprint.
+- Metadata fingerprints for compiler, target, backend, runtime, flags, layout, hooks, and proc signatures.
 - Explicit `nimAbiInit` symbol.
 - Compiler version, compiler API version, and rod-file version.
 - Target OS, CPU, endian, and bit width.
@@ -202,7 +203,7 @@ The generated metadata currently contains:
 - Hook symbols and availability.
 - Proc symbols and signature fingerprints.
 
-This is still producer-side artifact emission plus generated-module validation. The generated Nim ABI module imports the explicit init entry point, stores the expected fingerprint, and exposes `init<Project>Abi`. Public imported proc wrappers call `nimAbiEnsureInitialized` before forwarding to private imported mangled symbols. Hook wrappers keep normal hook semantics and do not raise from validation; callers must initialize the ABI module before imported ARC operations can run. Importer-side dynamic loading, stale-header rejection, and richer mismatch reporting remain to be implemented.
+This is still link-time importer integration rather than a dynamic loader. The generated Nim ABI module imports the explicit init entry point, stores expected ABI values derived from the generated Nim module and C header, and exposes `init<Project>Abi`. Public imported proc wrappers call `nimAbiEnsureInitialized` before forwarding to private imported mangled symbols. Hook wrappers are emitted before public proc wrappers so producer hook declarations attach while the importer module is semantically processed. Hook wrappers keep normal hook semantics and do not raise from validation; callers must initialize the ABI module before imported ARC operations can run. Importer-side dynamic loading and stale-header rejection remain to be implemented.
 
 ## Generated Nim ABI Module
 
@@ -360,16 +361,30 @@ Shared libraries export a generated initialization proc, for example:
 proc nimAbiInit(expected: ptr NimAbiExpected): NimAbiInitResult {.cdecl, exportc, dynlib.}
 ```
 
-The current prototype uses a compact C signature:
+The current prototype passes the generated importer expectations explicitly:
 
 ```c
-N_LIB_EXPORT int NimAbiInit_project(const char* expectedFingerprint, const char** mismatch);
+N_LIB_EXPORT int NimAbiInit_project(
+  char* expectedFingerprint,
+  char* expectedNimModuleHash,
+  char* expectedCHeaderHash,
+  char* expectedCompilerHash,
+  char* expectedTargetHash,
+  char* expectedBackendHash,
+  char* expectedMemoryManager,
+  char* expectedAllocator,
+  char* expectedRuntimeHash,
+  char* expectedFlagsHash,
+  char* expectedLayoutHash,
+  char* expectedHookHash,
+  char* expectedProcHash,
+  char** mismatch);
 ```
 
 This proc currently:
 
-1. Checks the consumer-provided ABI fingerprint against the generated producer fingerprint.
-2. Returns a stable mismatch code and message before initialization on failure.
+1. Checks consumer-provided ABI expectations against generated producer values.
+2. Returns a stable mismatch code and category-specific message before initialization on failure.
 3. Calls `NimMain` exactly once on success.
 4. Runs user-declared library initialization code through `NimMain`.
 5. Marks the library initialized.
@@ -425,7 +440,7 @@ A Nim importer module should:
 2. Import the generated Nim ABI module.
 3. Have generated backend code include or reference the generated C ABI header.
 4. Construct expected ABI metadata from the generated Nim module, importing compilation, and header-derived C layout constants.
-5. Call `init<Project>Abi`, which forwards to the generated `nimAbiInit` symbol with the expected fingerprint.
+5. Call `init<Project>Abi`, which forwards to the generated `nimAbiInit` symbol with expected hashes and runtime settings.
 6. Reject the library if metadata, `sizeof`, alignment, offsets, Nim module hash, or C header hash mismatch.
 7. Bind mangled proc and hook symbols only after successful validation.
 8. Compile high-level Nim calls, field access, and ARC lowering against the validated transparent layout.
@@ -453,11 +468,11 @@ Likely compiler areas:
 - Compute `sizeof`, alignment, field offsets, field sizes, and layout hashes for transparent `object` and `ref object` payloads. Current status: `sizeof`, alignment, field offsets, field sizes, inheritance paths, discriminant presence, managed-field classification, and layout fingerprints are emitted for supported generated objects.
 - Export producer-side hook thunks for user-defined custom hooks. Current status: custom attached hooks for ABI-visible object payloads remain private and producer-side exported ABI thunks wrap them.
 - Generate importer-side attached hook wrappers that forward to imported hook thunks. Current status: the generated Nim ABI module emits normal hook-name wrappers for custom hooks, imports producer-side ABI thunks, and emits `{.error.}` declarations for unavailable hooks.
-- Generate structured ABI metadata. Current status: producer-side `<project>.abi.json` is emitted with compiler, target, backend, runtime, flags, Nim module hash, C header hash, ABI fingerprint, init symbol, type layout data, hook data, and proc signature fingerprints.
+- Generate structured ABI metadata. Current status: producer-side `<project>.abi.json` is emitted with compiler, target, backend, runtime, flags, Nim module hash, C header hash, ABI fingerprint, metadata category fingerprints, init symbol, type layout data, hook data, and proc signature fingerprints.
 - Generate explicit init and optional shutdown symbols.
 - Suppress automatic shared-library constructors for explicit-init builds. Current status: exportnimabi dynlibs emit `NimMain` and `NimAbiInit_<project>` but skip the automatic shared-library constructor.
-- Generate or support importer-side ABI expectations.
-- Add or extend `importabi`/`importnimabi` handling so imported hook declarations attach before ARC lowering.
+- Generate or support importer-side ABI expectations. Current status: generated Nim ABI modules carry expected artifact hashes, compiler/backend/runtime fingerprints, allocator and memory-manager names, layout hashes, hook wrapper hashes, and proc signature hashes.
+- Add or extend `importabi`/`importnimabi` handling so imported hook declarations attach before ARC lowering. Current status: the generated Nim ABI module emits attached hook wrappers before public proc wrappers; broader handwritten import modes remain pending.
 - Add diagnostics for unsupported exported signatures, unsupported layouts, missing hooks, no-copy violations, stale headers, and unsafe C field access.
 
 Relevant existing compiler machinery:

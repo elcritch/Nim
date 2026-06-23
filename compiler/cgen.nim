@@ -1859,6 +1859,18 @@ type
     nimTypeNames: Table[int, string]
     cTypeNames: Table[int, string]
 
+  NimAbiMetadataHashes = object
+    compilerHash: string
+    targetHash: string
+    backendHash: string
+    runtimeHash: string
+    flagsHash: string
+    layoutHash: string
+    hookHash: string
+    procHash: string
+    memoryManager: string
+    allocator: string
+
 const
   NimAbiHookOps = {attachedWasMoved, attachedDestructor, attachedAsgn,
                    attachedDup, attachedSink}
@@ -3067,10 +3079,47 @@ proc nimAbiAppendJsonProcs(dest: var string; info: NimAbiArtifactInfo;
              "\", \"signatureFingerprint\": \"" & $hashType(s.typ, conf) & "\"}"
   dest.add "\n  ]\n"
 
+proc nimAbiHashParts(parts: openArray[string]): string =
+  var text = ""
+  for part in parts:
+    text.add part
+    text.add "\n"
+  result = getMD5(text)
+
+proc nimAbiBuildMetadataHashes(info: NimAbiArtifactInfo;
+                               mainModule: BModule): NimAbiMetadataHashes =
+  let conf = info.config
+  result = NimAbiMetadataHashes()
+  result.memoryManager = $conf.selectedGC
+  result.allocator = nimAbiAllocatorName(conf)
+  result.compilerHash = nimAbiHashParts([
+    VersionAsString, RodFileVersion, $NimCompilerApiVersion])
+  result.targetHash = nimAbiHashParts([
+    OS[conf.target.targetOS].name, CPU[conf.target.targetCPU].name,
+    nimAbiEndianName(conf), $CPU[conf.target.targetCPU].bit])
+  result.backendHash = nimAbiHashParts([$conf.backend, CC[conf.cCompiler].name])
+  result.runtimeHash = nimAbiHashParts([
+    result.memoryManager, result.allocator, $conf.exc,
+    $conf.selectedStrings, $(optThreads in conf.globalOptions)])
+  result.flagsHash = nimAbiHashParts([
+    nimAbiOptionSetJson(conf.options),
+    nimAbiOptionSetJson(conf.globalOptions),
+    conf.compileOptions, $conf.compileOptionsCmd, $conf.linkOptionsCmd])
+  var layoutText = ""
+  nimAbiAppendJsonTypes(layoutText, info, conf)
+  result.layoutHash = getMD5(layoutText)
+  var hookText = ""
+  nimAbiAppendJsonHooks(hookText, info, mainModule)
+  result.hookHash = getMD5(hookText)
+  var procText = ""
+  nimAbiAppendJsonProcs(procText, info, mainModule, conf)
+  result.procHash = getMD5(procText)
+
 proc nimAbiBuildMetadataCore(info: NimAbiArtifactInfo; mainModule: BModule;
                              nimPath, headerPath: AbsoluteFile;
                              nimModuleHash, headerHash,
-                             initSymbol: string): string =
+                             initSymbol: string;
+                             hashes: NimAbiMetadataHashes): string =
   let conf = info.config
   result = ""
   result.add "  \"format\": \"nim-exportnimabi-v1\",\n"
@@ -3079,6 +3128,16 @@ proc nimAbiBuildMetadataCore(info: NimAbiArtifactInfo; mainModule: BModule;
   result.add "  \"nimModuleHash\": \"" & nimModuleHash & "\",\n"
   result.add "  \"cHeaderHash\": \"" & headerHash & "\",\n"
   result.add "  \"initSymbol\": \"" & nimAbiJsonEscape(initSymbol) & "\",\n"
+  result.add "  \"metadataFingerprints\": {"
+  result.add "\"compiler\": \"" & hashes.compilerHash & "\""
+  result.add ", \"target\": \"" & hashes.targetHash & "\""
+  result.add ", \"backend\": \"" & hashes.backendHash & "\""
+  result.add ", \"runtime\": \"" & hashes.runtimeHash & "\""
+  result.add ", \"flags\": \"" & hashes.flagsHash & "\""
+  result.add ", \"layout\": \"" & hashes.layoutHash & "\""
+  result.add ", \"hooks\": \"" & hashes.hookHash & "\""
+  result.add ", \"procs\": \"" & hashes.procHash & "\""
+  result.add "},\n"
   nimAbiAppendJsonConfig(result, conf)
   nimAbiAppendJsonTypes(result, info, conf)
   nimAbiAppendJsonHooks(result, info, mainModule)
@@ -3090,8 +3149,43 @@ proc nimAbiBuildMetadataText(core, fingerprint: string): string =
   result.add core
   result.add "}\n"
 
+proc nimAbiAppendExpectedConst(dest: var string; expectedName, actualName,
+                               mismatchDefine: string) =
+  dest.add "when defined("
+  dest.add mismatchDefine
+  dest.add "):\n"
+  dest.add "  const "
+  dest.add expectedName
+  dest.add "* = \"forced-"
+  dest.add mismatchDefine
+  dest.add "\"\n"
+  dest.add "else:\n"
+  dest.add "  const "
+  dest.add expectedName
+  dest.add "* = "
+  dest.add actualName
+  dest.add "\n"
+
+proc nimAbiAppendCInitCompare(dest: var string; param, actual,
+                              mismatch: string; code: int) =
+  dest.add "\tif (!"
+  dest.add param
+  dest.add " || strcmp("
+  dest.add param
+  dest.add ", \""
+  dest.add nimAbiJsonEscape(actual)
+  dest.add "\") != 0) {\n"
+  dest.add "\t\tif (mismatch) *mismatch = (char*)\""
+  dest.add nimAbiJsonEscape(mismatch)
+  dest.add "\";\n"
+  dest.add "\t\treturn "
+  dest.add $code
+  dest.add ";\n"
+  dest.add "\t}\n"
+
 proc nimAbiWriteCInit(conf: ConfigRef; cPath: AbsoluteFile;
-                      initSymbol, fingerprint: string) =
+                      initSymbol, fingerprint, nimModuleHash,
+                      headerHash: string; hashes: NimAbiMetadataHashes) =
   var text = "/* Generated by Nim for exportnimabi; do not edit. */\n"
   text.add "#define NIM_INTBITS "
   text.add $CPU[conf.target.targetCPU].bit
@@ -3111,17 +3205,43 @@ proc nimAbiWriteCInit(conf: ConfigRef; cPath: AbsoluteFile;
   text.add "\";\n\n"
   text.add "N_LIB_EXPORT int "
   text.add initSymbol
-  text.add "(const char* expectedFingerprint, const char** mismatch) {\n"
-  text.add "\tif (mismatch) *mismatch = (const char*)0;\n"
-  text.add "\tif (!expectedFingerprint) {\n"
-  text.add "\t\tif (mismatch) *mismatch = \"missing ABI fingerprint\";\n"
-  text.add "\t\treturn 1;\n"
-  text.add "\t}\n"
-  text.add "\tif (strcmp(expectedFingerprint, "
+  text.add "(char* expectedFingerprint, char* expectedNimModuleHash, "
+  text.add "char* expectedCHeaderHash, char* expectedCompilerHash, "
+  text.add "char* expectedTargetHash, char* expectedBackendHash, "
+  text.add "char* expectedMemoryManager, char* expectedAllocator, "
+  text.add "char* expectedRuntimeHash, char* expectedFlagsHash, "
+  text.add "char* expectedLayoutHash, char* expectedHookHash, "
+  text.add "char* expectedProcHash, char** mismatch) {\n"
+  text.add "\tif (mismatch) *mismatch = (char*)0;\n"
+  nimAbiAppendCInitCompare(text, "expectedNimModuleHash", nimModuleHash,
+    "Nim ABI module hash mismatch", 2)
+  nimAbiAppendCInitCompare(text, "expectedCHeaderHash", headerHash,
+    "Nim ABI C header hash mismatch", 3)
+  nimAbiAppendCInitCompare(text, "expectedCompilerHash", hashes.compilerHash,
+    "Nim ABI compiler mismatch", 4)
+  nimAbiAppendCInitCompare(text, "expectedTargetHash", hashes.targetHash,
+    "Nim ABI target mismatch", 5)
+  nimAbiAppendCInitCompare(text, "expectedBackendHash", hashes.backendHash,
+    "Nim ABI backend mismatch", 6)
+  nimAbiAppendCInitCompare(text, "expectedMemoryManager", hashes.memoryManager,
+    "Nim ABI memory manager mismatch", 7)
+  nimAbiAppendCInitCompare(text, "expectedAllocator", hashes.allocator,
+    "Nim ABI allocator mismatch", 8)
+  nimAbiAppendCInitCompare(text, "expectedRuntimeHash", hashes.runtimeHash,
+    "Nim ABI runtime mismatch", 9)
+  nimAbiAppendCInitCompare(text, "expectedFlagsHash", hashes.flagsHash,
+    "Nim ABI flags mismatch", 10)
+  nimAbiAppendCInitCompare(text, "expectedLayoutHash", hashes.layoutHash,
+    "Nim ABI layout mismatch", 11)
+  nimAbiAppendCInitCompare(text, "expectedHookHash", hashes.hookHash,
+    "Nim ABI hook wrapper mismatch", 12)
+  nimAbiAppendCInitCompare(text, "expectedProcHash", hashes.procHash,
+    "Nim ABI proc signature mismatch", 13)
+  text.add "\tif (!expectedFingerprint || strcmp(expectedFingerprint, "
   text.add nimAbiFingerprintName(conf)
   text.add ") != 0) {\n"
-  text.add "\t\tif (mismatch) *mismatch = \"ABI fingerprint mismatch\";\n"
-  text.add "\t\treturn 2;\n"
+  text.add "\t\tif (mismatch) *mismatch = (char*)\"Nim ABI fingerprint mismatch\";\n"
+  text.add "\t\treturn 14;\n"
   text.add "\t}\n"
   text.add "\tif (!"
   text.add nimAbiInitializedName(conf)
@@ -3166,6 +3286,7 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
         break
   if mainModule == nil: return
   nimAbiAssignCTypeNames(info, mainModule)
+  let hashes = nimAbiBuildMetadataHashes(info, mainModule)
 
   var nimText = "# Generated by Nim for exportnimabi; do not edit.\n"
   nimText.add "{.warning[UnusedImport]: off.}\n\n"
@@ -3192,15 +3313,71 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   nimText.add "const nimAbiCHeaderHash* = \""
   nimText.add "@NIM_EXPORTNIMABI_C_HEADER_HASH@"
   nimText.add "\"\n"
-  nimText.add "proc nimAbiInitRaw(expectedFingerprint: cstring; mismatch: ptr cstring): cint {.importc: \""
+  nimText.add "const nimAbiCompilerHash* = \""
+  nimText.add hashes.compilerHash
+  nimText.add "\"\n"
+  nimText.add "const nimAbiTargetHash* = \""
+  nimText.add hashes.targetHash
+  nimText.add "\"\n"
+  nimText.add "const nimAbiBackendHash* = \""
+  nimText.add hashes.backendHash
+  nimText.add "\"\n"
+  nimText.add "const nimAbiMemoryManager* = \""
+  nimText.add nimAbiJsonEscape(hashes.memoryManager)
+  nimText.add "\"\n"
+  nimText.add "const nimAbiAllocator* = \""
+  nimText.add nimAbiJsonEscape(hashes.allocator)
+  nimText.add "\"\n"
+  nimText.add "const nimAbiRuntimeHash* = \""
+  nimText.add hashes.runtimeHash
+  nimText.add "\"\n"
+  nimText.add "const nimAbiFlagsHash* = \""
+  nimText.add hashes.flagsHash
+  nimText.add "\"\n"
+  nimText.add "const nimAbiLayoutHash* = \""
+  nimText.add hashes.layoutHash
+  nimText.add "\"\n"
+  nimText.add "const nimAbiHookHash* = \""
+  nimText.add hashes.hookHash
+  nimText.add "\"\n"
+  nimText.add "const nimAbiProcHash* = \""
+  nimText.add hashes.procHash
+  nimText.add "\"\n"
+  nimAbiAppendExpectedConst(nimText, "nimAbiExpectedFingerprint",
+    "nimAbiFingerprint", "nimAbiMismatchFingerprint")
+  nimAbiAppendExpectedConst(nimText, "nimAbiExpectedNimModuleHash",
+    "nimAbiNimModuleHash", "nimAbiMismatchNimModule")
+  nimAbiAppendExpectedConst(nimText, "nimAbiExpectedCHeaderHash",
+    "nimAbiCHeaderHash", "nimAbiMismatchCHeader")
+  nimAbiAppendExpectedConst(nimText, "nimAbiExpectedCompilerHash",
+    "nimAbiCompilerHash", "nimAbiMismatchCompiler")
+  nimAbiAppendExpectedConst(nimText, "nimAbiExpectedTargetHash",
+    "nimAbiTargetHash", "nimAbiMismatchTarget")
+  nimAbiAppendExpectedConst(nimText, "nimAbiExpectedBackendHash",
+    "nimAbiBackendHash", "nimAbiMismatchBackend")
+  nimAbiAppendExpectedConst(nimText, "nimAbiExpectedMemoryManager",
+    "nimAbiMemoryManager", "nimAbiMismatchMemoryManager")
+  nimAbiAppendExpectedConst(nimText, "nimAbiExpectedAllocator",
+    "nimAbiAllocator", "nimAbiMismatchAllocator")
+  nimAbiAppendExpectedConst(nimText, "nimAbiExpectedRuntimeHash",
+    "nimAbiRuntimeHash", "nimAbiMismatchRuntime")
+  nimAbiAppendExpectedConst(nimText, "nimAbiExpectedFlagsHash",
+    "nimAbiFlagsHash", "nimAbiMismatchFlags")
+  nimAbiAppendExpectedConst(nimText, "nimAbiExpectedLayoutHash",
+    "nimAbiLayoutHash", "nimAbiMismatchLayout")
+  nimAbiAppendExpectedConst(nimText, "nimAbiExpectedHookHash",
+    "nimAbiHookHash", "nimAbiMismatchHookWrappers")
+  nimAbiAppendExpectedConst(nimText, "nimAbiExpectedProcHash",
+    "nimAbiProcHash", "nimAbiMismatchProcs")
+  nimText.add "proc nimAbiInitRaw(expectedFingerprint, expectedNimModuleHash, expectedCHeaderHash, expectedCompilerHash, expectedTargetHash, expectedBackendHash, expectedMemoryManager, expectedAllocator, expectedRuntimeHash, expectedFlagsHash, expectedLayoutHash, expectedHookHash, expectedProcHash: cstring; mismatch: ptr cstring): cint {.importc: \""
   nimText.add nimAbiJsonEscape(initSymbol)
-  nimText.add "\".}\n"
+  nimText.add "\", cdecl.}\n"
   nimText.add "var nimAbiValidated = false\n"
   nimText.add "proc "
   nimText.add nimAbiNimInitName(conf)
   nimText.add "*() =\n"
   nimText.add "  var mismatch: cstring\n"
-  nimText.add "  let code = nimAbiInitRaw(nimAbiFingerprint, addr mismatch)\n"
+  nimText.add "  let code = nimAbiInitRaw(nimAbiExpectedFingerprint, nimAbiExpectedNimModuleHash, nimAbiExpectedCHeaderHash, nimAbiExpectedCompilerHash, nimAbiExpectedTargetHash, nimAbiExpectedBackendHash, nimAbiExpectedMemoryManager, nimAbiExpectedAllocator, nimAbiExpectedRuntimeHash, nimAbiExpectedFlagsHash, nimAbiExpectedLayoutHash, nimAbiExpectedHookHash, nimAbiExpectedProcHash, addr mismatch)\n"
   nimText.add "  if code != 0:\n"
   nimText.add "    if mismatch == nil:\n"
   nimText.add "      raise newException(ValueError, \"Nim ABI mismatch\")\n"
@@ -3256,7 +3433,13 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   headerText.add "(void);\n"
   headerText.add "N_LIB_IMPORT int "
   headerText.add initSymbol
-  headerText.add "(const char* expectedFingerprint, const char** mismatch);\n"
+  headerText.add "(char* expectedFingerprint, char* expectedNimModuleHash, "
+  headerText.add "char* expectedCHeaderHash, char* expectedCompilerHash, "
+  headerText.add "char* expectedTargetHash, char* expectedBackendHash, "
+  headerText.add "char* expectedMemoryManager, char* expectedAllocator, "
+  headerText.add "char* expectedRuntimeHash, char* expectedFlagsHash, "
+  headerText.add "char* expectedLayoutHash, char* expectedHookHash, "
+  headerText.add "char* expectedProcHash, char** mismatch);\n"
   for s in info.procs:
     headerText.add nimAbiProcCDecl(mainModule, info, s)
   for h in info.hooks:
@@ -3268,7 +3451,7 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
 
   let headerHash = getMD5(headerText)
   let metadataCore = nimAbiBuildMetadataCore(info, mainModule, nimPath,
-    headerPath, nimModuleHash, headerHash, initSymbol)
+    headerPath, nimModuleHash, headerHash, initSymbol, hashes)
   let abiFingerprint = getMD5(metadataCore)
   var metaText = nimAbiBuildMetadataText(metadataCore, abiFingerprint)
   nimText = nimText.replace(fingerprintPlaceholder, abiFingerprint)
@@ -3278,7 +3461,8 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   writeFile(nimPath, nimText)
   writeFile(headerPath, headerText)
   writeFile(metaPath, metaText)
-  nimAbiWriteCInit(conf, cInitPath, initSymbol, abiFingerprint)
+  nimAbiWriteCInit(conf, cInitPath, initSymbol, abiFingerprint,
+    nimModuleHash, headerHash, hashes)
 
 proc getSomeNameForModule*(m: BModule): Rope =
   ## Returns a mangled module name.
