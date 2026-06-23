@@ -17,6 +17,7 @@ r.scale = 5'f32
 r.child.label = "nested"
 r.token.id = 9
 
+echo "R: ", $r
 doAssert r.baseId == 2
 doAssert r.name == "imported"
 doAssert r.size.x == 3'f32

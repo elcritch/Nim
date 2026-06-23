@@ -34,4 +34,7 @@ proc makeRenderer*(): Renderer {.exportnimabi.} =
 proc rendererScale*(r: Renderer): float32 {.exportnimabi.} =
   r.scale
 
+proc `$`*(r: Renderer): string {.exportnimabi.} =
+  result = "RENDERER(" & repr(r) & ")"
+
 discard makeRenderer()

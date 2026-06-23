@@ -43,8 +43,12 @@ proc makeRenderer*(): Renderer {.exportnimabi.} =
 
 proc rendererScale*(r: Renderer): float32 {.exportnimabi.} =
   r.scale
+
+proc `$`*(r: Renderer): string {.exportnimabi.} =
+  result = "Renderer(" & repr(r) & ")"
 """
   consumerSource = """
+import std/strutils
 import producer_abi
 
 let r = makeRenderer()
@@ -56,6 +60,7 @@ r.size.y = 8'f32
 r.scale = 9'f32
 r.child.label = "child-updated"
 r.token.id = 42
+let rendered = $r
 doAssert r.baseId == 11
 doAssert r.name == "consumer"
 doAssert r.size.x == 7'f32
@@ -63,6 +68,7 @@ doAssert r.size.y == 8'f32
 doAssert rendererScale(r) == 9'f32
 doAssert r.child.label == "child-updated"
 doAssert r.token.id == 42
+doAssert "Renderer(" in rendered
 """
   mismatchSource = """
 import producer_abi

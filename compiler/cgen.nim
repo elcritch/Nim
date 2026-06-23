@@ -1891,6 +1891,8 @@ proc nimAbiSanitizeName(s: string): string =
       result = "Abi" & result
     else:
       result = "Abi_" & result
+  while result.len > 0 and result[^1] == '_':
+    result.setLen(result.len - 1)
 
 proc nimAbiSymName(s: PSym; fallback: string): string =
   if s != nil and s.name.s.len != 0:
