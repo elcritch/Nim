@@ -1,7 +1,10 @@
-# exportnimabi transparent ref example
+# exportnimabi transparent ref and generic object example
 
 This example exercises generated transparent `ref object` layout for a Nim ABI
-producer and a Nim consumer.
+producer and a Nim consumer. It also exports concrete generic object
+instantiations through `Box[int]` and `Box[string]` signatures, causing the
+generated ABI module and C header to expose module-qualified Itanium-style type
+names such as `NimAbi_ZN8producer3BoxI3intEE`.
 
 From the repository root, build a compiler with the local changes:
 
@@ -51,7 +54,9 @@ header, and shared library:
 The consumer calls `makeRenderer()` through the generated public proc wrapper,
 which validates ABI expectations and initializes the producer. It then performs
 ordinary Nim reads and writes on transparent `ref object` fields, including
-managed fields (`string`, nested `ref`, and a custom-hook object field).
+managed fields (`string`, nested `ref`, and a custom-hook object field). It also
+constructs generated generic ABI object types locally and passes them back to
+producer procs.
 
 The generated Nim ABI module exposes `initProducerAbi()`. Public imported proc
 wrappers call it automatically before forwarding to private mangled imports. The

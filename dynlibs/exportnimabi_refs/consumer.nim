@@ -9,6 +9,15 @@ doAssert rendererScale(r) == 1'f32
 doAssert r.child.label == "child"
 doAssert r.token.id == 7
 
+let intBox = makeIntBox()
+let stringBox = makeStringBox()
+let localIntBox = NimAbi_ZN8producer3BoxI3intEE(value: 12)
+let localStringBox = NimAbi_ZN8producer3BoxI6stringEE(value: "local")
+doAssert intBox.value == 42
+doAssert stringBox.value == "generic"
+doAssert boxIntValue(localIntBox) == 12
+doAssert boxStringLen(localStringBox) == 5
+
 r.baseId = 2
 r.name = "imported"
 r.size.x = 3'f32

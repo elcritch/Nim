@@ -5,6 +5,9 @@ type
   Token* = object
     id*: int
 
+  Box*[T] = object
+    value*: T
+
   Child* = ref object
     label*: string
 
@@ -36,5 +39,17 @@ proc rendererScale*(r: Renderer): float32 {.exportnimabi.} =
 
 proc `$`*(r: Renderer): string {.exportnimabi.} =
   result = "RENDERER(" & repr(r) & ")"
+
+proc makeIntBox*(): Box[int] {.exportnimabi.} =
+  Box[int](value: 42)
+
+proc makeStringBox*(): Box[string] {.exportnimabi.} =
+  Box[string](value: "generic")
+
+proc boxIntValue*(box: Box[int]): int {.exportnimabi.} =
+  box.value
+
+proc boxStringLen*(box: Box[string]): int {.exportnimabi.} =
+  box.value.len
 
 discard makeRenderer()

@@ -1830,6 +1830,7 @@ type
 
   NimAbiObjectInfo = object
     typ: PType
+    abiTyp: PType
     nimName: string
     cName: string
     isRefPayload: bool
@@ -2104,10 +2105,29 @@ proc nimAbiAddObject(info: var NimAbiArtifactInfo; typ: PType;
     return
   info.nimTypeNames[raw.id] = cleanName
   info.nimTypeNames[obj.id] = cleanName
-  info.objects.add NimAbiObjectInfo(typ: obj, nimName: cleanName,
+  info.objects.add NimAbiObjectInfo(typ: obj, abiTyp: raw, nimName: cleanName,
                                     isRefPayload: isRefPayload)
 
+proc nimAbiGenericObjectCTypeName(m: BModule; typ: PType): string =
+  let inst = typ.skipTypes({tyAlias})
+  if inst == nil or inst.kind != tyGenericInst or inst.len == 0 or
+      inst[0] == nil or inst[0].sym == nil:
+    return ""
+  var staticLists = ""
+  result = "NimAbi_ZN"
+  result.add encodeName(inst[0].sym.skipGenericOwner.name.s)
+  result.add encodeName(inst[0].sym.name.s)
+  result.add "I"
+  for _, arg in inst.genericInstParams:
+    result.add encodeType(m, arg, staticLists)
+  result.add "E"
+  result.add staticLists
+  result.add "E"
+
 proc nimAbiCTypeName(m: BModule; obj: NimAbiObjectInfo): string =
+  result = nimAbiGenericObjectCTypeName(m, obj.abiTyp)
+  if result.len != 0:
+    return
   if obj.typ != nil and obj.typ.sym != nil and obj.typ.sym.name.s.len != 0:
     result = "NimAbi_Z"
     result.add encodeSym(m, obj.typ.sym)
@@ -2191,8 +2211,15 @@ proc nimAbiAssignCTypeNames(info: var NimAbiArtifactInfo; m: BModule) =
       cName.add "_"
       cName.add nimAbiSanitizeName($hashType(info.objects[i].typ, info.config))
     seen[baseName] = i
+    var nimName = info.objects[i].nimName
+    if nimAbiGenericObjectCTypeName(m, info.objects[i].abiTyp).len != 0:
+      nimName = cName
+    info.objects[i].nimName = nimName
     info.objects[i].cName = cName
     info.cTypeNames[info.objects[i].typ.id] = cName
+    info.nimTypeNames[info.objects[i].typ.id] = nimName
+    if info.objects[i].abiTyp != nil:
+      info.nimTypeNames[info.objects[i].abiTyp.id] = nimName
 
 proc nimAbiAddRef(info: var NimAbiArtifactInfo; typ: PType) =
   let refTyp = typ.skipTypes({tyAlias, tyGenericInst})

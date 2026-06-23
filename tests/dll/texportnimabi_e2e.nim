@@ -16,6 +16,9 @@ type
   Token* = object
     id*: int
 
+  Box*[T] = object
+    value*: T
+
   Child* = ref object
     label*: string
 
@@ -46,6 +49,18 @@ proc rendererScale*(r: Renderer): float32 {.exportnimabi.} =
 
 proc `$`*(r: Renderer): string {.exportnimabi.} =
   result = "Renderer(" & repr(r) & ")"
+
+proc makeIntBox*(): Box[int] {.exportnimabi.} =
+  Box[int](value: 42)
+
+proc makeStringBox*(): Box[string] {.exportnimabi.} =
+  Box[string](value: "generic")
+
+proc boxIntValue*(box: Box[int]): int {.exportnimabi.} =
+  box.value
+
+proc boxStringLen*(box: Box[string]): int {.exportnimabi.} =
+  box.value.len
 """
   consumerSource = """
 import std/strutils
@@ -61,6 +76,10 @@ r.scale = 9'f32
 r.child.label = "child-updated"
 r.token.id = 42
 let rendered = $r
+let intBox = makeIntBox()
+let stringBox = makeStringBox()
+let localIntBox = NimAbi_ZN8producer3BoxI3intEE(value: 12)
+let localStringBox = NimAbi_ZN8producer3BoxI6stringEE(value: "local")
 doAssert r.baseId == 11
 doAssert r.name == "consumer"
 doAssert r.size.x == 7'f32
@@ -69,6 +88,10 @@ doAssert rendererScale(r) == 9'f32
 doAssert r.child.label == "child-updated"
 doAssert r.token.id == 42
 doAssert "Renderer(" in rendered
+doAssert intBox.value == 42
+doAssert stringBox.value == "generic"
+doAssert boxIntValue(localIntBox) == 12
+doAssert boxStringLen(localStringBox) == 5
 """
   mismatchSource = """
 import producer_abi
@@ -98,6 +121,15 @@ proc checkHookWrapperOrder(abiModule: string) =
   doAssert procPos >= 0, "missing imported proc wrapper"
   doAssert hookPos < procPos, "hook wrapper must attach before proc wrappers"
 
+proc checkGenericObjectNames(abiModule: string) =
+  let text = readFile(abiModule)
+  doAssert "NimAbi_ZN8producer3BoxI3intEE*" in text,
+    "missing concrete Box[int] ABI type"
+  doAssert "NimAbi_ZN8producer3BoxI6stringEE*" in text,
+    "missing concrete Box[string] ABI type"
+  doAssert "proc makeIntBox*(): NimAbi_ZN8producer3BoxI3intEE" in text
+  doAssert "proc makeStringBox*(): NimAbi_ZN8producer3BoxI6stringEE" in text
+
 let root = getTempDir() / "nim_exportnimabi_e2e_" & $getCurrentProcessId()
 removeDir(root)
 createDir(root)
@@ -126,6 +158,7 @@ let linkOpts = fmt"--path:{prodCache.quoteShell} " &
 discard runCmd(fmt"{nim.quoteShell} c -r --hints:off " &
   fmt"--nimcache:{consCache.quoteShell} {linkOpts} {consumer.quoteShell}")
 checkHookWrapperOrder(prodCache / "producer_abi.nim")
+checkGenericObjectNames(prodCache / "producer_abi.nim")
 
 for (define, expected) in [
   ("nimAbiMismatchLayout", "Nim ABI layout mismatch"),
