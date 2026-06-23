@@ -3652,11 +3652,13 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   headerText.add extract(headerDefines)
   headerText.add "#include <stddef.h>\n"
   headerText.add "#include \"nimbase.h\"\n\n"
+  let runtimeDeclsStart = headerText.len
   headerText.add "#ifndef NIM_EXPORTNIMABI_SKIP_RUNTIME_DECLS\n"
   headerText.add extract(mainModule.s[cfsForwardTypes])
   headerText.add extract(mainModule.s[cfsTypes])
   headerText.add extract(mainModule.s[cfsSeqTypes])
   headerText.add "#endif\n\n"
+  let runtimeDeclsEnd = headerText.len
   for obj in info.objects:
     headerText.add "typedef struct "
     headerText.add obj.cName
@@ -3688,7 +3690,13 @@ proc nimAbiWriteArtifacts(g: BModuleList) =
   headerText.add headerGuard
   headerText.add " */\n"
 
-  let headerHash = getMD5(headerText)
+  # The standalone header contains backend runtime declarations for C users.
+  # They can change after a body-only edit, so they are not part of the ABI hash.
+  let headerHashText =
+    headerText.substr(0, runtimeDeclsStart - 1) &
+    "/* Runtime declarations omitted from ABI hash. */\n\n" &
+    headerText.substr(runtimeDeclsEnd)
+  let headerHash = getMD5(headerHashText)
   let metadataCore = nimAbiBuildMetadataCore(info, mainModule, nimPath,
     headerPath, nimModuleHash, headerHash, initSymbol, hashes)
   let abiFingerprint = getMD5(metadataCore)

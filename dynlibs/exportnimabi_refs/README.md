@@ -13,6 +13,30 @@ From the repository root, build a compiler with the local changes:
 ./bin/nim c -d:release -o:compiler/nim-abi-test compiler/nim.nim
 ```
 
+Then compile the producer and consumer separately from this directory:
+
+```sh
+cd dynlibs/exportnimabi_refs
+./compile_producer.sh
+./compile_consumer.sh
+```
+
+`compile_producer.sh` removes the producer cache, builds the producer shared
+library, and emits ABI artifacts. `compile_consumer.sh` removes the consumer
+cache and compiles the consumer executable against the generated ABI module and
+C header without running it.
+
+To run the full producer/consumer example:
+
+```sh
+cd dynlibs/exportnimabi_refs
+./build_e2e.sh
+```
+
+The e2e script removes old caches, builds the producer shared library, builds
+and runs the consumer against the generated ABI module and C header, then prints
+the key exported init symbols from the shared library.
+
 Build the producer shared library and emit ABI artifacts:
 
 ```sh

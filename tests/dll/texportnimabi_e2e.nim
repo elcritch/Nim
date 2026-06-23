@@ -157,6 +157,16 @@ proc checkGenericObjectNames(abiModule: string) =
   doAssert "proc boxIntValue*(box: Box[int]): int" in text
   doAssert "proc boxStringLen*(box: Box[string]): int" in text
 
+proc generatedConstValue(abiModule, name: string): string =
+  let text = readFile(abiModule)
+  let prefix = "const " & name & "* = \""
+  let start = text.find(prefix)
+  doAssert start >= 0, "missing generated const: " & name
+  let valueStart = start + prefix.len
+  let valueEnd = text.find("\"", valueStart)
+  doAssert valueEnd >= valueStart, "unterminated generated const: " & name
+  result = text[valueStart..<valueEnd]
+
 let root = getTempDir() / "nim_exportnimabi_e2e_" & $getCurrentProcessId()
 removeDir(root)
 createDir(root)
@@ -188,6 +198,20 @@ checkHookWrapperOrder(prodCache / "producer_abi.nim")
 checkInitCallPlacement(prodCache / "producer_abi.nim")
 checkDirectProcImports(prodCache / "producer_abi.nim")
 checkGenericObjectNames(prodCache / "producer_abi.nim")
+
+let firstHeaderHash = generatedConstValue(prodCache / "producer_abi.nim",
+  "nimAbiCHeaderHash")
+writeFile(producer, producerSource.replace(
+  "proc `$`*(r: Renderer): string {.exportnimabi.} =\n  result =",
+  "proc `$`*(r: Renderer): string {.exportnimabi.} =\n  echo \"TEST\"\n  result ="))
+discard runCmd(fmt"{nim.quoteShell} c --hints:off --app:lib " &
+  fmt"--nimcache:{prodCache.quoteShell} --out:{libPath.quoteShell} " &
+  producer.quoteShell)
+let secondHeaderHash = generatedConstValue(prodCache / "producer_abi.nim",
+  "nimAbiCHeaderHash")
+doAssert firstHeaderHash == secondHeaderHash,
+  "body-only producer rebuild should not change C header ABI hash"
+discard runCmd((root / "consumer").quoteShell)
 
 for (define, expected) in [
   ("nimAbiMismatchLayout", "Nim ABI layout mismatch"),
