@@ -5,7 +5,7 @@ compiler owns only facts that require backend authority:
 
 - `{.exportabi.}` and its final Itanium-style symbol;
 - collection of concrete exported instances;
-- a compact `<project>.abi.nif` mapping semantic NIF symbols to backend symbols,
+- a compact `<library>.abi.nif` mapping semantic NIF symbols to backend symbols,
   with compiler, target, memory-manager, and allocator facts.
 
 `exportabi` reuses Nim's ordinary external-export and shared-library visibility
@@ -51,6 +51,11 @@ NIM_NATIVE_DYNLIB_COMPILER=/path/to/nim ./build_consumer.sh
 `build_producer.sh` produces the shared library and ABI artifacts.
 `build_consumer.sh` regenerates the Nim bindings, then builds and runs the
 consumer against the existing producer library.
+
+The compiler stages the manifest in `nimcache`, then publishes one manifest
+beside the successfully linked dynamic library. The public manifest covers the
+complete library export surface; its module table identifies every source
+module that contributed an exported procedure.
 
 The shared library and its stable semantic BIF are produced together by an
 ordinary `nim c --experimental:abi --emitBif:on --app:lib` build. This reuses

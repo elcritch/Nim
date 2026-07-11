@@ -14,11 +14,13 @@ type
 
   AbiManifest = object
     formatVersion: int64
+    libraryName: string
     compilerVersion: string
     targetOS: string
     targetCPU: string
     memoryManager: string
     allocator: string
+    modules: seq[NativeModule]
     procs: seq[AbiProcEntry]
 
 proc fail(message: string) {.noinline, noreturn.} =
@@ -75,6 +77,16 @@ proc parseAbiProcs(node: Cursor): seq[AbiProcEntry] =
       fail("native ABI manifest procs contains an invalid entry")
     children.skip
 
+proc parseAbiModules(node: Cursor): seq[NativeModule] =
+  var children = node.childCursor()
+  while children.hasMore:
+    if children.kind == TagLit and children.tagName == "module":
+      let values = readStrings(children, "module", 2)
+      result.add NativeModule(identity: values[0], name: values[1])
+    elif children.kind != DotToken:
+      fail("native ABI manifest modules contains an invalid entry")
+    children.skip
+
 proc readAbiManifest(path: string): AbiManifest =
   var manifest = nifcoreparse.parseFromFile(path)
   var cursor = manifest.beginRead()
@@ -103,6 +115,10 @@ proc readAbiManifest(path: string): AbiManifest =
         result.memoryManager = readStrings(cursor, "memorymanager", 1)[0]
       of "allocator":
         result.allocator = readStrings(cursor, "allocator", 1)[0]
+      of "library":
+        result.libraryName = readStrings(cursor, "library", 1)[0]
+      of "modules":
+        result.modules = parseAbiModules(cursor)
       of "procs":
         result.procs = parseAbiProcs(cursor)
       else:
@@ -110,11 +126,12 @@ proc readAbiManifest(path: string): AbiManifest =
     cursor.skip
   cursor.endRead()
 
-  if result.formatVersion != 1:
+  if result.formatVersion != 2:
     fail("unsupported native ABI manifest format")
   if result.compilerVersion.len == 0 or result.targetOS.len == 0 or
       result.targetCPU.len == 0 or result.memoryManager.len == 0 or
-      result.allocator.len == 0:
+      result.allocator.len == 0 or result.libraryName.len == 0 or
+      result.modules.len == 0:
     fail("native ABI manifest is missing target metadata")
 
 func symbolBase(symbol: string): string =
@@ -285,11 +302,13 @@ proc findDeclaration(module: var BifModule; nifSymbol: string): Cursor =
 
 proc readNativeApi*(bifPath, manifestPath: string): NativeApi =
   let manifest = readAbiManifest(manifestPath)
+  result.libraryName = manifest.libraryName
   result.compilerVersion = manifest.compilerVersion
   result.targetOS = manifest.targetOS
   result.targetCPU = manifest.targetCPU
   result.memoryManager = manifest.memoryManager
   result.allocator = manifest.allocator
+  result.modules = manifest.modules
 
   var module = bif.load(bifPath)
   for entry in module.index:

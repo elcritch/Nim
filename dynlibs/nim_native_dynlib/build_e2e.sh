@@ -10,7 +10,9 @@ case "$(uname -s)" in
   *) echo "unsupported platform" >&2; exit 1 ;;
 esac
 
-rm -rf nimcache generated generator consumer "$library"
+manifest="${library%.*}.abi.nif"
+
+rm -rf nimcache generated generator consumer "$library" "$manifest"
 
 "$script_dir/build_producer.sh"
 "$script_dir/build_consumer.sh"

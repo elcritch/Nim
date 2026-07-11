@@ -26,11 +26,17 @@ type
     returnTypeSymbol*: string
     params*: seq[NativeParam]
 
+  NativeModule* = object
+    identity*: string
+    name*: string
+
   NativeApi* = object
+    libraryName*: string
     compilerVersion*: string
     targetOS*: string
     targetCPU*: string
     memoryManager*: string
     allocator*: string
+    modules*: seq[NativeModule]
     types*: seq[NativeType]
     procs*: seq[NativeProc]

@@ -2963,21 +2963,34 @@ proc nativeDynlibAllocator(config: ConfigRef): string =
     result = "nim-default"
 
 proc writeNimExportManifest(g: BModuleList; config: ConfigRef) =
-  if config.cmd == cmdNifC or g.exportedNimProcs.len == 0:
+  if config.cmd == cmdNifC:
+    return
+
+  let path = config.nimcacheDir /
+    RelativeFile(config.projectName & ".abi.nif")
+  if g.exportedNimProcs.len == 0:
+    discard tryRemoveFile(path.string)
     return
 
   var procs = g.exportedNimProcs
   procs.sort(proc(a, b: PSym): int =
     cmp(globalName(a, config), globalName(b, config)))
 
-  let path = config.nimcacheDir /
-    RelativeFile(config.projectName & ".abi.nif")
+  var modules: seq[(string, string)] = @[]
+  var seenModules = initHashSet[string]()
+  for prc in procs:
+    let module = prc.getModule
+    let identity = modname(module, config)
+    if not seenModules.containsOrIncl(identity):
+      modules.add (identity, module.name.s)
+  modules.sort(proc(a, b: (string, string)): int = cmp(a[0], b[0]))
+
   var manifest = nifbuilder.open(
     path.string, writeMode = nifbuilder.OnlyIfChanged)
   nifbuilder.addHeader(manifest, "nim", "nim-native-dynlib")
   nifbuilder.withTree(manifest, "abi"):
     nifbuilder.withTree(manifest, "format"):
-      nifbuilder.addIntLit(manifest, 1)
+      nifbuilder.addIntLit(manifest, 2)
     nifbuilder.withTree(manifest, "compiler"):
       nifbuilder.addStrLit(manifest, VersionAsString)
     nifbuilder.withTree(manifest, "target"):
@@ -2987,6 +3000,13 @@ proc writeNimExportManifest(g: BModuleList; config: ConfigRef) =
       nifbuilder.addStrLit(manifest, $config.selectedGC)
     nifbuilder.withTree(manifest, "allocator"):
       nifbuilder.addStrLit(manifest, nativeDynlibAllocator(config))
+    nifbuilder.withTree(manifest, "library"):
+      nifbuilder.addStrLit(manifest, config.outFile.string.extractFilename)
+    nifbuilder.withTree(manifest, "modules"):
+      for module in modules:
+        nifbuilder.withTree(manifest, "module"):
+          nifbuilder.addStrLit(manifest, module[0])
+          nifbuilder.addStrLit(manifest, module[1])
     nifbuilder.withTree(manifest, "procs"):
       for prc in procs:
         nifbuilder.withTree(manifest, "proc"):
