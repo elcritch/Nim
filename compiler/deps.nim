@@ -771,6 +771,16 @@ proc computeForwardedArgs(c: DepContext): seq[string] =
   # them — phantom outputs that re-fire the build on every rerun).
   if c.config.selectedGC != gcUnselected:
     result.add "--mm:" & $c.config.selectedGC
+  # The application kind is a codegen/link setting, not just a set of defines.
+  # In particular, `--app:lib` also enables the shared-library linker mode in
+  # every `nim nifc` child. Forward it explicitly; replaying `library`/`dll`
+  # defines alone otherwise leaves the link child producing an executable.
+  if optGenDynLib in c.config.globalOptions:
+    result.add "--app:lib"
+  elif optGenStaticLib in c.config.globalOptions:
+    result.add "--app:staticlib"
+  elif optGenGuiApp in c.config.globalOptions:
+    result.add "--app:gui"
   # method dispatch semantics must match across the child processes:
   # a child compiled without --multimethods:on builds different dispatch
   # buckets (and rejects calls as ambiguous that multi-dispatch accepts)
