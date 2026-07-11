@@ -1,5 +1,5 @@
 import std/[os, strutils]
-import ../../dist/nimony/src/lib/[bif, nifcoreparse]
+import ../../../dist/nimony/src/lib/[bif, nifcoreparse]
 import model
 
 type

@@ -4,7 +4,7 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$script_dir"
 
-nim=${NIM_NATIVE_DYNLIB_COMPILER:-"../../bin/nim"}
+nim=${NIM_NATIVE_DYNLIB_COMPILER:-"../../../bin/nim"}
 
 case "$(uname -s)" in
   Darwin) library="$script_dir/libproducer.dylib" ;;
