@@ -81,7 +81,9 @@ proc generateTypes(api: NativeApi; names: Table[string, string]): string =
 func params(procInfo: NativeProc; names: Table[string, string]): string =
   var parts: seq[string] = @[]
   for param in procInfo.params:
-    parts.add nimIdentifier(param.name) & ": " & nimType(param.typeSymbol, names)
+    let modifier = if param.byVar: "var " else: ""
+    parts.add nimIdentifier(param.name) & ": " & modifier &
+      nimType(param.typeSymbol, names)
   result = parts.join("; ")
 
 func args(procInfo: NativeProc): string =
@@ -100,12 +102,36 @@ proc generateNativeModule*(api: NativeApi; libraryPath: string): string =
   result.add "var nativeLibraryInitialized = false\n\n"
   result.add "proc nativeNimMain() {.cdecl, importc: \"NimMain\", " &
     "dynlib: nativeLibrary.}\n\n"
+  result.add "proc ensureNativeLibrary() {.raises: [].} =\n"
+  result.add "  if not nativeLibraryInitialized:\n"
+  result.add "    nativeNimMain()\n"
+  result.add "    nativeLibraryInitialized = true\n\n"
   result.add "proc initNativeLibrary*() =\n"
   result.add "  if not nativeLibraryInitialized:\n"
   result.add "    echo \"Initializing native library: \", nativeLibrary\n"
-  result.add "    nativeNimMain()\n"
-  result.add "    nativeLibraryInitialized = true\n"
+  result.add "    ensureNativeLibrary()\n"
   result.add "    echo \"Native library initialized\"\n"
+
+  for i, hook in api.hooks:
+    let procInfo = hook.procInfo
+    let returnType = nimType(procInfo.returnTypeSymbol, names)
+    let returnDecl = if returnType.len == 0: "" else: ": " & returnType
+    let formals = params(procInfo, names)
+    let callArgs = args(procInfo)
+    if hook.status == nhCustom:
+      result.add "\nproc nativeHookRaw" & $i & "(" & formals & ")" &
+        returnDecl & " {.nimcall, importc: " & procInfo.cSymbol.escape &
+        ", dynlib: nativeLibrary.}\n"
+      result.add "\nproc " & nimIdentifier(hook.kind) & "(" & formals & ")" &
+        returnDecl & " =\n"
+      result.add "  ensureNativeLibrary()\n"
+      if returnType.len == 0:
+        result.add "  nativeHookRaw" & $i & "(" & callArgs & ")\n"
+      else:
+        result.add "  result = nativeHookRaw" & $i & "(" & callArgs & ")\n"
+    else:
+      result.add "\nproc " & nimIdentifier(hook.kind) & "(" & formals & ")" &
+        returnDecl & " {.error.}\n"
 
   for i, procInfo in api.procs:
     let returnType = nimType(procInfo.returnTypeSymbol, names)

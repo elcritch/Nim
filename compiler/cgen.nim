@@ -2972,17 +2972,41 @@ proc writeNimExportManifest(g: BModuleList; config: ConfigRef) =
     discard tryRemoveFile(path.string)
     return
 
-  var procs = g.exportedNimProcs
+  var hookIds = initIntSet()
+  for item in g.graph.abiHooks:
+    hookIds.incl item.hook.id
+
+  var procs: seq[PSym] = @[]
+  for prc in g.exportedNimProcs:
+    if prc.id notin hookIds and sfOverridden notin prc.flags:
+      procs.add prc
   procs.sort(proc(a, b: PSym): int =
     cmp(globalName(a, config), globalName(b, config)))
 
+  var hooks = g.graph.abiHooks
+  hooks.sort(proc(a, b: tuple[typ: PType, op: TTypeAttachedOp, hook: PSym]): int =
+    result = cmp(icNifTypeName(a.typ, config), icNifTypeName(b.typ, config))
+    if result == 0:
+      result = cmp(ord(a.op), ord(b.op)))
+  var uniqueHooks: seq[tuple[typ: PType, op: TTypeAttachedOp, hook: PSym]] = @[]
+  for item in hooks:
+    if uniqueHooks.len == 0 or
+        uniqueHooks[^1].op != item.op or
+        icNifTypeName(uniqueHooks[^1].typ, config) !=
+          icNifTypeName(item.typ, config):
+      uniqueHooks.add item
+
   var modules: seq[(string, string)] = @[]
   var seenModules = initHashSet[string]()
-  for prc in procs:
-    let module = prc.getModule
+  proc addModule(sym: PSym) =
+    let module = sym.getModule
     let identity = modname(module, config)
     if not seenModules.containsOrIncl(identity):
       modules.add (identity, module.name.s)
+  for prc in procs:
+    addModule(prc)
+  for item in uniqueHooks:
+    addModule(item.hook)
   modules.sort(proc(a, b: (string, string)): int = cmp(a[0], b[0]))
 
   var manifest = nifbuilder.open(
@@ -2990,7 +3014,7 @@ proc writeNimExportManifest(g: BModuleList; config: ConfigRef) =
   nifbuilder.addHeader(manifest, "nim", "nim-native-dynlib")
   nifbuilder.withTree(manifest, "abi"):
     nifbuilder.withTree(manifest, "format"):
-      nifbuilder.addIntLit(manifest, 2)
+      nifbuilder.addIntLit(manifest, 3)
     nifbuilder.withTree(manifest, "compiler"):
       nifbuilder.addStrLit(manifest, VersionAsString)
     nifbuilder.withTree(manifest, "target"):
@@ -3007,6 +3031,19 @@ proc writeNimExportManifest(g: BModuleList; config: ConfigRef) =
         nifbuilder.withTree(manifest, "module"):
           nifbuilder.addStrLit(manifest, module[0])
           nifbuilder.addStrLit(manifest, module[1])
+    nifbuilder.withTree(manifest, "hooks"):
+      for item in uniqueHooks:
+        nifbuilder.withTree(manifest, "hook"):
+          nifbuilder.addStrLit(manifest, icNifTypeName(item.typ, config))
+          nifbuilder.addStrLit(manifest, AttachedOpToStr[item.op])
+          nifbuilder.addStrLit(manifest, globalName(item.hook, config))
+          if sfError in item.hook.flags:
+            nifbuilder.addIdent(manifest, "forbidden")
+            nifbuilder.addEmpty(manifest)
+          else:
+            nifbuilder.addIdent(manifest, "custom")
+            nifbuilder.addStrLit(manifest,
+              stripCnifMarks(item.hook.loc.snippet))
     nifbuilder.withTree(manifest, "procs"):
       for prc in procs:
         nifbuilder.withTree(manifest, "proc"):

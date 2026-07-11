@@ -29,3 +29,10 @@ fi
   "$script_dir/generated/producer_abi.nim"
 
 "$nim" c -r --mm:orc -d:useMalloc --out:"$script_dir/consumer" consumer.nim
+
+if "$nim" c --hints:off --warnings:off --mm:orc -d:useMalloc \
+    --out:"$script_dir/consumer_copy_should_fail" \
+    consumer_copy_should_fail.nim >/dev/null 2>&1; then
+  echo "copying a generated move-only binding unexpectedly compiled" >&2
+  exit 1
+fi

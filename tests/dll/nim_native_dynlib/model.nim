@@ -18,6 +18,7 @@ type
   NativeParam* = object
     name*: string
     typeSymbol*: string
+    byVar*: bool
 
   NativeProc* = object
     name*: string
@@ -25,6 +26,16 @@ type
     cSymbol*: string
     returnTypeSymbol*: string
     params*: seq[NativeParam]
+
+  NativeHookStatus* = enum
+    nhCustom
+    nhForbidden
+
+  NativeHook* = object
+    typeSymbol*: string
+    kind*: string
+    status*: NativeHookStatus
+    procInfo*: NativeProc
 
   NativeModule* = object
     identity*: string
@@ -39,4 +50,5 @@ type
     allocator*: string
     modules*: seq[NativeModule]
     types*: seq[NativeType]
+    hooks*: seq[NativeHook]
     procs*: seq[NativeProc]

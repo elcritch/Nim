@@ -27,9 +27,14 @@ proc tag[T](box: Box[T]): int {.exportabi.} =
   else:
     box.value.len
 
+proc consumeImportedHook(value: CustomHooked) {.exportabi.} =
+  discard value
+
 discard tag(Box[int](value: 3))
 discard tag(Box[string](value: "nim"))
 doAssert exportedFromSupport(1) == 2
+consumeImportedHook(CustomHooked(value: 1))
+discard makeMoveOnly(2)
 
 let manifestPath = querySetting(nimcacheDir) / "texportnim.abi.nif"
 doAssert fileExists(manifestPath)
@@ -42,13 +47,16 @@ doAssert hasSemanticBif
 let manifest = readFile(manifestPath)
 doAssert manifest.startsWith("(.nif27)")
 doAssert manifest.contains("(.dialect \"nim-native-dynlib\")")
-doAssert manifest.contains("(format 2)")
+doAssert manifest.contains("(format 3)")
 doAssert manifest.contains("(library \"")
 doAssert manifest.contains("(modules\n  (module \"")
 doAssert manifest.contains("\" \"texportnim\")")
 doAssert manifest.contains("\" \"mexportabi_support\")")
 doAssert manifest.count("(module \"") == 2
-doAssert manifest.count("(proc \"") == 5
+doAssert manifest.count("(hook \"") == 3
+doAssert manifest.count(" custom \"") == 2
+doAssert manifest.count(" forbidden .)") == 1
+doAssert manifest.count("(proc \"") == 7
 doAssert manifest.count(" true)") == 2
-doAssert manifest.count(" false)") == 3
+doAssert manifest.count(" false)") == 5
 echo "ok"

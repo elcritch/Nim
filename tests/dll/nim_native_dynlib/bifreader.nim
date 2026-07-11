@@ -12,6 +12,13 @@ type
     signatureFingerprint: string
     genericInstance: bool
 
+  AbiHookEntry = object
+    typeSymbol: string
+    kind: string
+    nifSymbol: string
+    cSymbol: string
+    status: NativeHookStatus
+
   AbiManifest = object
     formatVersion: int64
     libraryName: string
@@ -21,6 +28,7 @@ type
     memoryManager: string
     allocator: string
     modules: seq[NativeModule]
+    hooks: seq[AbiHookEntry]
     procs: seq[AbiProcEntry]
 
 proc fail(message: string) {.noinline, noreturn.} =
@@ -77,6 +85,49 @@ proc parseAbiProcs(node: Cursor): seq[AbiProcEntry] =
       fail("native ABI manifest procs contains an invalid entry")
     children.skip
 
+proc parseAbiHook(node: Cursor): AbiHookEntry =
+  var values: seq[string] = @[]
+  var hasStatus = false
+  var children = node.childCursor()
+  while children.hasMore:
+    case children.kind
+    of StrLit:
+      values.add children.strVal
+    of Ident:
+      if hasStatus:
+        fail("native ABI manifest hook has duplicate status")
+      case children.strVal
+      of "custom": result.status = nhCustom
+      of "forbidden": result.status = nhForbidden
+      else: fail("native ABI manifest hook has invalid status")
+      hasStatus = true
+    of DotToken:
+      discard
+    else:
+      fail("native ABI manifest hook has an invalid field")
+    children.skip
+
+  if not hasStatus or values.len notin {3, 4}:
+    fail("native ABI manifest hook has an invalid shape")
+  result.typeSymbol = values[0]
+  result.kind = values[1]
+  result.nifSymbol = values[2]
+  if result.status == nhCustom:
+    if values.len != 4:
+      fail("custom native ABI hook has no linker symbol")
+    result.cSymbol = values[3]
+  elif values.len != 3:
+    fail("forbidden native ABI hook has a linker symbol")
+
+proc parseAbiHooks(node: Cursor): seq[AbiHookEntry] =
+  var children = node.childCursor()
+  while children.hasMore:
+    if children.kind == TagLit and children.tagName == "hook":
+      result.add parseAbiHook(children)
+    elif children.kind != DotToken:
+      fail("native ABI manifest hooks contains an invalid entry")
+    children.skip
+
 proc parseAbiModules(node: Cursor): seq[NativeModule] =
   var children = node.childCursor()
   while children.hasMore:
@@ -119,6 +170,8 @@ proc readAbiManifest(path: string): AbiManifest =
         result.libraryName = readStrings(cursor, "library", 1)[0]
       of "modules":
         result.modules = parseAbiModules(cursor)
+      of "hooks":
+        result.hooks = parseAbiHooks(cursor)
       of "procs":
         result.procs = parseAbiProcs(cursor)
       else:
@@ -126,7 +179,7 @@ proc readAbiManifest(path: string): AbiManifest =
     cursor.skip
   cursor.endRead()
 
-  if result.formatVersion != 2:
+  if result.formatVersion != 3:
     fail("unsupported native ABI manifest format")
   if result.compilerVersion.len == 0 or result.targetOS.len == 0 or
       result.targetCPU.len == 0 or result.memoryManager.len == 0 or
@@ -162,6 +215,13 @@ proc firstDirectSymbol(node: Cursor): string =
   while children.hasMore:
     if children.kind == Symbol:
       return children.symName
+    children.skip
+
+proc lastDirectSymbol(node: Cursor): string =
+  var children = node.childCursor()
+  while children.hasMore:
+    if children.kind == Symbol:
+      result = children.symName
     children.skip
 
 proc firstSymbolDef(node: Cursor): string =
@@ -266,7 +326,16 @@ proc parseParam(declaration: Cursor): NativeParam =
   let metadata = findDirectTag(declaration, "param")
   if metadata.cursorIsNil:
     fail("missing parameter metadata for " & result.name)
-  result.typeSymbol = firstDirectSymbol(declaration)
+  let typeDesc = findDirectTag(declaration, "td")
+  if not typeDesc.cursorIsNil:
+    let typeId = firstSymbolDef(typeDesc)
+    if typeId.startsWith("`t23."):
+      result.byVar = true
+      result.typeSymbol = lastDirectSymbol(typeDesc)
+    else:
+      fail("native ABI does not support parameter type: " & typeId)
+  else:
+    result.typeSymbol = firstDirectSymbol(declaration)
   if result.typeSymbol.len == 0:
     fail("native ABI only supports value parameters: " & result.name)
 
@@ -330,6 +399,17 @@ proc readNativeApi*(bifPath, manifestPath: string): NativeApi =
       fail("semantic declaration not found for " & nifSymbol)
     result.procs.add parseNativeProc(
       declaration, nifSymbol, item.cSymbol)
+
+  for item in manifest.hooks:
+    let declaration = findDeclaration(module, item.nifSymbol)
+    if declaration.cursorIsNil:
+      fail("semantic hook declaration not found for " & item.nifSymbol)
+    result.hooks.add NativeHook(
+      typeSymbol: item.typeSymbol,
+      kind: item.kind,
+      status: item.status,
+      procInfo: parseNativeProc(
+        declaration, item.nifSymbol, item.cSymbol))
 
 proc scanModuleSource(cursor: var Cursor; source: var string) =
   while cursor.hasMore:

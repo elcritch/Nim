@@ -26,14 +26,20 @@ then performs ordinary public field reads and writes in the consumer. Producer
 and consumer are deliberately compiled with the same compiler, ORC, and
 allocator mode.
 
+Custom attached ownership hooks reachable from exported signatures are emitted
+as native ABI exports and recreated as forwarding hooks in the generated
+binding. Compiler-generated structural hooks remain local and are lifted again
+by the consumer compiler. The fixture verifies custom `=copy` and `=destroy`
+calls against producer-side counters.
+
 The consumer prints the native library initialization and calls the exported
 `message` proc. Edit the string returned by `message` in `producer.nim`, run
 `build_producer.sh` followed by `build_consumer.sh`, and check that the consumer
 prints the updated value. This gives a visible sanity check that the generated
 binding called into the rebuilt dynamic library.
 
-Custom ownership hooks, inheritance, variants, open generics, exceptions, and
-runtime ABI mismatch rejection are not supported yet.
+Inheritance, variants, open generics, exceptions, and runtime ABI mismatch
+rejection are not supported yet.
 
 Build a compiler from this branch and run:
 

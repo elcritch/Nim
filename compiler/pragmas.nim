@@ -12,11 +12,11 @@
 import
   condsyms, ast, astalgo, idents, semdata, msgs, renderer,
   wordrecg, ropes, options, extccomp, magicsys, trees,
-  types, lookups, lineinfos, pathutils, linter, modulepaths
+  types, lookups, lineinfos, pathutils, linter, modulepaths, modulegraphs
 
 from sigmatch import trySuggestPragmas
 
-import std/[os, math, strutils]
+import std/[intsets, os, math, strutils]
 
 when defined(nimPreviewSlimSystem):
   import std/assertions
@@ -173,6 +173,43 @@ proc makeExternImport(c: PContext; s: PSym, extname: string, info: TLineInfo) =
 
 proc markExternExport(s: PSym) =
   s.incl(sfExportc)
+
+proc markNimAbiExport(s: PSym) =
+  markExternExport(s)
+  incl(s, {sfExportNim, sfUsed})
+  incl(s, lfExportLib)
+
+proc markCustomAbiHooks(c: PContext; root: PType) =
+  var seen = initIntSet()
+
+  proc visitType(typ: PType)
+
+  proc visitMembers(n: PNode) =
+    if n == nil:
+      return
+    if n.kind == nkSym and n.sym.kind in {skField, skParam, skResult}:
+      visitType(n.sym.typ)
+    else:
+      for child in n:
+        visitMembers(child)
+
+  proc visitType(typ: PType) =
+    if typ == nil or seen.containsOrIncl(typ.id):
+      return
+
+    for op in low(TTypeAttachedOp)..high(TTypeAttachedOp):
+      let hook = getAttachedOp(c.graph, typ, op)
+      if hook != nil and sfOverridden in hook.flags and
+          not hook.typ.containsGenericType:
+        c.graph.abiHooks.add (typ, op, hook)
+        if sfError notin hook.flags:
+          markNimAbiExport(hook)
+
+    visitMembers(typ.n)
+    for child in typ.sons:
+      visitType(child)
+
+  visitType(root)
 
 proc makeExternExport(c: PContext; s: PSym, extname: string, info: TLineInfo) =
   setExternName(c, s, extname, info)
@@ -928,9 +965,8 @@ proc singlePragma(c: PContext, sym: PSym, n: PNode, i: var int,
           if sfImportc in sym.flags:
             localError(c.config, it.info,
               "{.exportabi.} and {.importc.} pragmas are incompatible")
-          markExternExport(sym)
-          incl(sym, {sfExportNim, sfUsed})
-          incl(sym, lfExportLib)
+          markNimAbiExport(sym)
+          markCustomAbiHooks(c, sym.typ)
       of wImportc:
         let name = getOptionalStr(c, it, "$1")
         cppDefine(c.config, name)

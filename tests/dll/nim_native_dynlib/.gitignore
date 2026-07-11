@@ -1,5 +1,6 @@
 /analysis
 /consumer
+/consumer_copy_should_fail
 /generated/
 /generator
 /libproducer.dylib

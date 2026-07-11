@@ -10,6 +10,31 @@ type
     size*: Vec2
     child*: Child
 
+  Hooked* = object
+    value*: int
+
+  MoveOnly* = object
+    value*: int
+
+var
+  hookedCopies = 0
+  hookedDestroys = 0
+  moveOnlyDestroys = 0
+
+proc `=destroy`(hooked: Hooked) =
+  if hooked.value != 0:
+    inc hookedDestroys
+
+proc `=copy`(dest: var Hooked; source: Hooked) =
+  inc hookedCopies
+  dest.value = source.value
+
+proc `=destroy`(moveOnly: MoveOnly) =
+  if moveOnly.value != 0:
+    inc moveOnlyDestroys
+
+proc `=copy`(dest: var MoveOnly; source: MoveOnly) {.error.}
+
 proc newRenderer*(name: string): Renderer {.exportabi.} =
   Renderer(
     name: name,
@@ -25,3 +50,15 @@ proc describe*(renderer: Renderer): string {.exportabi.} =
 
 proc message*(): string {.exportabi.} =
   "hello from the producer dynlib"
+
+proc newHooked*(value: int): Hooked {.exportabi.} =
+  Hooked(value: value)
+
+proc hookedCopyCount*(): int {.exportabi.} =
+  hookedCopies
+
+proc hookedDestroyCount*(): int {.exportabi.} =
+  hookedDestroys
+
+proc newMoveOnly*(value: int): MoveOnly {.exportabi.} =
+  MoveOnly(value: value)
