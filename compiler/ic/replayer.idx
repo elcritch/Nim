@@ -1,0 +1,3 @@
+nimTitle	replayer	ic/replayer.html	module ic/replayer		0
+nim	replayStateChanges	ic/replayer.html#replayStateChanges,PSym,ModuleGraph,PNode	proc replayStateChanges(module: PSym; g: ModuleGraph; list: PNode)		22
+nim	replayBackendActions	ic/replayer.html#replayBackendActions,ModuleGraph,PSym,PNode	proc replayBackendActions(g: ModuleGraph; module: PSym; list: PNode)		94
