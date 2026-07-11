@@ -22,3 +22,6 @@ proc translate*(renderer: Renderer; delta: Vec2) {.exportabi.} =
 
 proc describe*(renderer: Renderer): string {.exportabi.} =
   renderer.name & ":" & renderer.child.label
+
+proc message*(): string {.exportabi.} =
+  "hello from the producer dynlib"

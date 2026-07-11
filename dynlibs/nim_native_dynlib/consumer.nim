@@ -1,5 +1,7 @@
 import generated/producer_abi
 
+echo "Producer says: ", message()
+
 let renderer = newRenderer("main")
 doAssert renderer.name == "main"
 doAssert renderer.size.x == 1

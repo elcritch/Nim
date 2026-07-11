@@ -26,6 +26,12 @@ then performs ordinary public field reads and writes in the consumer. Producer
 and consumer are deliberately compiled with the same compiler, ORC, and
 allocator mode.
 
+The consumer prints the native library initialization and calls the exported
+`message` proc. Edit the string returned by `message` in `producer.nim`, run
+`build_producer.sh` followed by `build_consumer.sh`, and check that the consumer
+prints the updated value. This gives a visible sanity check that the generated
+binding called into the rebuilt dynamic library.
+
 Custom ownership hooks, inheritance, variants, open generics, exceptions, and
 runtime ABI mismatch rejection are not supported yet.
 
@@ -34,6 +40,17 @@ Build a compiler from this branch and run:
 ```sh
 NIM_NATIVE_DYNLIB_COMPILER=/path/to/nim ./build_e2e.sh
 ```
+
+To rebuild each side separately, run:
+
+```sh
+NIM_NATIVE_DYNLIB_COMPILER=/path/to/nim ./build_producer.sh
+NIM_NATIVE_DYNLIB_COMPILER=/path/to/nim ./build_consumer.sh
+```
+
+`build_producer.sh` produces the shared library and ABI artifacts.
+`build_consumer.sh` regenerates the Nim bindings, then builds and runs the
+consumer against the existing producer library.
 
 The shared library and its stable semantic BIF are produced together by an
 ordinary `nim c --experimental:abi --emitBif:on --app:lib` build. This reuses

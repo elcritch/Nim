@@ -102,8 +102,10 @@ proc generateNativeModule*(api: NativeApi; libraryPath: string): string =
     "dynlib: nativeLibrary.}\n\n"
   result.add "proc initNativeLibrary*() =\n"
   result.add "  if not nativeLibraryInitialized:\n"
+  result.add "    echo \"Initializing native library: \", nativeLibrary\n"
   result.add "    nativeNimMain()\n"
   result.add "    nativeLibraryInitialized = true\n"
+  result.add "    echo \"Native library initialized\"\n"
 
   for i, procInfo in api.procs:
     let returnType = nimType(procInfo.returnTypeSymbol, names)
