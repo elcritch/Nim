@@ -252,6 +252,11 @@ proc mainCommand*(graph: ModuleGraph) =
       # only set if wasn't already set, to allow override via `nim c -b:cpp`
       conf.backend = backend
 
+    if conf.exc == excNative:
+      if conf.backend != backendC or conf.cCompiler notin {ccGcc, ccCLang}:
+        globalError(conf, unknownLineInfo, "--exceptions:native requires the C backend with GCC or Clang")
+      if conf.target.targetOS == osWindows or conf.hcrOn:
+        globalError(conf, unknownLineInfo, "--exceptions:native does not support Windows or hot code reloading")
     defineSymbol(graph.config.symbols, $conf.backend)
     case conf.backend
     of backendC:

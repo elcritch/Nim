@@ -846,3 +846,11 @@ efficient:
   of "license": c.license = UnixToNativePath(k.value)
   else: quit(errorStr(p, "unknown variable: " & k.key))
   ```
+
+Native exceptions for C
+-----------------------
+
+The experimental `--exceptions:native` mode keeps generated code as C and uses
+an outlined callback boundary with a small C++ unwinding runtime. It requires
+GCC or Clang and a compatible C++ runtime. See [Native exceptions with the C
+backend](native_exceptions.html) for setup, semantics, and limitations.

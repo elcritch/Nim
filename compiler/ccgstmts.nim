@@ -556,7 +556,7 @@ proc genIf(p: BProc, n: PNode, d: var TLoc) =
 
 proc genReturnStmt(p: BProc, t: PNode) =
   if nfPreventCg in t.flags: return
-  p.flags.incl beforeRetNeeded
+  if p.nativeRegions.len == 0: p.flags.incl beforeRetNeeded
   genLineDir(p, t)
   if (t.firstSon.kind != nkEmpty): genStmts(p, t.firstSon)
   blockLeaveActions(p,
@@ -572,7 +572,12 @@ proc genReturnStmt(p: BProc, t: PNode) =
         dotField(safePoint, "status"),
         cIntValue(0))):
       p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "popCurrentException"))
-  p.s(cpsStmts).addGoto("BeforeRet_")
+  if p.nativeRegions.len > 0:
+    p.nativeRegions[^1].exits.add(newTree(nkReturnStmt, newNodeI(nkEmpty, t.info)))
+    p.s(cpsStmts).addAssignment("nativeResult_", cIntValue(p.nativeRegions[^1].exits.len))
+    p.s(cpsStmts).addGoto("NativeRet_")
+  else:
+    p.s(cpsStmts).addGoto("BeforeRet_")
 
 proc genGotoForCase(p: BProc; caseStmt: PNode) =
   for child in sonsFrom(caseStmt, 1):
@@ -804,6 +809,12 @@ proc genBreakStmt(p: BProc, t: PNode) =
     while idx >= 0 and not p.blocks[idx].isLoop: dec idx
     if idx < 0 or not p.blocks[idx].isLoop:
       internalError(p.config, t.info, "no loop to break")
+  if p.nativeRegions.len > 0 and idx < p.nativeRegions[^1].blockDepth:
+    blockLeaveActions(p, p.nestedTryStmts.len, p.inExceptBlockLen)
+    p.nativeRegions[^1].exits.add(t)
+    p.s(cpsStmts).addAssignment("nativeResult_", cIntValue(p.nativeRegions[^1].exits.len))
+    p.s(cpsStmts).addGoto("NativeRet_")
+    return
   p.blocks[idx].label = "LA" & p.blocks[idx].id.rope
   blockLeaveActions(p,
     p.nestedTryStmts.len - p.blocks[idx].nestedTryStmts,
@@ -1496,7 +1507,18 @@ proc genTryGoto(p: BProc; t: PNode; d: var TLoc) =
   raiseExit(p)
   if hasExcept: inc p.withinTryWithExcept
 
-proc genTrySetjmp(p: BProc, t: PNode, d: var TLoc) =
+include ccgnativeexc
+
+proc genTryC(p: BProc, t: PNode, d: var TLoc) =
+  if p.config.exc == excNative and t.len > 2 and
+      t.secondSon.kind == nkExceptBranch and t.lastSon.kind == nkFinally:
+    # Catch handler failures at a separate boundary before running finally.
+    let inner = copyNode(t)
+    inner.sons = t.sons[0..^2]
+    let outer = copyNode(t)
+    outer.sons = @[inner, t.lastSon]
+    genTryC(p, outer, d)
+    return
   # code to generate:
   #
   # XXX: There should be a standard dispatch algorithm
@@ -1528,20 +1550,41 @@ proc genTrySetjmp(p: BProc, t: PNode, d: var TLoc) =
   if not isEmptyType(t.typ) and d.k == locNone:
     d = getTemp(p, t.typ)
   let quirkyExceptions = p.config.exc == excQuirky or
-      (t.kind == nkHiddenTryStmt and sfSystemModule in p.module.module.flags)
-  if not quirkyExceptions:
+      (p.config.exc != excNative and t.kind == nkHiddenTryStmt and sfSystemModule in p.module.module.flags)
+  let native = p.config.exc == excNative
+  if not quirkyExceptions and not native:
     p.module.includeHeader("<setjmp.h>")
-  else:
+  elif quirkyExceptions:
     p.flags.incl noSafePoints
   genLineDir(p, t)
   cgsym(p.module, "Exception")
   var safePoint: Rope = ""
+  var nativeBody = default(tuple[callback, context: Rope, exits: seq[PNode]])
+  var flow, frame: Rope = ""
   var nonQuirkyIf = default(IfBuilder)
   if not quirkyExceptions:
     safePoint = getTempName(p.module)
-    p.s(cpsLocals).addVar(name = safePoint, typ = cgsymValue(p.module, "TSafePoint"))
-    p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "pushSafePoint"), cAddr(safePoint))
-    if isDefined(p.config, "nimStdSetjmp"):
+    let safePointType = if native: rope"NimNativeSafePoint"
+                        else: cgsymValue(p.module, "TSafePoint")
+    p.s(cpsLocals).addVar(name = safePoint, typ = safePointType)
+    p.nativeLocal(safePoint, safePointType)
+    if native:
+      flow = getTempName(p.module)
+      frame = getTempName(p.module)
+      p.s(cpsLocals).addVar(name = flow, typ = "int")
+      p.nativeLocal(flow, "int")
+      p.s(cpsLocals).addVar(name = frame, typ = "TFrame *")
+      p.nativeLocal(frame, "TFrame *")
+      p.s(cpsStmts).addAssignment(frame, cCall(cgsymValue(p.module, "getFrame")))
+      nativeBody = genNativeBody(p, t.firstSon, d)
+      p.s(cpsStmts).addFieldAssignment(safePoint, "status",
+        cCall(cgsymValue(p.module, "nimNativeTry"), nativeBody.callback,
+          cAddr(nativeBody.context), cAddr(flow)))
+      p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "setFrame"), frame)
+    else:
+      p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "pushSafePoint"), cAddr(safePoint))
+    if native: discard
+    elif isDefined(p.config, "nimStdSetjmp"):
       p.s(cpsStmts).addFieldAssignmentWithValue(safePoint, "status"):
         p.s(cpsStmts).addCall("setjmp", dotField(safePoint, "context"))
     elif isDefined(p.config, "nimSigSetjmp"):
@@ -1577,17 +1620,18 @@ proc genTrySetjmp(p: BProc, t: PNode, d: var TLoc) =
       cOp(Equal, dotField(safePoint, "status"), cIntValue(0))))
   let fin = if t.lastSon.kind == nkFinally: t.lastSon else: nil
   p.nestedTryStmts.add((fin, quirkyExceptions, t.kind == nkHiddenTryStmt, 0.Natural))
-  expr(p, t.firstSon, d)
+  if not native: expr(p, t.firstSon, d)
   var quirkyIf = default(IfBuilder)
   var quirkyScope = default(ScopeBuilder)
   var isScope = false
   if not quirkyExceptions:
-    p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "popSafePoint"))
+    if not native: p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "popSafePoint"))
     finishBranch(p.s(cpsStmts), nonQuirkyIf)
     startBlockWith(p):
       initElseBranch(p.s(cpsStmts), nonQuirkyIf)
-    p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "popSafePoint"))
-    genRestoreFrameAfterException(p)
+    if not native:
+      p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "popSafePoint"))
+      genRestoreFrameAfterException(p)
   elif 1 < t.len and t.secondSon.kind == nkExceptBranch:
     startBlockWith(p):
       quirkyIf = initIfStmt(p.s(cpsStmts))
@@ -1598,6 +1642,25 @@ proc genTrySetjmp(p: BProc, t: PNode, d: var TLoc) =
     startBlockWith(p):
       quirkyScope = initScope(p.s(cpsStmts))
   p.nestedTryStmts[^1].inExcept = true
+  template nativeHandler(body: PNode) =
+    let caught = getTempName(p.module)
+    let excType = ptrType(cgsymValue(p.module, "Exception"))
+    p.s(cpsLocals).addVar(name = caught, typ = excType)
+    p.nativeLocal(caught, excType)
+    p.s(cpsStmts).addAssignment(caught,
+      cCall(cgsymValue(p.module, "nimBorrowCurrentException")))
+    let handler = genNativeBody(p, body, d)
+    p.s(cpsStmts).addFieldAssignment(safePoint, "status",
+      cCall(cgsymValue(p.module, "nimNativeTry"), handler.callback,
+        cAddr(handler.context), cAddr(flow)))
+    p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "setFrame"), frame)
+    p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "nimNativeEndCatch"), caught,
+      cOp(NotEqual, dotField(safePoint, "status"), cIntValue(0)))
+    if handler.exits.len > 0:
+      p.s(cpsStmts).addSingleIfStmt(cOp(NotEqual, flow, cIntValue(0))):
+        p.s(cpsStmts).addAssignment(flow, cOp(Add, NimInt, flow, cIntValue(nativeBody.exits.len)))
+      nativeBody.exits.add handler.exits
+
   var i = 1
   var exceptIf = default(IfBuilder)
   var exceptIfInited = false
@@ -1615,8 +1678,11 @@ proc genTrySetjmp(p: BProc, t: PNode, d: var TLoc) =
           scope = initScope(p.s(cpsStmts))
       if not quirkyExceptions:
         p.s(cpsStmts).addFieldAssignment(safePoint, "status", cIntValue(0))
-      expr(p, exceptBranch.firstSon, d)
-      p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "popCurrentException"))
+      if native:
+        nativeHandler(exceptBranch.firstSon)
+      else:
+        expr(p, exceptBranch.firstSon, d)
+        p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "popCurrentException"))
       endBlockWith(p):
         if exceptIfInited:
           finishBranch(p.s(cpsStmts), exceptIf)
@@ -1656,8 +1722,11 @@ proc genTrySetjmp(p: BProc, t: PNode, d: var TLoc) =
         initElifBranch(p.s(cpsStmts), exceptIf, orExpr)
       if not quirkyExceptions:
         p.s(cpsStmts).addFieldAssignment(safePoint, "status", cIntValue(0))
-      expr(p, exceptBranch.lastSon, d)
-      p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "popCurrentException"))
+      if native:
+        nativeHandler(exceptBranch.lastSon)
+      else:
+        expr(p, exceptBranch.lastSon, d)
+        p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "popCurrentException"))
       endBlockWith(p):
         finishBranch(p.s(cpsStmts), exceptIf)
     inc(i)
@@ -1679,7 +1748,37 @@ proc genTrySetjmp(p: BProc, t: PNode, d: var TLoc) =
     p.finallySafePoints.add(safePoint)
     var finallyScope: ScopeBuilder
     startSimpleBlock(p, finallyScope)
-    genStmts(p, finallyBranch.firstSon)
+    if native:
+      let finalFlow = getTempName(p.module)
+      let finalStatus = getTempName(p.module)
+      let pending = getTempName(p.module)
+      let excType = ptrType(cgsymValue(p.module, "Exception"))
+      p.s(cpsLocals).addVar(name = finalFlow, typ = "int")
+      p.s(cpsLocals).addVar(name = finalStatus, typ = "int")
+      p.s(cpsLocals).addVar(name = pending, typ = excType)
+      p.nativeLocal(finalFlow, "int")
+      p.nativeLocal(finalStatus, "int")
+      p.nativeLocal(pending, excType)
+      p.s(cpsStmts).addAssignment(pending, cCall(cgsymValue(p.module, "nimBorrowCurrentException")))
+      let finalBody = genNativeBody(p, finallyBranch.firstSon, d)
+      p.s(cpsStmts).addAssignment(finalStatus,
+        cCall(cgsymValue(p.module, "nimNativeTry"), finalBody.callback,
+          cAddr(finalBody.context), cAddr(finalFlow)))
+      p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "setFrame"), frame)
+      p.s(cpsStmts).addSingleIfStmt(cOp(NotEqual, finalStatus, cIntValue(0))):
+        p.s(cpsStmts).addSingleIfStmt(cOp(NotEqual, dotField(safePoint, "status"), cIntValue(0))):
+          p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "nimNativeEndCatch"), pending, cIntValue(1))
+        p.s(cpsStmts).addFieldAssignment(safePoint, "status", finalStatus)
+      if finalBody.exits.len > 0:
+        p.s(cpsStmts).addSingleIfStmt(cOp(NotEqual, finalFlow, cIntValue(0))):
+          p.s(cpsStmts).addSingleIfStmt(cOp(NotEqual, dotField(safePoint, "status"), cIntValue(0))):
+            p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "popCurrentException"))
+          p.s(cpsStmts).addFieldAssignment(safePoint, "status", cIntValue(0))
+          p.s(cpsStmts).addAssignment(flow,
+            cOp(Add, NimInt, finalFlow, cIntValue(nativeBody.exits.len)))
+        nativeBody.exits.add finalBody.exits
+    else:
+      genStmts(p, finallyBranch.firstSon)
     # pretend we handled the exception in a 'finally' so that we don't
     # re-raise the unhandled one but instead keep the old one (it was
     # not popped either):
@@ -1697,6 +1796,11 @@ proc genTrySetjmp(p: BProc, t: PNode, d: var TLoc) =
         dotField(safePoint, "status"),
         cIntValue(0))):
       p.s(cpsStmts).addCallStmt(cgsymValue(p.module, "reraiseException"))
+
+  if native:
+    for i, exit in nativeBody.exits:
+      p.s(cpsStmts).addSingleIfStmt(cOp(Equal, flow, cIntValue(i + 1))):
+        genStmts(p, exit)
 
 proc genAsmOrEmitStmt(p: BProc, t: PNode, isAsmStmt=false; result: var Rope) =
   var res = ""

@@ -10,6 +10,9 @@
 {.push profiler: off.}
 
 const
+  nativeExceptions =
+    when defined(nimHasNativeExceptions): compileOption("exceptions", "native")
+    else: false
   gotoBasedExceptions = compileOption("exceptions", "goto")
   quirkyExceptions = compileOption("exceptions", "quirky")
 

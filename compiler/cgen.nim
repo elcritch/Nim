@@ -837,6 +837,10 @@ proc initLocalVar(p: BProc, v: PSym, immediateAsgn: bool) =
       backendEnsureMutable v
       constructLoc(p, v.locImpl)
 
+template nativeLocal(p: BProc; name, typ: Rope) =
+  if p.config.exc == excNative:
+    p.blocks[^1].nativeLocals.add((name, typ))
+
 proc getTemp(p: BProc, t: PType, needsInit=false): TLoc =
   inc(p.labels)
   result = TLoc(snippet: "T" & rope(p.labels) & "_", k: locTemp, lode: lodeTyp t,
@@ -849,6 +853,7 @@ proc getTemp(p: BProc, t: PType, needsInit=false): TLoc =
     p.s(cpsLocals).addVar(kind = Local,
       name = result.snippet,
       typ = getTypeDesc(p.module, t, dkVar))
+  p.nativeLocal(result.snippet, getTypeDesc(p.module, t, dkVar))
   constructLoc(p, result, not needsInit)
   when false:
     # XXX Introduce a compiler switch in order to detect these easily.
@@ -874,6 +879,7 @@ proc getIntTemp(p: BProc): TLoc =
                 storage: OnStack, lode: lodeTyp getSysType(p.module.g.graph, unknownLineInfo, tyInt),
                 flags: {})
   p.s(cpsLocals).addVar(kind = Local, name = result.snippet, typ = NimInt)
+  p.nativeLocal(result.snippet, NimInt)
 
 proc localVarDecl(res: var Builder, p: BProc; n: PNode,
                   initializer: Snippet = "",
@@ -895,6 +901,7 @@ proc localVarDecl(res: var Builder, p: BProc; n: PNode,
     # at batch size 4.
     p.sigConflicts.inc(s.name.s.mangle)
 
+  p.nativeLocal(s.loc.snippet, getTypeDesc(p.module, s.typ, dkVar))
   genCLineDir(res, p, n.info, p.config)
 
   res.addVar(p.module, s,
@@ -1050,6 +1057,21 @@ proc callGlobalVarCppCtor(p: BProc; v: PSym; vn: PNode; value: PNode; didGenTemp
 proc assignParam(p: BProc, s: PSym, retType: PType) =
   assert(s.loc.snippet != "")
   scopeMangledParam(p, s)
+  if p.config.exc == excNative:
+    var typ = getTypeDesc(p.module, s.typ, dkParam)
+    if lfIndirect in s.loc.flags: typ = ptrType(typ)
+    let t = s.typ.skipTypes(abstractVarRange)
+    if t.kind in {tyArray, tyUncheckedArray}:
+      typ = ptrType(getTypeDesc(p.module, t.elemType, dkVar))
+    elif t.kind == tySet and mapSetType(p.config, t) == ctArray:
+      typ = ptrType(NimUint8)
+    p.nativeLocal(s.loc.snippet, typ)
+    var arr = t
+    var index = 0
+    while arr.kind in {tyOpenArray, tyVarargs}:
+      p.nativeLocal(s.loc.snippet & "Len_" & $index, NimInt)
+      inc index
+      arr = arr.elementType.skipTypes({tySink})
 
 proc fillProcLoc(m: BModule; n: PNode) =
   let sym = n.sym
@@ -1107,6 +1129,9 @@ when defined(icCanRaiseLog):
     stderr.writeLine "CANRAISE " & s.name.s & "." & $s.disamb & "." &
       (if m == nil: "?" else: m.name.s) & "|" & $verdict & "|" & $s.magic &
       "|b" & $canRaiseBranch
+
+proc initFrame(p: BProc, procname, filename: Rope): Rope
+proc deinitFrame(p: BProc): Snippet
 
 include ccgcalls, "ccgstmts.nim"
 

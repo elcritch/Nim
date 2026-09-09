@@ -3792,7 +3792,7 @@ proc expr(p: BProc, n: PNode, d: var TLoc) =
     of excCpp:
       genTryCpp(p, n, d)
     else:
-      genTrySetjmp(p, n, d)
+      genTryC(p, n, d)
   of nkRaiseStmt: genRaiseStmt(p, n)
   of nkTypeSection:
     # we have to emit the type information for object types here to support

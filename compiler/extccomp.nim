@@ -591,6 +591,9 @@ proc getCompileCFileCmd*(conf: ConfigRef; cfile: Cfile,
     # If any C++ file was compiled, we need to use C++ driver for linking as well
     incl conf.globalOptions, optMixedMode
 
+  if conf.exc == excNative:
+    options.add " -fexceptions"
+
   var exe = getConfigVar(conf, c, ".exe")
   if exe.len == 0: exe = getCompilerExe(conf, c, isCpp)
 

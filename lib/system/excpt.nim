@@ -457,9 +457,35 @@ proc reportUnhandledError(e: ref Exception) {.nodestroy, gcsafe.} =
   when hostOS != "any":
     reportUnhandledErrorAux(e)
 
+when nativeExceptions:
+  proc nimNativeEndCatch(caught: ref Exception; propagating: bool) {.compilerRtl.} =
+    # Closure iterators can restore their caller's exception before returning.
+    # In that case the caught exception is already absent from this chain.
+    if currException == caught:
+      if not propagating: popCurrentException()
+    else:
+      # A new exception escaped the handler. Remove the handled exception
+      # from its chain without consuming the new one or an enclosing catch.
+      var e = currException
+      while e != nil and e.up != caught:
+        e = e.up
+      if e != nil:
+        e.up = caught.up
+
+  {.compile("nativeexc.cpp", "-std=c++11 -fexceptions").}
+  proc nimNativeHasHandler(): cint {.importc, header: "nativeexc.h".}
+  proc nimNativeThrow() {.importc, header: "nativeexc.h", noreturn.}
+  proc nimNativeTry(body: pointer, context: pointer, flow: ptr cint): cint
+    {.importc, header: "nativeexc.h", compilerproc.}
+
 when not gotoBasedExceptions:
   proc nimLeaveFinally() {.compilerRtl.} =
-    when defined(cpp) and not defined(noCppExceptions) and not gotoBasedExceptions:
+    when nativeExceptions:
+      if nimNativeHasHandler() == 0:
+        reportUnhandledError(currException)
+        rawQuit(1)
+      nimNativeThrow()
+    elif defined(cpp) and not defined(noCppExceptions) and not gotoBasedExceptions:
       {.emit: "throw;".}
     else:
       if excHandler != nil:
@@ -493,7 +519,14 @@ proc raiseExceptionAux(e: sink(ref Exception)) {.nodestroy.} =
     if not localRaiseHook(e): return
   if globalRaiseHook != nil:
     if not globalRaiseHook(e): return
-  when defined(cpp) and not defined(noCppExceptions) and not gotoBasedExceptions:
+  when nativeExceptions:
+    if nimNativeHasHandler() == 0:
+      reportUnhandledError(e)
+      rawQuit(1)
+    if e != currException:
+      pushCurrentException(e)
+    nimNativeThrow()
+  elif defined(cpp) and not defined(noCppExceptions) and not gotoBasedExceptions:
     if e != currException:
       pushCurrentException(e)
     {.emit: "throw `e`;".}

@@ -983,6 +983,7 @@ proc computeForwardedArgs(c: DepContext): seq[string] =
     result.add "--exceptions:" & (case c.config.exc
                                   of excGoto: "goto"
                                   of excCpp: "cpp"
+                                  of excNative: "native"
                                   of excQuirky: "quirky"
                                   else: "setjmp")
   # method dispatch semantics must match across the child processes:

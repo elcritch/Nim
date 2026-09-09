@@ -248,7 +248,7 @@ const
   errNoneBoehmRefcExpectedButXFound = "'arc', 'orc', 'yrc', 'atomicArc', 'markAndSweep', 'boehm', 'go', 'none', 'regions', or 'refc' expected, but '$1' found"
   errNoneSpeedOrSizeExpectedButXFound = "'none', 'speed' or 'size' expected, but '$1' found"
   errGuiConsoleOrLibExpectedButXFound = "'gui', 'console', 'lib' or 'staticlib' expected, but '$1' found"
-  errInvalidExceptionSystem = "'goto', 'setjmp', 'cpp' or 'quirky' expected, but '$1' found"
+  errInvalidExceptionSystem = "'goto', 'setjmp', 'cpp', 'native' or 'quirky' expected, but '$1' found"
   errInvalidFeatureButXFound = Feature.toSeq.map(proc(val:Feature): string = "'$1'" % $val).join(", ") & " expected, but '$1' found"
   errDefaultOrSsoExpectedButXFound = "'default' or 'sso' expected, but '$1' found"
 
@@ -300,6 +300,7 @@ proc testCompileOptionArg*(conf: ConfigRef; switch, arg: string, info: TLineInfo
     result = isDynlibOverride(conf, arg)
   of "exceptions":
     case arg.normalize
+    of "native": result = conf.exc == excNative
     of "cpp": result = conf.exc == excCpp
     of "setjmp": result = conf.exc == excSetjmp
     of "quirky": result = conf.exc == excQuirky
@@ -1220,6 +1221,7 @@ proc processSwitch*(switch, arg: string, pass: TCmdLinePass, info: TLineInfo;
     docRawOutput(conf)
   of "exceptions":
     case arg.normalize
+    of "native": conf.exc = excNative
     of "cpp": conf.exc = excCpp
     of "setjmp": conf.exc = excSetjmp
     of "quirky": conf.exc = excQuirky

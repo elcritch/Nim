@@ -59,6 +59,7 @@ type
     isLoop*: bool             # whether block is a loop
     nestedTryStmts*: int16    # how many try statements is it nested into
     nestedExceptStmts*: int16 # how many except statements is it nested into
+    nativeLocals*: seq[tuple[name, typ: Rope]]
     frameLen*: int16
 
   TCProcFlag* = enum
@@ -71,6 +72,7 @@ type
     nimErrorFlagDisabled
 
   TCProc = object             # represents C proc that is currently generated
+    nativeRegions*: seq[tuple[blockDepth: int, exits: seq[PNode]]]
     prc*: PSym                # the Nim proc that this C proc belongs to
     flags*: set[TCProcFlag]
     lastLineInfo*: TLineInfo  # to avoid generating excessive 'nimln' statements
