@@ -29,7 +29,8 @@ const
 
   nimEnableCovariance* = defined(nimEnableCovariance)
 
-  icFormatVersion* = "39"
+  icFormatVersion* = "40"
+    ## v40: CacheCounter projects use one semantic compilation session.
     ## Version of the IC cache format (the sem-NIF module layout written by
     ## ast2nif.nim plus the iface/impl/edges side files). Bump it whenever
     ## that layout changes: `commandIc` wipes a nimcache whose `ic.version`
@@ -443,6 +444,7 @@ type
                               # recursion resolves in-memory) and each gets its NIF
                               # written, instead of being loaded from a precompiled
                               # NIF. See `compiler/deps.nim` (SCC grouping).
+    icWholeProject*: bool     # under nim m: compile imports from source in one VM
     icProject*: string        # under `nim m`/`nim nifc`: absolute path of the
                               # ORIGINAL project file. The child's own project file
                               # is the module being compiled, which would make that

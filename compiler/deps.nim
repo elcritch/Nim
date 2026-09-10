@@ -20,6 +20,7 @@ import "../dist/nimony/src/lib" / [bitabs, nifreader, nifbuilder]
 import icmodnames
 import icnifcore
 from ic/replayer import BackendActionsExt
+import ic/counterstate
 
 type
   FilePair = object
@@ -1022,7 +1023,7 @@ proc computeForwardedArgs(c: DepContext): seq[string] =
   const notForwarded = [
     "nimcache", "out", "o", "outdir", "usenimcache", "run", "r",
     "incremental", "ic", "symbolfiles", "genbif",
-    "icproject", "icpreparsedconfig", "icconfigout", "icgroup",
+    "icproject", "icpreparsedconfig", "icconfigout", "icgroup", "icwholeproject",
     "icbackendstage", "icbackendmodule", "ismainmodule",
     "help", "h", "fullhelp", "version", "v", "advanced"]
   for a in commandLineParams():
@@ -1078,7 +1079,10 @@ proc configSignatureFile(c: DepContext; forwardedArgs: seq[string]): string =
   if not fileExists(result) or readFile(result) != content:
     writeFile(result, content)
 
-proc generateFrontendBuildFile(c: DepContext; forwardedArgs: seq[string]): string =
+proc computeLiveBackendNodes(c: DepContext): seq[bool]
+
+proc generateFrontendBuildFile(c: DepContext; forwardedArgs: seq[string];
+                               wholeProject: bool): string =
   ## Frontend build file: the nifler (parse) and `nim m` (sem) rules only. The
   ## driver runs this to a discovery fixpoint; it produces every module's semmed
   ## NIF plus the cookie/edge sidecars that the backend build file then consumes.
@@ -1163,6 +1167,34 @@ proc generateFrontendBuildFile(c: DepContext; forwardedArgs: seq[string]): strin
   # inputs — intra-component edges are produced by this very rule and listing
   # them would reintroduce the cycle nifmake just rejected.
   let argsFile = configSignatureFile(c, forwardedArgs)
+  if wholeProject:
+    # Counter reads observe a program-wide history, not just an import closure.
+    # Compile from the root in one VM; backend rules still consume per-module
+    # artifacts and retain their ordinary incremental reuse.
+    b.addTree "do"
+    b.addIdent "nim_m"
+    b.withTree "args":
+      b.addStrLit "--isMainModule:on"
+      b.addStrLit "--icWholeProject:on"
+    b.withTree "input": b.addStrLit c.nodes[0].files[0].nimFile
+    b.withTree "input": b.addStrLit argsFile
+    b.withTree "input": b.addStrLit counterSessionFile(c.config)
+    for node in c.nodes:
+      for pair in node.files:
+        b.withTree "input": b.addStrLit c.parsedFile(pair)
+    # Use the real import closure: speculative scanner nodes may never be
+    # compiled. A first retry may know only the root; subsequent runs recover
+    # the full closure from the successful frontend's semantic dependency files.
+    let live = computeLiveBackendNodes(c)
+    for i, node in c.nodes:
+      if live[i]:
+        let pair = node.files[0]
+        for path in [c.semmedFile(pair), c.ifaceFile(pair), c.implFile(pair.modname),
+                     c.edgesFile(pair), c.semDepsFile(pair)]:
+          b.withTree "output": b.addStrLit path
+    b.endTree()
+    b.endTree() # stmts
+    return
   let sccs = computeSCCs(c)
   var sccOf = newSeq[int](c.nodes.len)
   for sccId, comp in sccs:
@@ -1862,8 +1894,9 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false) =
     # Phase 1 — frontend (nifler + `nim m`), run to a discovery fixpoint.
     var rounds = 0
     var frontendOk = false
+    var wholeProject = fileExists(counterSessionFile(conf))
     while true:
-      let buildFile = generateFrontendBuildFile(c, forwardedArgs)
+      let buildFile = generateFrontendBuildFile(c, forwardedArgs, wholeProject)
       rawMessage(conf, hintSuccess, "generated: " & buildFile)
       if nifmake.len == 0:
         rawMessage(conf, hintSuccess, "run:" & " nifmake run" & parallel & " " & buildFile)
@@ -1878,9 +1911,30 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false) =
       let cmd = quoteShell(nifmake) & " run" & parallel & " " & quoteShell(buildFile)
       rawMessage(conf, hintExecuting, cmd)
       let exitCode = execShellCmd(cmd)
+      if not wholeProject and fileExists(counterSessionFile(conf)):
+        wholeProject = true
+        # The previous root artifact must not satisfy the replacement rule,
+        # even on a filesystem whose timestamp resolution hides this request.
+        removeFile(c.semmedFile(rootPair))
+        rawMessage(conf, hintExecuting, "CacheCounter: retrying with a shared frontend session")
+        continue
+      if exitCode == 0 and wholeProject:
+        # The shared frontend can compile macro-generated imports immediately;
+        # add them to the graph before emitting their backend rules.
+        if deriveFromSemDeps(c): continue
+        # The first shared run may have started without the root's semantic
+        # dependency list. Publish the complete output set now so the first
+        # warm run has an identical build graph and checks every artifact.
+        discard generateFrontendBuildFile(c, forwardedArgs, wholeProject)
       if exitCode == 0:
         frontendOk = true
         break
+
+      if wholeProject:
+        # Dependencies may have written fresh outputs before the root failed.
+        # nifmake uses the newest output as its freshness proof, so keep this
+        # grouped rule incomplete until the entire session succeeds.
+        removeFile(c.semmedFile(rootPair))
 
       # Re-derive from the post-sem deps of every node compiled so far. Imports
       # the static scanner missed become new nodes; the importer->import edge

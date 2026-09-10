@@ -11,6 +11,7 @@
 ## An instruction is 1-3 int32s in memory, it is a register based VM.
 
 import semmacrosanity
+import ic/counterstate
 import
   std/[strutils, tables, intsets, parseutils],
   msgs, vmdef, vmgen, nimsets, types,
@@ -2279,10 +2280,12 @@ proc rawExecute(c: PCtx, start: int, tos: PStackFrame): TFullReg =
       regs[ra].node = newSymNode(sym)
       regs[ra].node.flags.incl nfIsRef
     of opcNccValue:
+      requireCounterSession(c.config)
       decodeB(rkInt)
       let destKey {.cursor.} = regs[rb].node.strVal
       regs[ra].intVal = getOrDefault(c.graph.cacheCounters, destKey)
     of opcNccInc:
+      requireCounterSession(c.config)
       let g = c.graph
       declBC()
       let destKey {.cursor.} = regs[rb].node.strVal

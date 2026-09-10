@@ -607,8 +607,11 @@ proc getConstExpr(m: PSym, n: PNode; idgen: IdGenerator; g: ModuleGraph): PNode 
         # Under `nim m` (IC) `sfMainModule` is set on every module that is being
         # compiled (so it writes its own NIF), so it cannot answer `isMainModule`;
         # the IC build file marks the real entry point with `--isMainModule:on`.
-        let isMain = if g.config.cmd == cmdM: g.config.isMainModule
-                     else: sfMainModule in m.flags
+        # A shared frontend compiles the real root plus its imports, so the
+        # ordinary per-module flags identify the entry point there.
+        let isMain =
+          if g.config.cmd == cmdM and not g.config.icWholeProject: g.config.isMainModule
+          else: sfMainModule in m.flags
         result = newIntNodeT(toInt128(ord(isMain)), n, idgen, g)
       of mCompileDate: result = newStrNodeT(getDateStr(), n, g)
       of mCompileTime: result = newStrNodeT(getClockStr(), n, g)

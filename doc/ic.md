@@ -101,6 +101,28 @@ backend:
   picks the single artifact allowed to embed each body (smallest claimant), which
   is the cross-process replacement for the old in-process single-writer machinery.
 
+Shared compile-time counters
+============================
+
+``CacheCounter`` reads and increments require a shared compile-time history.
+Separate semantic processes cannot allocate values independently: sibling modules
+would embed duplicate values even if their increments were replayed later in the
+importer. Compiling those processes sequentially alone does not fix this.
+
+On the first counter operation, an IC frontend requests a shared session and
+stops before evaluating the operation. The driver retries semantic checking from
+the real project root, compiling all imports from source in one process. This
+preserves normal counter order and generic-instance reuse. Only the real root
+sees ``isMainModule`` as true, and macro-generated imports join the backend graph
+through the ordinary semantic dependency records.
+
+The cache records this mode in ``ic.counter-session``. Subsequent no-change builds
+reuse the semantic artifacts; changing a source input reruns the whole frontend.
+Parsing and the backend retain their incremental rules. This is a conservative
+correctness fallback until IC can record global counter dependencies and reuse
+individual semantic modules safely. The mode persists until the cache is cleared;
+merely importing ``std/macrocache`` does not activate it.
+
 The driver: graph construction (`commandIc`)
 ============================================
 
