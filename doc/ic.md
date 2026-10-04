@@ -35,8 +35,8 @@ and schedules its rules on Sigils actors:
 1. **Frontend** — per module:
    - ``nifler parse --deps`` turns ``.nim`` source into a parsed NIF
      (``.p.nif``) plus a static dependency list (``.deps.nif``).
-   - ``nim m`` (the *semantic* step, `cmdM`) reads the parsed NIF + the
-     precompiled NIFs of the module's imports, type-checks, and writes the
+   - ``nim m`` (the *semantic* step, `cmdM`) parses the module's source and
+     loads the precompiled NIFs of its imports, type-checks, and writes the
      **semmed NIF** (``.nif``) plus invalidation sidecars (see *Cookies*).
 2. **Backend** — ``nim nifc`` (`cmdNifC`, ``compiler/nifbackend.nim``) reads the
    semmed NIFs, generates C, compiles and links.
@@ -65,13 +65,30 @@ coordinator. Completed actors are released immediately. A module's later stages
 can run on another worker, so the dependency cache belongs to the OS worker,
 not the module actor.
 
-The preliminary ``nifler deps`` scans and graph traversal still run serially
-in the driver. These extract imports before the pool's full parsing and semantic
-jobs can be scheduled. The scans launch directly through ``startProcess``,
-allowing POSIX spawn without an intermediate shell, including between rounds
-when the compiler retains large caches. Newly discovered imports enter the next
-round; graph expansion does not yet insert jobs into a running round. Semantic
-work inside one module also remains sequential.
+Dependency scanning uses a growing queue of per-file actors in the same pool.
+Each runs ``nifler parse --deps`` once, retaining both the parsed ``.p.nif`` and
+its dependency list. The coordinator reads each completed list and immediately
+queues new files, including includes; it does not wait for a whole scan wave.
+Shared files are deduplicated. Parsing still runs in external ``nifler``
+processes, launched directly with ``startProcess``; compiler semantic/backend
+jobs run inside the worker threads. The process fallback scans files serially
+but also retains their parsed output.
+
+The coordinator caches ordered dependency entries separately for main-module
+and imported-module include contexts, then applies them in source traversal
+order. Module IDs, conditional edges and cycle representatives therefore do
+not depend on worker completion order. Fresh parse outputs let the later
+frontend parse rules skip this work. Semantic discoveries still enter the next
+semantic round; this change removes scan barriers, not those rounds or the
+sequential semantic work inside a module.
+
+The native semantic pipeline still parses ``.nim`` source into its own AST;
+it does not decode the untyped ``.p.nif``. Those files currently gate semantic
+rebuilds, including edits to includes and non-representative cycle members.
+Retaining them removes the second ``nifler`` invocation, but does not yet
+remove parsing inside ``nim m``. ``icBNodeProf`` separates ``ParseSourceus``
+and ``ParseIncludeus`` from the rest of semantic work, preserving timings for
+small files that take less than a millisecond to parse.
 
 A successful job that stops to discover an import has no module output yet.
 Its dependents wait for the next discovery round while independent branches
@@ -92,9 +109,13 @@ Symbol/type cycles and VM/codegen backreferences are explicitly released at
 job completion. Each worker retains a bounded cache of dependency BIF mappings,
 name tables, lazy name lookup indexes and declaration indexes. Runtime helper
 lookup also retains an index by basename, including overloads and misses,
-instead of scanning every declaration for each lookup. Later jobs on
-that worker reuse this data while constructing fresh ASTs, symbol/type IDs,
-VMs and module graphs. Cached buffers never cross OS threads.
+instead of scanning every declaration for each lookup. The image also remembers
+which declarations contain no local symbol definitions, avoiding repeat walks
+through their deferred bodies. Definitions with locals still use the original
+pre-scan to construct symbols in order; no decoded AST or symbol is retained.
+``-d:icLocalScanCheck`` builds a compiler that rechecks each skipped scan.
+Later jobs on that worker reuse this data while constructing fresh ASTs,
+symbol/type IDs, VMs and module graphs. Cached buffers never cross OS threads.
 
 The cache checks file identity, size and timestamps before every reuse, so an
 atomic replacement invalidates it even if its size and modification time are
@@ -159,7 +180,9 @@ time (``queueNs``) and execution time;
 ``ICCOMPILE`` separates setup, compiler work and cleanup by stage; ``ICBUILD``
 reports the actual pool size, executed/skipped/deferred/blocked counts and
 aggregate busy time. Times are in nanoseconds, with job starts relative to that
-build round. Request delivery starts when the coordinator creates the actor;
+build round. ``ICSCANJOB`` and ``ICSCAN`` report the corresponding per-file
+parse jobs and growing scan queue, including cached/skipped files, peak active
+workers, aggregate busy time and elapsed time. Request delivery starts when the coordinator creates the actor;
 it excludes time a ready job waits for an available pool slot. This measures
 actor occupancy, not CPU utilization: the ``link``
 actor also drives C compiler subprocesses in parallel through
@@ -265,6 +288,38 @@ still matched. Every resulting executable passed ``--help``. After one warm rebu
 actor no-op took 0.45 seconds without changing primary artifact timestamps.
 The process runner still redid some frontend/backend work on unchanged sources
 and took about 9.1 seconds, so that is not a pure no-op comparison.
+
+The growing per-file scan queue parsed Kosmo's initial 1,023 files in 0.25
+seconds with 16 workers (2.65 combined worker-seconds, about 10.6 active workers
+on average). Time to the first semantic build dropped from 2.40 to 0.60 seconds.
+Two complete clean builds averaged 136.81 seconds versus 136.71 for the earlier
+direct-launch scanner: the faster scan did not produce a reliable overall gain
+in those trials. All 1,188 generated C files matched the earlier actors and the
+process runner.
+
+An isolated frontend profile then separated native source parsing from semantic
+work. Across 969 jobs, source and include parsing took only 0.79 combined
+worker-seconds, versus about 195 in the frontend stage as a whole. Dependency
+header reconstruction accounted for about 42 worker-seconds. Remembering which
+declarations contain no local definitions avoided 1.90 million repeat body
+pre-scans and reduced that subphase from 4.17 to 1.26 worker-seconds. The release
+frontend comparison was 59.59 versus 59.46 seconds, within run-to-run variation.
+An experiment deferring generic type offers did not improve time and was not
+retained. These measurements favor reducing semantic/dependency work over
+further splitting the native parser. All 1,004 semantic artifacts matched after
+normalizing paths to the separate benchmark cache directories.
+Two full builds with the declaration cache took 136.57 and 134.65 seconds
+(135.61 mean), versus 136.81 for the preceding scanner version. Frontend means
+were effectively unchanged, 59.63 versus 59.66 seconds, so the full-build
+difference remains within observed variation. Peak RSS was 10.8 GiB. All 1,188
+generated C files matched, both executables passed ``--help``, and the settled
+no-op took 0.45 seconds with unchanged primary artifact timestamps.
+
+For frontend-only measurements, use ``nim track`` without a definition/use
+query, with a fresh ``--nimcache`` and the same project options as the full
+build. ``icBNodeProf`` reports ``LocalScanHit``, ``LocalScanMiss`` and
+``LocalScanms`` for the declaration metadata cache; its timing slots are nested
+and should not be summed as independent phases.
 
 ``koch boot`` fetches pinned Sigils, threading, variant and stack_strings sources
 under ``dist/sigils``. Sigils currently requires full system exports and classic
@@ -530,10 +585,11 @@ and `--mm:refc`.
 Known residual hack
 -------------------
 
-- `deps.runNifler` still uses `setLastModificationTime` to mark its scan
-  up-to-date and deletes a stale parsed file to coordinate with the nifmake nifler
-  rule — the driver duplicating nifmake's freshness logic. It is explicitly
-  flagged in the source and folds away with a full frontend/nifler split.
+- ``ic/scanjobs.nim`` publishes a fresh ``.deps.nif`` marker only after a
+  successful parse. Content-stable parsed output keeps its mtime; the parse's
+  dependency sidecar advances past the source so the build rule skips a second
+  parse after a comment-only edit. This still coordinates freshness through
+  timestamps, but no longer deletes parsed output or parses every source twice.
 
 Status and performance
 ======================
@@ -583,9 +639,8 @@ Settled vs. open:
   make the merge decision deterministic. The precise owner *rule* (minting module
   vs. root-type's module) can still be tuned where it would force a downstream
   package to own stdlib code.
-- **Remaining cleanup.** The `runNifler` `setLastModificationTime` coordination
-  (above) folds away with a full frontend/nifler split; dead `when` imports could
-  also be pruned during the `.s.deps` re-derivation.
+- **Remaining cleanup.** Scan freshness still uses timestamp markers (above);
+  dead `when` imports could also be pruned during the `.s.deps` re-derivation.
 
 Validation bar (held on every change): `koch bootic` must reach its byte-identical
 fixed point, and binary size must not regress (DCE parity), across the

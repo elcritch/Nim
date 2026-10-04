@@ -37,7 +37,7 @@
 ## `-d:icEagerPools` materializes every name during `load`, for an A/B;
 ## the accessors work on an eager pool as they do on any other.
 
-import std / [assertions, hashes, tables, varints, times]
+import std / [assertions, hashes, tables, sets, varints, times]
 from std/strutils import rfind
 from std/os import FileInfo, getFileInfo, absolutePath
 import ic/workercontext
@@ -65,6 +65,10 @@ type
     bySym*: seq[int32]  # symbol id -> last declaration in entries
     byBasename: Table[string, seq[SymId]]
     basenamesReady: bool
+    withoutLocalSyms*: HashSet[int]
+      ## Declaration offsets whose trees contain no local symbol definitions.
+      ## This is a property of the immutable file, retained with its versioned
+      ## image. No decoded symbols, cursors or compiler IDs are cached here.
 
   IndexedBif* = object
     buf*: TokenBuf

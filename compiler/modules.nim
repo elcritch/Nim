@@ -12,7 +12,7 @@
 import
   ast, magicsys, msgs, options,
   idents, lexer, syntaxes, modulegraphs,
-  lineinfos, pathutils
+  lineinfos, pathutils, icprof
 
 import ../dist/checksums/src/checksums/sha1
 import std/strtabs
@@ -42,7 +42,8 @@ proc newModule*(graph: ModuleGraph; fileIdx: FileIndex): PSym =
   graph.registerModule(result)
 
 proc includeModule*(graph: ModuleGraph; s: PSym, fileIdx: FileIndex): PNode =
-  result = syntaxes.parseFile(fileIdx, graph.cache, graph.config)
+  timed(tParseInclude):
+    result = syntaxes.parseFile(fileIdx, graph.cache, graph.config)
   graph.addDep(s, fileIdx)
   graph.addIncludeDep(s.position.FileIndex, fileIdx)
   let path = toFullPath(graph.config, fileIdx)

@@ -12,6 +12,7 @@ var entered: Atomic[int]
 var calls: Atomic[int]
 var workerVisits {.threadvar.}: int
 var reusedWorker: Atomic[int]
+var expandedChild: Atomic[bool]
 let mainThread = getThreadId()
 
 proc execute(args: seq[string]): IcJobResult {.gcsafe.} =
@@ -31,6 +32,14 @@ proc execute(args: seq[string]): IcJobResult {.gcsafe.} =
   of "defer": return # successful discovery stop, no module output yet
   of "ordered": return IcJobResult(output: args[1])
   of "raise": raise newException(ValueError, "worker exception")
+  of "wait-for-child":
+    let deadline = epochTime() + 5
+    while not expandedChild.load() and epochTime() < deadline: sleep(1)
+    doAssert expandedChild.load(), "discovery must not wait for a whole scan wave"
+    return
+  of "discovered-child":
+    expandedChild.store(true)
+    return
   of "environment":
     beginIcWorker()
     try:
@@ -174,6 +183,42 @@ try:
   finally:
     session.close()
   session.close() # idempotent cleanup
+
+  # A fast scan discovers another file while an unrelated scan is still busy.
+  # A wave/barrier scheduler deadlocks here until the worker's assertion fires.
+  let scanner = newIcWorkerPool(workers = 2)
+  try:
+    var expanded, warmExpanded: seq[string]
+    var scanProfile: JsonNode
+    proc expandScan(job: IcJob; outcome: IcJobResult): seq[IcJob] =
+      doAssert outcome.exitCode == 0
+      expanded.add job.arguments[0]
+      if job.arguments[0] == "ordered":
+        result.add IcJob(arguments: @["discovered-child"])
+    doAssert runIcWorkQueue(@[
+      IcJob(arguments: @["wait-for-child"]),
+      IcJob(arguments: @["ordered", "parent"])], execute,
+      expand = expandScan,
+      session = scanner, profile = true,
+      report = proc(s: string) =
+        if s.startsWith("ICSCAN "): scanProfile = parseJson(s[7..^1])) == 0
+    doAssert expanded.len == 3
+    doAssert scanProfile["executed"].getInt == 3
+    doAssert scanProfile["peakActive"].getInt == 2
+
+    # Cached roots must still expand to newly discovered work. Failure of one
+    # scan must be observable and must not discard an independent completion.
+    var failures = 0
+    proc expandCached(job: IcJob; outcome: IcJobResult): seq[IcJob] =
+      warmExpanded.add job.arguments[0]
+      if outcome.exitCode != 0: inc failures
+      if job.arguments[0] == "cached":
+        result = @[IcJob(arguments: @["fail"]), IcJob(arguments: @["reuse"])]
+    doAssert runIcWorkQueue(@[IcJob(arguments: @["cached"], outputs: @[left])], execute,
+      expand = expandCached, session = scanner) == 7
+    doAssert warmExpanded.len == 3 and failures == 1
+  finally:
+    scanner.close()
 finally:
   removeDir(dir)
 

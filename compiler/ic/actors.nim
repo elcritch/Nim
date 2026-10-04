@@ -23,6 +23,7 @@ type
     dependencies*: seq[int]
 
   IcJobObserver* = proc(job: IcJob; exitCode: int) {.closure.}
+  IcJobExpansion* = proc(job: IcJob; outcome: IcJobResult): seq[IcJob] {.closure.}
 
   CommandPart = object
     kind, value: string
@@ -360,6 +361,79 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
       # Drop proxies while their scheduler is alive; all results have arrived.
   finally:
     if session == nil: owner.close()
+
+proc runIcWorkQueue*(initial: seq[IcJob]; execute: IcExecutor;
+                     expand: IcJobExpansion; session: IcWorkerPool;
+                     report: IcReporter = nil; profile = false): int =
+  ## A growing queue of independent file jobs. Only the coordinator expands
+  ## completed jobs; a child can start while other parents are still running.
+  ## Cached jobs also expand, without a worker round trip. The caller deduplicates
+  ## files and owns the discovered graph; no mutable graph crosses a signal.
+  if session == nil or session.pool == nil: invalid("worker pool is closed")
+  let started = if profile: getMonoTime() else: default(MonoTime)
+  let pool = session.pool
+  let home = getCurrentSigilThread()
+  let coordinator = Coordinator()
+  var ready = initDeque[IcJob]()
+  for job in initial: ready.addLast job
+  var jobs = newSeq[IcJob](pool[].workerCount)
+  var requests = newSeq[Request](pool[].workerCount)
+  var proxies = newSeq[AgentProxy[ModuleAgent]](pool[].workerCount)
+  var available: seq[int] = @[]
+  for id in countdown(pool[].workerCount - 1, 0): available.add id
+  var active, executed, skipped, peakActive: int
+  var busyNs: int64
+  result = 0
+
+  proc complete(job: IcJob; outcome: IcJobResult) =
+    if expand != nil:
+      for child in expand(job, outcome): ready.addLast child
+
+  while ready.len > 0 or active > 0:
+    while ready.len > 0 and available.len > 0:
+      let job = ready.popFirst()
+      if job.dependencies.len > 0: invalid("work queue jobs must be independent")
+      if not needsRebuild(job):
+        inc skipped
+        complete(job, default(IcJobResult))
+      else:
+        let id = available.pop()
+        jobs[id] = job
+        var actor = ModuleAgent(arguments: job.arguments, command: job.command,
+          id: id, execute: execute, profile: profile,
+          submitted: (if profile: getMonoTime() else: default(MonoTime)))
+        proxies[id] = actor.moveToThread(pool)
+        requests[id] = Request()
+        connectThreaded(requests[id], requested, proxies[id], process)
+        connectThreaded(proxies[id], finished, coordinator, Coordinator.record())
+        inc active
+        inc executed
+        peakActive = max(peakActive, active)
+        emit requests[id].requested()
+    if active > 0:
+      while coordinator.completed.len == 0: discard home.poll()
+      while coordinator.completed.len > 0:
+        let completion = coordinator.completed.popFirst()
+        let id = completion.id
+        dec active
+        if completion.outcome.exitCode != 0: result = completion.outcome.exitCode
+        if profile and report != nil:
+          let duration = (completion.finished - completion.started).inNanoseconds
+          busyNs += duration
+          report("ICSCANJOB " & $(%*{"thread": completion.thread,
+            "input": (if jobs[id].inputs.len > 0: jobs[id].inputs[0] else: ""),
+            "startNs": (completion.started - started).inNanoseconds,
+            "queueNs": completion.queueNs, "durationNs": duration,
+            "exitCode": completion.outcome.exitCode}))
+        complete(jobs[id], completion.outcome)
+        reset(requests[id])
+        reset(proxies[id])
+        reset(jobs[id])
+        available.add id
+  if profile and report != nil:
+    report("ICSCAN " & $(%*{"workers": pool[].workerCount,
+      "executed": executed, "skipped": skipped, "peakActive": peakActive,
+      "busyNs": busyNs, "wallNs": (getMonoTime() - started).inNanoseconds}))
 
 proc runExternalJob*(arguments: seq[string]): IcJobResult {.gcsafe.} =
   if arguments.len == 0: invalid("empty command")

@@ -38,7 +38,8 @@ when defined(icBNodeProf):
       pGenBodyCalls, pInfo, pIfaceExported, pIfaceHidden, pIfaceModules,
       pTopNodes, pExportSyms, pPeekKind, pPeekFallback, pPeekLoaded,
       pTopToolingSkip,
-      pBifLoads, pSemBufLoads   ## `.bif` files opened; of which `.s.bif` companions
+      pBifLoads, pSemBufLoads,  ## `.bif` files opened; of which `.s.bif` companions
+      pLocalScanHit, pLocalScanMiss
     TimeSlot* = enum
       tLoadClosure, tModuleId, tBifLoad, tPosIndex, tTopLevel, tInterfTables,
       tTransform, tHandOff, tGenBody, tAnalyses,
@@ -62,9 +63,10 @@ when defined(icBNodeProf):
       # their own. Read `SemBodyms / SemModulems` for the share, `SemBodyn` for
       # how many units a module has and `SemBodymaxus` for the critical path
       # inside one.
-      tSemBody, tSemModule,
+      tSemBody, tSemModule, tParseSource, tParseInclude,
       # `processTopLevel`'s branches: which part of a module HEADER costs what.
-      tTopReplay, tTopLogOps, tTopOffers, tTopStmts
+      tTopReplay, tTopLogOps, tTopOffers, tTopStmts,
+      tLocalScan, tOfferTypes
     MemSlot* = enum
       ## Heap snapshots (`getOccupiedMem`, MB) at the points that split a
       ## process's memory by WHAT it holds: what the dependency closure's load
@@ -112,6 +114,10 @@ when defined(icBNodeProf):
     if profTag.len > 0: line.add " tag=" & profTag
     for s in ProfSlot: line.add " " & ($s)[1..^1] & "=" & $profCounts[s]
     for s in TimeSlot: line.add " " & ($s)[1..^1] & "ms=" & $(profNanos[s] div 1_000_000)
+    # Individual source parses are often sub-millisecond. Preserve their
+    # totals rather than rounding most of the small modules down to zero.
+    for s in [tParseSource, tParseInclude]:
+      line.add " " & ($s)[1..^1] & "us=" & $(profNanos[s] div 1000)
     for s in TimeSlot: line.add " " & ($s)[1..^1] & "dKB=" & $(profMemDelta[s] div 1024)
     # Only the re-entrant slots have these, and only when they ran; every other
     # slot would add two zero fields to every line of every profile.

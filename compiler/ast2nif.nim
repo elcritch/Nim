@@ -3010,10 +3010,13 @@ proc createTypeStub(c: var DecodeContext; name: string): PType =
     raiseAssert "symbol has no offset: " & name
 
 proc extractLocalSymsFromTree(c: var DecodeContext; n: var Cursor; thisModule: string;
-                              localSyms: var Table[string, PSym]) =
+                              localSyms: var Table[string, PSym]): bool =
   ## Scan a tree for local symbol definitions (sdef tags) and add them to localSyms.
   ## For local symbols, fully load them immediately since they have no index offsets.
   ## After this proc returns, n is positioned AFTER the tree.
+  ## Returns whether this scope contains any local definitions, even when they
+  ## were already registered by an earlier definition in the same scope.
+  result = false
   # Atoms (non-compound nodes): nothing to scan, just skip past them.
   if n.kind != TagLit:
     skip n
@@ -3032,7 +3035,9 @@ proc extractLocalSymsFromTree(c: var DecodeContext; n: var Cursor; thisModule: s
     expect name, SymbolDef
     let symName = symName(name)
     let sn = parseSymName(symName)
-    if sn.module.len == 0 and symName notin localSyms:
+    if sn.module.len == 0:
+      result = true
+    if result and symName notin localSyms:
       # Local symbol - create stub and immediately load it fully
       # since local symbols have no index offsets for lazy loading
       let module = moduleId(c, thisModule)
@@ -3051,7 +3056,7 @@ proc extractLocalSymsFromTree(c: var DecodeContext; n: var Cursor; thisModule: s
       return
   # Otherwise descend into every child, scanning each for nested local sdefs.
   n.loopInto:
-    extractLocalSymsFromTree(c, n, thisModule, localSyms)
+    if extractLocalSymsFromTree(c, n, thisModule, localSyms): result = true
 
 proc loadTypeFromCursor(c: var DecodeContext; n: var Cursor; t: PType; localSyms: var Table[string, PSym])
 
@@ -3202,7 +3207,7 @@ proc loadTypeFromCursor(c: var DecodeContext; n: var Cursor; t: PType; localSyms
     # nonexistent `<suffix>@bk.nif`.
     typesModule = typesModule[0 ..< typesModule.len - BackendLocalMarker.len]
   var scanCursor = n  # copy cursor at start of type
-  extractLocalSymsFromTree(c, scanCursor, typesModule, localSyms)
+  discard extractLocalSymsFromTree(c, scanCursor, typesModule, localSyms)
 
   n.into:  # enter (td, body consumes all children, closing ) is consumed by `into`
     expect n, SymbolDef
@@ -3398,7 +3403,9 @@ proc loadSym*(c: var DecodeContext; s: PSym) =
   recordLoad(c, s.itemId.module.FileIndex, isType = false)
   let symsModule = s.itemId.module.FileIndex
   let nifname = globalName(s, c.infos.config)
-  var n = cursorFromIndexEntry(c, symsModule, c.syms[nifname][1])
+  let entry = c.syms[nifname][1]
+  let module = c.mods[symsModule]
+  var n = cursorFromIndexEntry(c, symsModule, entry)
 
   expect n, TagLit
   if not tagIs(n, symDefTagName):
@@ -3421,8 +3428,22 @@ proc loadSym*(c: var DecodeContext; s: PSym) =
   # suffix-less locals, and without it a nested closure's use of its owner's
   # parameter resolved to a second symbol and was reported as an illegal
   # capture (`config` in `makeFieldReadersTable`'s `readField`).
-  var scanCursor = n
-  extractLocalSymsFromTree(c, scanCursor, c.mods[symsModule].suffix, localSyms)
+  # Most definitions contain no suffix-less locals. Remember that immutable
+  # fact across jobs on this worker, so importing the same routine in another
+  # module does not rescan its entire deferred body. Scopes with locals still
+  # run the original pre-scan and create job-owned symbols in the original order.
+  if entry.offset notin module.index.withoutLocalSyms:
+    prof pLocalScanMiss
+    var scanCursor = n
+    timedOutermost tLocalScan:
+      if not extractLocalSymsFromTree(c, scanCursor, module.suffix, localSyms):
+        module.index.withoutLocalSyms.incl entry.offset
+  else:
+    prof pLocalScanHit
+    when defined(icLocalScanCheck):
+      var scanCursor = n
+      doAssert not extractLocalSymsFromTree(c, scanCursor, module.suffix, localSyms)
+      doAssert localSyms.len == 0
 
   # Now parse the symbol definition with all local symbols pre-registered
   s.infoImpl = c.infos.oldLineInfo(n.info, cursorPool(n))
@@ -4478,7 +4499,8 @@ proc processTopLevel(c: var DecodeContext; cur: var Cursor; flags: set[LoadFlag]
           let genSym = resolveHookSym(c, genName)
           let inst = tryCreateTypeStub(c, instName)
           if genSym != nil and inst != nil:
-            loadType(c, inst)
+            timedOutermost tOfferTypes:
+              loadType(c, inst)
             result.typeOffers.add (genSym, inst)
         icProfStop(tTopOffers)
       of ttModuleSrc:

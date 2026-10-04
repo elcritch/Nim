@@ -6,6 +6,8 @@ import ../[options, commands, cmdlinehelper, pathutils, idents, modulegraphs,
   ast, ast2nif, icbif, icconfig, extccomp, condsyms, cgendata, vmdef, debugutils,
   icprof]
 import jobtypes, workercontext, sharedcounters
+when defined(icBNodeProf):
+  from ../icmodnames import moduleSuffix
 
 proc processArgs(pass: TCmdLinePass; args: seq[string]; conf: ConfigRef) =
   var parser = initOptParser(args)
@@ -73,6 +75,8 @@ proc compileIcJob*(args: seq[string];
     reportProfile = isDefined(conf, "icProfile")
     if conf.cmd == cmdNifC: stage = conf.icBackendStage
     if conf.selectedGC == gcUnselected: initOrcDefines(conf)
+    when defined(icBNodeProf):
+      if conf.cmd == cmdM: profTag = moduleSuffix(conf.projectFull.string, [])
     graph = newModuleGraph(newIdentCache(), conf)
     workStarted = getMonoTime()
     dispatched = true

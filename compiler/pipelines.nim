@@ -175,7 +175,8 @@ proc processPipelineModuleImpl(graph: ModuleGraph; module: PSym; idgen: IdGenera
     else:
       nil
   while true:
-    syntaxes.openParser(p, fileIdx, s, graph.cache, graph.config)
+    timed(tParseSource):
+      syntaxes.openParser(p, fileIdx, s, graph.cache, graph.config)
 
     if not belongsToStdlib(graph, module) or (belongsToStdlib(graph, module) and module.name.s == "distros"):
       # XXX what about caching? no processing then? what if I change the
@@ -186,18 +187,22 @@ proc processPipelineModuleImpl(graph: ModuleGraph; module: PSym; idgen: IdGenera
         processImplicitImports graph, graph.config.implicitImports, nkImportStmt, module, ctx, bModule, idgen, topLevelStmts
         processImplicitImports graph, graph.config.implicitIncludes, nkIncludeStmt, module, ctx, bModule, idgen, topLevelStmts
 
-    checkFirstLineIndentation(p)
+    timed(tParseSource):
+      checkFirstLineIndentation(p)
     block processCode:
       if graph.stopCompile(): break processCode
-      var n = parseTopLevelStmt(p)
-      if n.kind == nkEmpty: break processCode
-      # read everything, no streaming possible
-      var sl = newNodeI(nkStmtList, n.info)
-      sl.add n
-      while true:
-        var n = parseTopLevelStmt(p)
-        if n.kind == nkEmpty: break
-        sl.add n
+      var sl: PNode = nil
+      timed(tParseSource):
+        let n = parseTopLevelStmt(p)
+        if n.kind != nkEmpty:
+          # read everything, no streaming possible
+          sl = newNodeI(nkStmtList, n.info)
+          sl.add n
+          while true:
+            let n = parseTopLevelStmt(p)
+            if n.kind == nkEmpty: break
+            sl.add n
+      if sl == nil: break processCode
 
       prePass(ctx, sl)
       if sfReorder in module.flags or codeReordering in graph.config.features:

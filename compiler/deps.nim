@@ -10,7 +10,7 @@
 ## Generate a .build.nif file for nifmake from a Nim project.
 ## This enables incremental and parallel compilation using the `m` switch.
 
-import std / [os, tables, sets, times, osproc, algorithm, strtabs, strutils, syncio]
+import std / [os, tables, sets, times, osproc, algorithm, strtabs, strutils, syncio, deques]
 from std/sha1 import secureHash, `$`
 import options, msgs, lineinfos, pathutils, condsyms,
   modulepaths, extccomp, cnif, platform
@@ -22,7 +22,7 @@ import icmodnames
 import icnifcore
 from ic/replayer import BackendActionsExt, BodyDepsExt
 from commands import compileOptionValue
-import ic/jobtypes
+import ic/[jobtypes, scanjobs]
 when hasIcActors:
   import ic/actors
 
@@ -30,6 +30,11 @@ type
   FilePair = object
     nimFile: string
     modname: string
+
+  ScanKey = tuple[path: string, main: bool]
+  Dependency = object
+    path: string
+    isInclude, speculative: bool
 
   Node = ref object
     files: seq[FilePair]  # main file + includes
@@ -65,6 +70,10 @@ type
     speculating: int   # nesting depth of `when` guards the scanner could not
                        # decide; every import edge added while this is > 0 is
                        # recorded as speculative (see pruneDeadSpeculative)
+    scanEntries: Table[ScanKey, seq[Dependency]]
+    scanResults: Table[string, IcJobResult]
+    when hasIcActors:
+      scanPool: IcWorkerPool
 
 proc toPair(c: DepContext; f: string): FilePair =
   FilePair(nimFile: f, modname: moduleSuffix(f, cast[seq[string]](c.config.searchPaths)))
@@ -79,7 +88,7 @@ proc parsedDepsFile(c: DepContext; f: FilePair): string =
   ## The deps sidecar `nifler parse --deps <src> <out>.p.nif` actually writes: it
   ## appends `.deps.nif` to the OUTPUT path, giving `<mod>.p.deps.nif`. Not to be
   ## confused with `depsFile` (`<mod>.deps.nif`), which the driver's own
-  ## `nifler deps` pre-scan writes.
+  ## pre-scan freshness marker.
   parsedFile(c, f).changeFileExt("") & ".deps.nif"
 
 proc semmedFile(c: DepContext; f: FilePair): string =
@@ -151,52 +160,21 @@ proc findNifmake(): string =
   if not fileExists(result):
     result = findExe("nifmake")
 
-proc runNifler(c: DepContext; nimFile: string): bool =
-  ## Run nifler deps on a file if needed. Returns true on success.
-  ## NOTE: the `setLastModificationTime` coordination below is a known hack; its
-  ## clean removal lands with the Phase 2 frontend/backend split, which redefines
-  ## this pre-scan's role. (A naive switch to keying on the parsed file produced
-  ## a stale warm rebuild, so it's left intact until the restructure.)
+proc runNifler(c: var DepContext; nimFile: string): bool =
+  ## The parallel pre-scan and serial fallback produce the same parse and deps.
+  ## Keep diagnostics in traversal order even when scans finished out of order.
+  let nimFile = normalizedPath(nimFile)
   let pair = c.toPair(nimFile)
   let depsPath = c.depsFile(pair)
-
-  # Check if deps file is up-to-date
-  if fileExists(depsPath) and fileExists(nimFile):
-    if getLastModificationTime(depsPath) > getLastModificationTime(nimFile):
-      return true  # Already up-to-date
-
-  # Create output directory if needed
-  createDir(parentDir(depsPath))
-
-  # This pre-scan also runs between discovery rounds, when the actor process
-  # retains large dependency caches. Launch directly so POSIX can use spawn
-  # instead of forking that address space through an intermediate shell.
-  let process = startProcess(c.nifler, args = ["deps", nimFile, depsPath],
-    options = {poUsePath, poParentStreams})
-  defer: process.close()
-  let exitCode = process.waitForExit()
-  result = exitCode == 0
-  if result:
-    # The build graph's `nifler parse --deps` rule outputs BOTH the parsed
-    # file and the deps file. Refreshing the deps file here would MASK that
-    # rule: nifmake's `needsRebuild` takes the freshest output as proof of
-    # "ran since the inputs changed", so the rule never re-fires and the
-    # parsed file goes stale. For an import-cycle group that loses the edit
-    # entirely — a non-representative member's source is not a direct input
-    # of the group's `nim_m` rule; its only build-graph connection is the
-    # (now stale) parsed file. Drop a genuinely stale parsed file so the
-    # nifler rule re-fires on the missing output.
-    let parsedPath = c.parsedFile(pair)
-    if fileExists(parsedPath) and
-       getLastModificationTime(parsedPath) < getLastModificationTime(nimFile):
-      removeFile(parsedPath)
-    # nifler writes OnlyIfChanged: after an edit that leaves the import set
-    # unchanged the deps file keeps its old mtime and would stay older than
-    # the source forever, re-running this scan (and re-deleting the parsed
-    # file) on every warm build. Bump it explicitly: it is the scan's own
-    # up-to-date marker.
-    if getLastModificationTime(depsPath) < getLastModificationTime(nimFile):
-      setLastModificationTime(depsPath, getTime())
+  if nimFile notin c.scanResults:
+    c.scanResults[nimFile] =
+      if scanCurrent(nimFile, c.parsedFile(pair), depsPath): default(IcJobResult)
+      else: runScanJob(@[c.nifler, nimFile, c.parsedFile(pair), depsPath])
+  let outcome = c.scanResults[nimFile]
+  if outcome.output.len > 0:
+    msgWriteln(c.config, outcome.output.strip(leading = false))
+    c.scanResults[nimFile].output.setLen 0
+  result = outcome.exitCode == 0
 
 proc resolveImport(c: DepContext; origin, toResolve: string): string =
   ## Resolve an import path using the compiler's normal module lookup rules.
@@ -599,16 +577,16 @@ proc parseImportPath(s: var Stream; t: var PackedToken): seq[string] =
   else:
     t = next(s)
 
-proc readDepsFile(c: var DepContext; pair: FilePair; current: Node) =
-  ## Read a .deps.nif file and process imports/includes
+proc readDependencies(c: var DepContext; pair: FilePair; main: bool): seq[Dependency] =
+  ## Decode a file's imports/includes without mutating the module graph. The
+  ## same ordered entries drive both parallel scan-ahead and graph traversal.
+  result = @[]
   let depsPath = c.depsFile(pair)
   if not fileExists(depsPath):
     return
 
-  # `current.id == 0` is the project main (rootNode); restored on exit so the
-  # flag is correct for each parent frame between its child recursions.
   let prevScanningMain = c.scanningMain
-  c.scanningMain = current.id == 0
+  c.scanningMain = main
   defer: c.scanningMain = prevScanningMain
 
   var s = nifstreams.open(depsPath)
@@ -662,23 +640,19 @@ proc readDepsFile(c: var DepContext; pair: FilePair; current: Node) =
         # that expand to several imports. A plain `import a, b, c` lists several
         # modules as siblings; a `fromimport` has a single path followed by the
         # imported symbol list, which must not be treated as modules.
-        if speculative: inc c.speculating
         if tag == "fromimport" or tag == "importexcept":
           # `from m import syms` / `import m except syms`: the first child is the
           # module path; the rest is the (in/ex)cluded symbol list, which must not
           # be treated as modules. Both still create a real dependency on `m`.
           for importPath in parseImportPath(s, t):
             if importPath.len > 0:
-              processImport(c, importPath, current, pair.nimFile)
+              result.add Dependency(path: importPath, speculative: speculative)
         else:
           while t.kind != ParRi and t.kind != EofToken:
             for importPath in parseImportPath(s, t):
               if importPath.len > 0:
-                if tag == "include":
-                  processInclude(c, importPath, current, pair.nimFile)
-                else:
-                  processImport(c, importPath, current, pair.nimFile)
-        if speculative: dec c.speculating
+                result.add Dependency(path: importPath, isInclude: tag == "include",
+                  speculative: speculative)
         # Drain any remaining tokens of this node (e.g. the symbol list of a
         # `fromimport`), up to and including the node's closing ')'.
         var depth = 1
@@ -695,6 +669,83 @@ proc readDepsFile(c: var DepContext; pair: FilePair; current: Node) =
           if t.kind == ParLe: inc depth
           elif t.kind == ParRi: dec depth
     t = next(s)
+
+proc readDepsFile(c: var DepContext; pair: FilePair; current: Node) =
+  let key: ScanKey = (normalizedPath(pair.nimFile), current.id == 0)
+  if key notin c.scanEntries:
+    c.scanEntries[key] = readDependencies(c, pair, key.main)
+  # Graph mutation remains depth-first, in source order, regardless of when
+  # workers parsed the files. Includes keep the parent's speculation context;
+  # imported modules start their own context in processImport.
+  let entries = c.scanEntries[key]
+  for dependency in entries:
+    if dependency.speculative: inc c.speculating
+    if dependency.isInclude:
+      processInclude(c, dependency.path, current, pair.nimFile)
+    else:
+      processImport(c, dependency.path, current, pair.nimFile)
+    if dependency.speculative: dec c.speculating
+
+proc prefetchDeps(c: var DepContext; seeds: seq[ScanKey]) =
+  when hasIcActors:
+    if c.scanPool == nil: return
+    # Normal lookup moves successful lazy search paths to the front. Scan
+    # completion order must not change the later ordered graph traversal's
+    # lookup precedence. A differently resolved file can still be scanned by
+    # that traversal; its diagnostics are reported only when it is reached.
+    let lazyPaths = c.config.lazyPaths
+    defer: c.config.lazyPaths = lazyPaths
+    # The closure executes only on the coordinator. Worker payloads contain
+    # filenames, never this context, its configuration, or its token pools.
+    let context = addr c
+    var contexts = initTable[string, set[bool]]()
+    var scheduled = initHashSet[string]()
+    var completed = initHashSet[string]()
+    var toRead = initDeque[ScanKey]()
+
+    proc enqueue(key: ScanKey; jobs: var seq[IcJob]) =
+      # moduleSuffix normalizes paths too: aliases must not concurrently write
+      # the same parsed output even when they arrived through different includes.
+      let key: ScanKey = (normalizedPath(key.path), key.main)
+      if key in context[].scanEntries: return
+      contexts.mgetOrPut(key.path, {}).incl key.main
+      if not scheduled.containsOrIncl(key.path):
+        let pair = context[].toPair(key.path)
+        let parsed = context[].parsedFile(pair)
+        let deps = context[].depsFile(pair)
+        # A fresh deps marker alone cannot prove a missing parsed file exists.
+        # Force a job unless all three outputs are present and the scan is fresh.
+        jobs.add IcJob(command: "nifler_scan", inputs: @[key.path],
+          outputs: (if scanCurrent(key.path, parsed, deps): @[deps] else: @[]),
+          arguments: @[context[].nifler, key.path, parsed, deps])
+      elif key.path in completed:
+        toRead.addLast key
+
+    var initial: seq[IcJob] = @[]
+    for key in seeds: enqueue(key, initial)
+    discard runIcWorkQueue(initial, runScanJob,
+      expand = proc(job: IcJob; outcome: IcJobResult): seq[IcJob] =
+        result = @[]
+        let path = job.inputs[0]
+        context[].scanResults[path] = outcome
+        # Report failures only if ordered traversal reaches this file; scan-ahead
+        # may have followed a lookup/include context absent from the final graph.
+        if outcome.exitCode != 0: return
+        completed.incl path
+        for main in contexts[path]: toRead.addLast (path, main)
+        while toRead.len > 0:
+          let key = toRead.popFirst()
+          if key in context[].scanEntries: continue
+          let entries = readDependencies(context[], context[].toPair(key.path), key.main)
+          context[].scanEntries[key] = entries
+          for dependency in entries:
+            let resolved =
+              if dependency.isInclude: resolveInclude(context[], key.path, dependency.path)
+              else: resolveImport(context[], key.path, dependency.path)
+            if resolved.len > 0 and fileExists(resolved):
+              enqueue((resolved, dependency.isInclude and key.main), result),
+      session = c.scanPool, profile = isDefined(c.config, "icProfile"),
+      report = proc(message: string) = msgWriteln(context[].config, message))
 
 proc collectIncludeNames(depsPath: string; names: var seq[string]) =
   ## Lightweight scan of a `.deps.nif` prelude: collect the raw path text of
@@ -1024,14 +1075,15 @@ proc removeDeferredScans(c: DepContext) =
   var liveFiles = initHashSet[string]()
   for node in c.nodes:
     if not node.deferred:
-      for f in node.files: liveFiles.incl f.nimFile
-  for node in c.nodes:
-    if not node.deferred: continue
-    for f in node.files:
-      if f.nimFile in liveFiles: continue
-      removeFile(c.parsedFile(f))
-      removeFile(c.depsFile(f))
-      removeFile(c.parsedDepsFile(f))
+      for f in node.files: liveFiles.incl normalizedPath(f.nimFile)
+  # Scan-ahead may also have visited a file in an include context which the
+  # ordered traversal never reaches (e.g. an include cycle). Prune those too.
+  for path in c.scanResults.keys:
+    if path in liveFiles: continue
+    let f = c.toPair(path)
+    removeFile(c.parsedFile(f))
+    removeFile(c.depsFile(f))
+    removeFile(c.parsedDepsFile(f))
 
 proc computeSCCs(c: DepContext): seq[seq[int]] =
   ## Tarjan's strongly-connected-components over the module dependency graph
@@ -1298,8 +1350,8 @@ proc generateFrontendBuildFile(c: DepContext; forwardedArgs: seq[string]): strin
         b.addStrLit parsed
         b.endTree()
         # The deps sidecar this command really produces is `<mod>.p.deps.nif`,
-        # not `<mod>.deps.nif` (which only the driver's `nifler deps` pre-scan
-        # writes). Declaring the latter made the rule permanently stale — a
+        # not `<mod>.deps.nif` (the driver's scan freshness marker).
+        # Declaring the latter made the rule permanently stale — a
         # missing output is nifmake's strongest rebuild trigger — for every
         # module the pre-scan does not also cover.
         b.addTree "output"
@@ -1946,6 +1998,17 @@ proc deriveFromSemDeps(c: var DepContext; afterRound: bool;
   ## has not changed either.
   result = false
   let n0 = c.nodes.len  # snapshot: new nodes are traversed as they're added
+  var seeds: seq[ScanKey] = @[]
+  var imports = newSeq[seq[string]](n0)
+  for ni, node in c.nodes:
+    if node.deferred: continue
+    if afterRound and completed != nil and c.semmedFile(node.files[0]) notin completed[]:
+      continue
+    imports[ni] = readSemDeps(c, node.files[0])
+    for path in imports[ni]:
+      if c.toPair(path).modname notin c.processedModules and fileExists(path):
+        seeds.add (path, false)
+  prefetchDeps(c, seeds)
   for ni in 0 ..< n0:
     # A deferred module was not semmed by the last round.
     if c.nodes[ni].deferred: continue
@@ -1955,7 +2018,7 @@ proc deriveFromSemDeps(c: var DepContext; afterRound: bool;
       # sidecars from another source/configuration, not fresh discoveries.
       continue
     let confirmed = afterRound or semDepsAreCurrent(c, c.nodes[ni])
-    for p in readSemDeps(c, c.nodes[ni].files[0]):
+    for p in imports[ni]:
       let pair = c.toPair(p)
       var idx = c.processedModules.getOrDefault(pair.modname, -1)
       if idx == -1:
@@ -2019,6 +2082,24 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false; execute: IcExecutor = nil
       createDir(cacheDir)
       writeFile(versionFile, icFormatVersion)
 
+    let useActors = hasIcActors and execute != nil and not isDefined(conf, "icProcesses")
+    let workers =
+      if isDefined(conf, "icNoParallel"): 1
+      elif isDefined(conf, "icJobs"):
+        try:
+          let n = parseInt(conf.symbols["icJobs"])
+          if n <= 0: raise newException(ValueError, "nonpositive worker count")
+          n
+        except ValueError:
+          rawMessage(conf, errGenerated, "icJobs must be a positive integer")
+          return
+      elif conf.numberOfProcessors > 0: conf.numberOfProcessors
+      else: countProcessors()
+
+    when hasIcActors:
+      let workerPool = if useActors: newIcWorkerPool(workers) else: nil
+      defer: workerPool.close()
+
     var c = DepContext(
       config: conf,
       nifler: nifler,
@@ -2027,6 +2108,22 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false; execute: IcExecutor = nil
       includeStack: @[],
       systemNodeId: -1
     )
+
+    when hasIcActors:
+      c.scanPool = workerPool
+
+    # Discover independent files as scans finish. Replay their ordered entries
+    # below to preserve module IDs and SCC representatives across schedulers.
+    block:
+      let lazyPaths = conf.lazyPaths
+      defer: conf.lazyPaths = lazyPaths
+      var scanSeeds: seq[ScanKey] = @[
+        ((conf.libpath / RelativeFile"system.nim").string, false),
+        (projectFile, true)]
+      for imp in conf.implicitImports:
+        let resolved = resolveImport(c, projectFile, imp)
+        if resolved.len > 0 and fileExists(resolved): scanSeeds.add (resolved, false)
+      prefetchDeps(c, scanSeeds)
 
     # Create root node for main project file
     let rootPair = c.toPair(projectFile)
@@ -2127,23 +2224,6 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false; execute: IcExecutor = nil
       elif conf.numberOfProcessors > 0: " --parallel:" & $conf.numberOfProcessors
       else: " --parallel"
 
-    let useActors = hasIcActors and execute != nil and not isDefined(conf, "icProcesses")
-    let workers =
-      if isDefined(conf, "icNoParallel"): 1
-      elif isDefined(conf, "icJobs"):
-        try:
-          let n = parseInt(conf.symbols["icJobs"])
-          if n <= 0: raise newException(ValueError, "nonpositive worker count")
-          n
-        except ValueError:
-          rawMessage(conf, errGenerated, "icJobs must be a positive integer")
-          return
-      elif conf.numberOfProcessors > 0: conf.numberOfProcessors
-      else: countProcessors()
-
-    when hasIcActors:
-      var workerPool: IcWorkerPool = nil
-      defer: workerPool.close()
     var completedSem = initHashSet[string]()
 
     proc runBuild(buildFile: string): int =
@@ -2153,8 +2233,6 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false; execute: IcExecutor = nil
           rawMessage(conf, hintExecuting, "IC Sigils workers: " & $workers)
           try:
             let jobs = loadIcJobs(buildFile)
-            if workerPool == nil:
-              workerPool = newIcWorkerPool(min(workers, max(1, jobs.len)))
             result = runIcJobs(jobs, execute, workers,
               proc(output: string) = msgWriteln(conf, output.strip(leading = false)),
               session = workerPool, profile = isDefined(conf, "icProfile"),
