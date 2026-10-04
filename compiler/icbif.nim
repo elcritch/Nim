@@ -112,7 +112,7 @@ var cacheClock {.threadvar.}: uint64
 var cacheStats {.threadvar.}: DependencyCacheStats
 var cacheCleanupRegistered {.threadvar.}: bool
 
-const DefaultDependencyCacheBytes* = 128 * 1024 * 1024
+const DefaultDependencyCacheBytes* = 512 * 1024 * 1024
 
 proc lazyOf(p: Pool): LazyPool {.inline.} = lazyPools.getOrDefault(p)
 

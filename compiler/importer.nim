@@ -340,8 +340,9 @@ proc impMod(c: PContext; it: PNode; importStmtResult: PNode) =
     #importForwarded(c, m.ast, emptySet, m)
     afterImport(c, m)
 
-proc evalImport*(c: PContext, n: PNode): PNode =
-  result = newNodeI(nkImportStmt, n.info)
+iterator importItems(n: PNode): PNode =
+  ## Expand grouped paths in place, consuming each yielded node before the
+  ## next one reuses its prefix (as the importer has always done).
   for i in 0..<n.len:
     let it = n[i]
     if it.kind in {nkInfix, nkPrefix} and it[^1].kind == nkBracket:
@@ -359,12 +360,28 @@ proc evalImport*(c: PContext, n: PNode): PNode =
           imp[lastPos] = x[1]
           impAs[1] = imp
           impAs[2] = x[2]
-          impMod(c, impAs, result)
+          yield impAs
         else:
           imp[lastPos] = x
-          impMod(c, imp, result)
+          yield imp
     else:
-      impMod(c, it, result)
+      yield it
+
+proc evalImport*(c: PContext, n: PNode): PNode =
+  result = newNodeI(nkImportStmt, n.info)
+  if c.config.cmd == cmdM and c.config.icProject.len > 0 and
+      c.compilesContextId == 0:
+    # The surrounding `when`/macro has already selected this statement. Record
+    # ALL of its imports before loading any: loading the first missing NIF
+    # stops this job for discovery. Otherwise `import a, b, c` takes one round
+    # per module, hiding independent branches from the worker pool. Do not
+    # speculate across statements, guards or `compiles` probes.
+    for it in importItems(n):
+      let path = transformImportAs(c, it).node
+      let f = checkModuleName(c.config, path, doLocalError = false)
+      if f != InvalidFileIdx: addImportFileDep(c, f)
+  for it in importItems(n):
+    impMod(c, it, result)
 
 proc evalFrom*(c: PContext, n: PNode): PNode =
   result = newNodeI(nkImportStmt, n.info)

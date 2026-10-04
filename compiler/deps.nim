@@ -303,7 +303,17 @@ proc processImport(c: var DepContext; importPath: string; current: Node; origin:
         if impId != newNode.id: newNode.deps.add impId
     c.processedModules[pair.modname] = newNode.id
     c.nodes.add newNode
-    traverseDeps(c, pair, newNode)
+    # Uncertainty belongs to this import EDGE, not to the imported module's
+    # own unconditional imports. Reachability already keeps its whole subtree
+    # deferred until this edge is confirmed. Carrying the parent's guard into
+    # the child hid every level of that subtree behind another discovery round.
+    # Includes deliberately keep the guard: they are part of the same module.
+    let parentSpeculation = c.speculating
+    c.speculating = 0
+    try:
+      traverseDeps(c, pair, newNode)
+    finally:
+      c.speculating = parentSpeculation
   else:
     # Already processed - just add dependency
     addDepEdge(c, current, existingIdx)
@@ -1880,7 +1890,8 @@ proc generateBackendBuildFile(c: DepContext; forwardedArgs: seq[string]): string
 
   b.endTree()  # stmts
 
-proc deriveFromSemDeps(c: var DepContext; afterRound: bool): bool =
+proc deriveFromSemDeps(c: var DepContext; afterRound: bool;
+                       completed: ptr HashSet[string] = nil): bool =
   ## Fold every already-compiled module's `.s.deps` sidecar (its REAL post-sem
   ## imports, macro-generated ones included) back into the graph. Returns true
   ## if a confirmed (hard) node or edge was added; see below.
@@ -1899,18 +1910,22 @@ proc deriveFromSemDeps(c: var DepContext; afterRound: bool): bool =
   ## so they are hard edges, even under a `when` the scanner cannot decide, as
   ## long as the sources it was produced from are unchanged. A stale sidecar's
   ## imports are only speculative: deferred, and rediscovered if sem still takes
-  ## them. `afterRound`: called after a frontend round, in which every module
-  ## whose sources changed has just been semmed again, so every sidecar is
-  ## current (a rewrite with unchanged content keeps the sidecar's old mtime,
-  ## which is why mtimes are only consulted at start-up). Only hard additions
-  ## count as progress for the discovery loop, which defers speculative ones
-  ## again. The caller only seeds from sidecars when the build configuration
+  ## them. `afterRound`: successful jobs have fresh sidecars even when a
+  ## content-stable rewrite kept their old mtimes. Actor rounds supply the set
+  ## of jobs that ran; blocked importers' old sidecars must not be consulted.
+  ## Only hard additions count as progress for the discovery loop, which defers
+  ## speculative ones again. The caller only seeds from sidecars when the build configuration
   ## has not changed either.
   result = false
   let n0 = c.nodes.len  # snapshot: new nodes are traversed as they're added
   for ni in 0 ..< n0:
     # A deferred module was not semmed by the last round.
     if c.nodes[ni].deferred: continue
+    if afterRound and completed != nil and
+        c.semmedFile(c.nodes[ni].files[0]) notin completed[]:
+      # Reuse the startup graph for cached jobs. Blocked importers may have
+      # sidecars from another source/configuration, not fresh discoveries.
+      continue
     let confirmed = afterRound or semDepsAreCurrent(c, c.nodes[ni])
     for p in readSemDeps(c, c.nodes[ni].files[0]):
       let pair = c.toPair(p)
@@ -2101,8 +2116,10 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false; execute: IcExecutor = nil
     when hasIcActors:
       var workerPool: IcWorkerPool = nil
       defer: workerPool.close()
+    var completedSem = initHashSet[string]()
 
     proc runBuild(buildFile: string): int =
+      completedSem.clear()
       if useActors:
         when hasIcActors:
           rawMessage(conf, hintExecuting, "IC Sigils workers: " & $workers)
@@ -2112,7 +2129,11 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false; execute: IcExecutor = nil
               workerPool = newIcWorkerPool(min(workers, max(1, jobs.len)))
             result = runIcJobs(jobs, execute, workers,
               proc(output: string) = msgWriteln(conf, output.strip(leading = false)),
-              session = workerPool)
+              session = workerPool, profile = isDefined(conf, "icProfile"),
+              onComplete = proc(job: IcJob; exitCode: int) =
+                if job.command == "nim_m" and exitCode == 0:
+                  for output in job.outputs:
+                    if output.endsWith(".s.bif"): completedSem.incl output)
           except CatchableError as e:
             rawMessage(conf, errGenerated, e.msg)
             result = 1
@@ -2140,20 +2161,24 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false; execute: IcExecutor = nil
       # A child that met an import no rule produced yet records it in its
       # `.s.deps`, removes its own NIF and exits successfully (see
       # `pipelines.compilePipelineModule`), so a clean exit is not enough.
-      let discoveryPending = not allSemmed(c)
-      if exitCode == 0 and not discoveryPending:
-        frontendOk = true
-        break
-
       # Re-derive from the post-sem deps of every node compiled so far. Imports
       # the static scanner missed become new nodes; the importer->import edge
       # the scanner could not see is added so the discovered module builds
       # first. (Static-import edges are already present, so `notin deps` skips
       # the redundant ones.)
-      let discovered = deriveFromSemDeps(c, afterRound = true)
+      let discovered = deriveFromSemDeps(c, afterRound = true,
+        completed = (if useActors: addr completedSem else: nil))
       # Imports taken from stale sidecars, and a discovered module's own
       # undecidable imports, are speculative: defer them like the initial scan's.
       if discovered: pruneDeadSpeculative(c)
+      # Discover even after a successful round. A macro import can load a NIF
+      # left by an older configuration without stopping, while that module is
+      # still absent from this build's graph. Schedule its inputs before
+      # declaring the frontend complete (and before pruning backend outputs).
+      let discoveryPending = not allSemmed(c)
+      if exitCode == 0 and not discoveryPending and not discovered:
+        frontendOk = true
+        break
       if not discovered and exitCode == 0:
         # Only the deferred-import stops happened, and they taught us nothing.
         rawMessage(conf, errGenerated,

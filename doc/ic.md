@@ -5,7 +5,7 @@
 ``--ic:on`` turns an ordinary compile into an incremental one. It decomposes
 compilation into per-module steps whose results are cached as NIF files, and
 uses a Sigils worker pool to re-run only the steps whose inputs changed.
-The compiler itself is built with ``--mm:atomicArc --threads:on``; the target
+The compiler itself is built with ``--mm:arc --threads:on``; the target
 program's memory manager is still selected independently.
 
 .. code-block:: cmd
@@ -41,7 +41,8 @@ and schedules its rules on Sigils actors:
 2. **Backend** — ``nim nifc`` (`cmdNifC`, ``compiler/nifbackend.nim``) reads the
    semmed NIFs, generates C, compiles and links.
 
-The coordinator orders steps by their input/output files. A completion signal
+The coordinator orders steps by their input/output files. Among ready jobs it
+starts the longest remaining dependency chains first. A completion signal
 releases dependent actors immediately; there is no barrier between unrelated
 modules at the same graph depth. Timestamps are checked after dependencies
 complete, so an unchanged interface cookie still stops a rebuild cascade.
@@ -55,6 +56,15 @@ Each scheduled module job is an ``AgentActor`` moved into a
 return its exit status and buffered compiler diagnostics. The coordinator alone
 owns dependency counts. Failed prerequisites block their dependents while
 independent jobs finish; the pool is joined before IC returns.
+
+A successful job that stops to discover an import has no module output yet.
+Its dependents wait for the next discovery round while independent branches
+finish. Only jobs that actually ran can confirm fresh dependency sidecars.
+An unknown ``when`` guard applies to the import edge in that module; once the
+edge is confirmed, the imported module's unconditional dependency subtree is
+available to the pool. All imports in a selected import statement are recorded
+together, including grouped paths and aliases. Inactive branches and
+``compiles`` probes are not expanded speculatively.
 
 Semantic analysis and the ``lower``, ``cg``, ``merge``, ``emit`` and ``link``
 commands run **inside the compiler's worker threads**, through
@@ -73,12 +83,18 @@ atomic replacement invalidates it even if its size and modification time are
 unchanged. Active jobs hold leases on their images: eviction or replacement
 cannot unmap data while a cursor still uses it. Job leases are released after
 the last AST and cursor; cached images are released when the worker exits.
-The default budget is 128 MiB per worker, charged against mapped file bytes and
+The default budget is 512 MiB per worker, charged against mapped file bytes and
 an estimate of decoded tables and names. Active job data can exceed that budget.
+This is a retention limit, not an allocation at startup.
 ``-d:icDepCacheMiB:N`` sets the budget; ``-d:icNoDepCache`` disables reuse for
 comparison. ``-d:icDepCacheStats`` prints per-job hits, misses, evictions and
 retained bytes. One worker pool lives across frontend discovery rounds and
 backend processing, and is joined at the end of the compiler invocation.
+
+Ordinary ARC suffices because compiler graphs and cached buffers stay on their
+own OS worker. Sigils transfers actor/message ownership, gives an actor an
+exclusive worker lease, and uses synchronized shared delivery endpoints.
+``--mm:atomicArc`` remains supported for compiler builds.
 
 Compile-time environment changes are local to a job, including the environment
 passed to ``staticExec``. An import cycle remains one semantic job, since its
@@ -89,14 +105,60 @@ producer remain external tools. Their module jobs are still scheduled by the
 pool. Discovery of macro-generated imports uses the existing rounds and
 ``.s.deps.bif`` sidecars. Workers report an early stop to the coordinator instead
 of exiting the compiler process.
+On POSIX systems that support it, external tools use ``posix_spawn``. A command
+with an explicit working directory uses ``fork`` so that only the child changes
+directory; this avoids copying the compiler's large address space for ordinary
+parser and C compiler commands.
 
 Use ``--parallelBuild:N`` to bound the pool, ``-d:icJobs:N`` to override that
 bound, or ``-d:icNoParallel`` for one worker. The default is the available CPU
 count. ``-d:icProcesses`` selects the previous ``nifmake`` process runner for
-comparison and troubleshooting. Compilers built without atomic ARC/threads, or
+comparison and troubleshooting. Compilers built without ARC/atomic ARC and
+threads, or
 with the optional native FFI or IC profiling instrumentation, also use the
 process runner. Native FFI can mutate process-global library state, and those
 profilers use process-wide counters and exit hooks.
+
+``-d:icProfile`` works with actors and prints JSON records through the
+coordinator: ``ICJOB`` gives the worker, output, start time and execution time;
+``ICCOMPILE`` separates setup, compiler work and cleanup by stage; ``ICBUILD``
+reports the actual pool size, executed/skipped/deferred/blocked counts and
+aggregate busy time. Times are in nanoseconds, with job starts relative to that
+build round. This measures actor occupancy, not CPU utilization: the ``link``
+actor also drives C compiler subprocesses in parallel through
+``--parallelBuild:N``. The backend's lowering barrier ensures code generation
+sees complete lowered dependencies; main-module codegen, ownership merging and
+linking have additional whole-program dependencies.
+
+For example, use an empty cache directory to profile a clean compiler build:
+
+.. code-block:: cmd
+
+  bin/nim c --ic:on -d:release --parallelBuild:16 --skipUserCfg \
+    -d:icProfile -d:icDepCacheStats --hint:Processing:off \
+    --nimcache:/tmp/ic-profile-cache --out:/tmp/ic-profile-nim compiler/nim.nim
+
+Measurements on FreeBSD 15.1, a Ryzen 7 8745HS (16 logical CPUs) and 16 GiB
+RAM, with release builds and a warm filesystem cache (2026-10-04): a clean
+compiler self-build took 82.77 seconds with the previous actor implementation
+and 34.41 seconds after these changes, using 16 workers on the same source
+tree. Frontend discovery fell from 47 rounds to 4. The updated process runner
+took 34.05 seconds; this workload is now approximately tied between runners.
+
+With a 512 MiB cache limit per worker, the actor build took 52.92 / 38.08 /
+34.45 seconds at 4 / 8 / 16 workers, with peak compiler RSS of 1.64 / 2.61 /
+4.17 GiB. More workers became useful after fixing discovery and avoiding large
+``fork`` operations. Raising the cache from 128 to 512 MiB removed evictions,
+but the final 16-worker timings (34.80 versus 34.41 seconds) were close.
+ARC and atomic ARC compiler-only timings were also effectively tied
+(19.54 versus 19.58 seconds at 8 workers); ownership isolation allows ARC,
+but removing atomics was not the main speedup.
+
+A 48-module workload's median clean build improved from 4.39 to 2.69 seconds
+(three runs). No-op builds remained about 21 ms and single-module body edits
+about 200 ms (five runs each). No-op artifact timestamps were unchanged;
+the actor and process runners produced identical primary artifacts for both
+this workload and the compiler self-build.
 
 ``koch boot`` fetches pinned Sigils, threading, variant and stack_strings sources
 under ``dist/sigils``. Sigils currently requires full system exports and classic

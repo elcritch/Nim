@@ -1,10 +1,10 @@
 discard """
   output: "IC actors OK"
   cmd: "nim c --skipParentCfg -r $options $file"
-  matrix: "--ic:off; --ic:on"
+  matrix: "--ic:off --mm:arc; --ic:on --mm:arc; --ic:off --mm:atomicArc; --ic:on --mm:atomicArc"
 """
 
-import std/[os, times, tempfiles, atomics, strutils, assertions]
+import std/[os, times, tempfiles, atomics, strutils, assertions, json]
 import compiler/ic/actors
 import compiler/ic/workercontext
 
@@ -28,6 +28,8 @@ proc execute(args: seq[string]): IcJobResult {.gcsafe.} =
     while entered.load() < 2 and epochTime() < deadline: sleep(1)
     doAssert entered.load() == 2, "two independent actors must overlap"
   of "fail": return IcJobResult(exitCode: 7, output: "intentional failure")
+  of "defer": return # successful discovery stop, no module output yet
+  of "ordered": return IcJobResult(output: args[1])
   of "raise": raise newException(ValueError, "worker exception")
   of "environment":
     beginIcWorker()
@@ -79,6 +81,23 @@ try:
   doAssert "intentional failure" in diagnostics
   doAssert not fileExists(blockedOutput)
   doAssert fileExists(independent)
+
+  # Successful discovery stops must not launch dependents before their input
+  # exists. This is distinct from a compiler error: the driver will retry the
+  # expanded graph, while unrelated branches can finish in the current round.
+  let deferredOutput = dir / "deferred"
+  let afterDeferred = dir / "after-deferred"
+  let independentDeferred = dir / "independent-deferred"
+  let beforeDeferred = calls.load()
+  doAssert runIcJobs(@[
+    IcJob(arguments: @["defer"], outputs: @[deferredOutput]),
+    IcJob(arguments: @["join", afterDeferred, deferredOutput],
+      outputs: @[afterDeferred], dependencies: @[0]),
+    IcJob(arguments: @["join", independentDeferred], outputs: @[independentDeferred])],
+    execute, workers = 2) == 0
+  doAssert calls.load() == beforeDeferred + 2
+  doAssert not fileExists(afterDeferred)
+  doAssert fileExists(independentDeferred)
   doAssert runIcJobs(@[IcJob(arguments: @["raise"], outputs: @[failedOutput])],
     execute, workers = 1) == 1
 
@@ -97,6 +116,30 @@ try:
       discard parseInt(s.strip())
       inc replies) == 0
   doAssert replies == 64
+
+  # Profiling is reported by the coordinator after a reply, with the actual
+  # worker identity and elapsed execution time. It must not change dispatch.
+  var jobProfiles, buildProfiles: seq[JsonNode]
+  doAssert runIcJobs(@[IcJob(command: "reuse", arguments: @["reuse"])],
+    execute, workers = 2, profile = true,
+    report = proc(s: string) =
+      if s.startsWith("ICJOB "): jobProfiles.add parseJson(s[6..^1])
+      elif s.startsWith("ICBUILD "): buildProfiles.add parseJson(s[8..^1])) == 0
+  doAssert jobProfiles.len == 1 and buildProfiles.len == 1
+  doAssert jobProfiles[0]["thread"].getInt != mainThread
+  doAssert jobProfiles[0]["durationNs"].getBiggestInt >= 0
+  doAssert buildProfiles[0]["executed"].getInt == 1
+  doAssert buildProfiles[0]["workers"].getInt == 1 # capped by job count
+
+  # Ready jobs that unlock a longer chain take priority over unrelated work.
+  var dispatchOrder: seq[string]
+  doAssert runIcJobs(@[
+    IcJob(arguments: @["ordered", "short"]),
+    IcJob(arguments: @["ordered", "critical"]),
+    IcJob(arguments: @["ordered", "middle"], dependencies: @[1]),
+    IcJob(arguments: @["ordered", "join"], dependencies: @[0, 2])],
+    execute, workers = 1, report = proc(s: string) = dispatchOrder.add s) == 0
+  doAssert dispatchOrder == @["critical", "short", "middle", "join"]
 
   # The same OS worker must start each compiler invocation with fresh state.
   doAssert runIcJobs(@[IcJob(arguments: @["environment"]),

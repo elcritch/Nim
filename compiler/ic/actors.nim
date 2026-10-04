@@ -5,7 +5,8 @@
 # Sigils templates use Nim's default-initialized containers.
 {.push warning[Uninit]: off, warning[ProveInit]: off.}
 
-import std/[os, osproc, times, tables, sets, deques, locks, streams]
+import std/[os, osproc, times, tables, sets, deques, locks, streams, monotimes, json,
+            heapqueue]
 import sigils
 import sigils/threads
 import "../../dist/nimony/src/lib" / [nifcore, nifcoreparse]
@@ -18,6 +19,8 @@ type
     arguments*: seq[string]       # executable followed by individual argv entries
     inputs*, outputs*: seq[string]
     dependencies*: seq[int]
+
+  IcJobObserver* = proc(job: IcJob; exitCode: int) {.closure.}
 
   CommandPart = object
     kind, value: string
@@ -142,10 +145,13 @@ type
     job: IcJob
     id: int
     execute: IcExecutor
+    profile: bool
   Request = ref object of Agent
   Completion = object
     id: int
     outcome: IcJobResult
+    started, finished: MonoTime
+    thread: int
   Coordinator = ref object of Agent
     completed: Deque[Completion]
 
@@ -153,6 +159,7 @@ proc requested(self: Request) {.signal.}
 proc finished(self: ModuleAgent; value: Completion) {.signal.}
 
 proc process(self: ModuleAgent) {.slot.} =
+  let started = if self.profile: getMonoTime() else: default(MonoTime)
   var outcome = default(IcJobResult)
   try:
     outcome = self.execute(self.job.arguments)
@@ -161,7 +168,9 @@ proc process(self: ModuleAgent) {.slot.} =
       output: "IC " & self.job.command & ": " & e.msg & "\n" & e.getStackTrace())
   except Defect as e:
     outcome = IcJobResult(exitCode: 1, output: e.msg & "\n" & e.getStackTrace())
-  emit self.finished(Completion(id: self.id, outcome: move(outcome)))
+  let finished = if self.profile: getMonoTime() else: default(MonoTime)
+  emit self.finished(Completion(id: self.id, outcome: move(outcome),
+    started: started, finished: finished, thread: getThreadId()))
 
 proc record(self: Coordinator; value: Completion) {.slot.} =
   self.completed.addLast value
@@ -195,31 +204,46 @@ proc close*(workers: IcWorkerPool) =
 
 proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
                 workers = countProcessors(); report: IcReporter = nil;
-                session: IcWorkerPool = nil): int =
+                session: IcWorkerPool = nil; profile = false;
+                onComplete: IcJobObserver = nil): int =
+  let started = if profile: getMonoTime() else: default(MonoTime)
   result = 0
   if jobs.len == 0: return 0
   # Validate and topologically check BEFORE starting any work: a cycle must
   # never strand the coordinator in a blocking poll.
   var pending = newSeq[int](jobs.len)
   var dependents = newSeq[seq[int]](jobs.len)
-  var ready = initDeque[int]()
+  var roots = initDeque[int]()
   for i, job in jobs:
     pending[i] = job.dependencies.len
-    if pending[i] == 0: ready.addLast i
+    if pending[i] == 0: roots.addLast i
     for dep in job.dependencies:
       if dep < 0 or dep >= jobs.len: invalid("dependency out of range")
       dependents[dep].add i
+  var order: seq[int] = @[]
   block:
     var counts = pending
-    var queue = ready
+    var queue = roots
     var visited = 0
     while queue.len > 0:
       let id = queue.popFirst()
+      order.add id
       inc visited
       for next in dependents[id]:
         dec counts[next]
         if counts[next] == 0: queue.addLast next
     if visited != jobs.len: invalid("dependency cycle")
+
+  # Start the longest remaining dependency chains first. A FIFO lets a large
+  # wave of unrelated parser jobs delay system/sem jobs that unlock the tree.
+  # Equal priorities keep source order, so a single worker is deterministic.
+  var rank = newSeq[int](jobs.len)
+  for i in countdown(order.high, 0):
+    let id = order[i]
+    for dep in jobs[id].dependencies:
+      rank[dep] = max(rank[dep], rank[id] + 1)
+  var ready = initHeapQueue[tuple[priority, id: int]]()
+  for id in roots: ready.push((-rank[id], id))
 
   startLocalThreadDefault()
   let home = getCurrentSigilThread()
@@ -235,39 +259,74 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
       var blocked = newSeq[bool](jobs.len)
       var active = 0
       var remaining = jobs.len
+      var executed, skipped, deferred, blockedJobs, peakActive: int
+      var busyNs: int64
 
       proc complete(id: int; failed: bool) =
         dec remaining
         for next in dependents[id]:
           blocked[next] = blocked[next] or failed
           dec pending[next]
-          if pending[next] == 0: ready.addLast next
+          if pending[next] == 0: ready.push((-rank[next], next))
 
       while remaining > 0:
         while ready.len > 0 and active < pool[].workerCount:
-          let id = ready.popFirst()
+          let id = ready.pop().id
           if blocked[id]:
+            inc blockedJobs
             complete(id, true)
           elif not needsRebuild(jobs[id]):
+            inc skipped
             complete(id, false)
           else:
-            var actor = ModuleAgent(job: jobs[id], id: id, execute: execute)
+            var actor = ModuleAgent(job: jobs[id], id: id, execute: execute,
+                                    profile: profile)
             proxies[id] = actor.moveToThread(pool)
             requests[id] = Request()
             connectThreaded(requests[id], requested, proxies[id], process)
             connectThreaded(proxies[id], finished, coordinator, Coordinator.record())
             inc active
+            inc executed
+            peakActive = max(peakActive, active)
             emit requests[id].requested()
         if active > 0:
           while coordinator.completed.len == 0: discard home.poll()
           while coordinator.completed.len > 0:
             let completion = coordinator.completed.popFirst()
             dec active
+            if onComplete != nil:
+              onComplete(jobs[completion.id], completion.outcome.exitCode)
             if completion.outcome.output.len > 0 and report != nil:
               report(completion.outcome.output)
+            if profile and report != nil:
+              let job = jobs[completion.id]
+              let duration = (completion.finished - completion.started).inNanoseconds
+              busyNs += duration
+              report("ICJOB " & $(%*{"id": completion.id,
+                "thread": completion.thread, "command": job.command,
+                "output": (if job.outputs.len > 0: job.outputs[0] else: ""),
+                "startNs": (completion.started - started).inNanoseconds,
+                "durationNs": duration, "exitCode": completion.outcome.exitCode}))
             let failed = completion.outcome.exitCode != 0
             if failed: result = completion.outcome.exitCode
-            complete(completion.id, failed)
+            # A semantic job stops successfully when it discovers an import
+            # that has not been built yet. Its missing outputs mean that its
+            # dependents cannot run this round, even though it did not fail.
+            # Let independent branches finish and the driver discover the new
+            # edges, instead of repeatedly starting the entire importer chain.
+            var incomplete = false
+            if not failed:
+              for output in jobs[completion.id].outputs:
+                if not fileExists(output):
+                  incomplete = true
+                  break
+              if incomplete: inc deferred
+            complete(completion.id, failed or incomplete)
+      if profile and report != nil:
+        report("ICBUILD " & $(%*{"workers": pool[].workerCount,
+          "executed": executed, "skipped": skipped, "peakActive": peakActive,
+          "deferred": deferred, "blocked": blockedJobs,
+          "busyNs": busyNs, "wallNs": (getMonoTime() - started).inNanoseconds}))
       # Drop proxies while their scheduler is alive; all results have arrived.
   finally:
     if session == nil: owner.close()

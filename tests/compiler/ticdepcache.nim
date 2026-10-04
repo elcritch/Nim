@@ -1,6 +1,7 @@
 discard """
   output: "IC dependency cache OK"
-  cmd: "nim c --skipParentCfg --mm:atomicArc --threads:on -r $options $file"
+  cmd: "nim c --skipParentCfg --threads:on -r $options $file"
+  matrix: "--mm:arc; --mm:atomicArc"
 """
 
 import std/[os, times, tempfiles, atomics, memfiles]

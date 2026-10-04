@@ -1,7 +1,7 @@
 ## A complete compiler invocation with job-owned configuration and graph.
 ## Only argv and diagnostics cross the actor boundary; ASTs and VM state do not.
 
-import std/[os, parseopt, strutils, strtabs]
+import std/[os, parseopt, strutils, strtabs, monotimes, times, json]
 import ../[options, commands, cmdlinehelper, pathutils, idents, modulegraphs,
   ast, ast2nif, icbif, icconfig, extccomp, condsyms, cgendata, vmdef, debugutils]
 import jobtypes, workercontext, sharedcounters
@@ -29,6 +29,11 @@ proc processArgs(pass: TCmdLinePass; args: seq[string]; conf: ConfigRef) =
 proc compileIcJob*(args: seq[string];
                    dispatch: proc(graph: ModuleGraph) {.nimcall.}): IcJobResult =
   result = default(IcJobResult)
+  let started = getMonoTime()
+  var workStarted = started
+  var dispatched = false
+  var reportProfile = false
+  var stage = "frontend"
   beginIcWorker()
   clearIcDecodeState()
   registerNifAstTags()
@@ -63,14 +68,20 @@ proc compileIcJob*(args: seq[string];
     if isDefined(conf, "icNoDepCache"): cacheBudget = 0
     setDependencyCacheBudget(cacheBudget)
     reportCache = isDefined(conf, "icDepCacheStats")
+    reportProfile = isDefined(conf, "icProfile")
+    if conf.cmd == cmdNifC: stage = conf.icBackendStage
     if conf.selectedGC == gcUnselected: initOrcDefines(conf)
     graph = newModuleGraph(newIdentCache(), conf)
+    workStarted = getMonoTime()
+    dispatched = true
     dispatch(graph)
     result.exitCode = ord(conf.errorCounter != 0)
   except IcJobExit as e:
     result.exitCode = e.exitCode
     if e.msg.len > 0: output.add e.msg & "\n"
   finally:
+    let cleanupStarted = getMonoTime()
+    if not dispatched: workStarted = cleanupStarted
     when defined(icWorkerStats):
       let memoryPeak = getOccupiedMem()
     releaseSharedCounters()
@@ -85,6 +96,11 @@ proc compileIcJob*(args: seq[string];
     releaseIcAst()
     clearIcDecodeState()
     endIcWorker()
+    if reportProfile:
+      output.add "ICCOMPILE " & $(%*{"thread": getThreadId(), "stage": stage,
+        "setupNs": (workStarted - started).inNanoseconds,
+        "workNs": (cleanupStarted - workStarted).inNanoseconds,
+        "cleanupNs": (getMonoTime() - cleanupStarted).inNanoseconds}) & "\n"
     if reportCache:
       let stats = dependencyCacheStats()
       output.add "ICDEPCACHE " & $getThreadId() &
