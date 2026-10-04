@@ -30,6 +30,9 @@ from transf import transformBody
 from injectdestructors import injectDestructorCalls
 import icprof
 import ic / replayer
+import ic / jobtypes
+when hasIcActors:
+  import ic / [mergecache, workercontext]
 
 proc systemNifSuffix(conf: ConfigRef): string =
   ## The system module's NIF suffix, derived from `system.nim`'s path EXACTLY as
@@ -884,7 +887,7 @@ proc generateMergeStage(g: ModuleGraph) =
     for artifact in walkFiles(nimcache / ("*" & icCFileExt(g.config) & ".nif")):
       files.add artifact
   sort files
-  let decision = computeMergeDecision(files)
+  var decision = computeMergeDecision(files)
   if decision.broken:
     rawMessage(g.config, errGenerated,
       "per-module backend merge: a .c.nif artifact is missing or unparsable")
@@ -894,6 +897,9 @@ proc generateMergeStage(g: ModuleGraph) =
     stderr.writeLine "[icMerge] artifacts: " & $files.len &
       " live: " & $decision.live.len & " defs: " & $decision.defs &
       " liveDefs: " & $decision.liveDefs & " owned: " & $decision.owners.len
+  when hasIcActors:
+    if inIcWorker:
+      publishMergeSnapshot(nimcache / MergeDecisionFile, move(decision))
 
 proc emitOneModule(g: ModuleGraph; mainFileIdx: FileIndex; member: string;
                    isMain: bool; decision: MergeDecision)
@@ -953,21 +959,30 @@ proc generateEmitStage(g: ModuleGraph; mainFileIdx: FileIndex) =
   # process loads nothing and the fire-all costs process-startup, not a graph load.
   # The decision is read ONCE for the batch: it is a whole-program artifact, and
   # re-reading it per member was a per-process cost the batch exists to remove.
-  let decision = readMergeDecision(getNimcacheDir(g.config).string / MergeDecisionFile)
-  if decision.broken:
-    rawMessage(g.config, errGenerated,
-      "per-module emit: missing or unparsable merge decision " & MergeDecisionFile)
-    return
-  let members = if batch.members.len == 0: @[mainSuffix] else: batch.members
-  for member in members:
-    # Per MEMBER, not per batch. `backendBatch.isMain` answers "is this
-    # invocation the main-module invocation", which is the right question for
-    # `lower`/`cg` (main loads the whole program, so it is never batched with
-    # anything). emit has no such constraint and batches freely, so main can sit
-    # in a batch with others — and then the batch-wide flag sent main's `.c` to
-    # the path derived from its SUFFIX rather than from its source file, and its
-    # `.c` was never written.
-    emitOneModule(g, mainFileIdx, member, member == mainSuffix, decision)
+  let decisionFile = getNimcacheDir(g.config).string / MergeDecisionFile
+  proc renderBatch(decision: MergeDecision) =
+    if decision.broken:
+      rawMessage(g.config, errGenerated,
+        "per-module emit: missing or unparsable merge decision " & MergeDecisionFile)
+      return
+    let members = if batch.members.len == 0: @[mainSuffix] else: batch.members
+    for member in members:
+      # Per MEMBER, not per batch. `backendBatch.isMain` answers "is this
+      # invocation the main-module invocation", which is the right question for
+      # `lower`/`cg` (main loads the whole program, so it is never batched with
+      # anything). emit has no such constraint and batches freely, so main can sit
+      # in a batch with others — and then the batch-wide flag sent main's `.c` to
+      # the path derived from its SUFFIX rather than from its source file, and its
+      # `.c` was never written.
+      emitOneModule(g, mainFileIdx, member, member == mainSuffix, decision)
+  when hasIcActors:
+    if inIcWorker:
+      let shared = acquireMergeSnapshot(decisionFile)
+      renderBatch(shared[])
+    else:
+      renderBatch(readMergeDecision(decisionFile))
+  else:
+    renderBatch(readMergeDecision(decisionFile))
 
 proc emitOneModule(g: ModuleGraph; mainFileIdx: FileIndex; member: string;
                    isMain: bool; decision: MergeDecision) =

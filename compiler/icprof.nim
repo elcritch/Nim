@@ -18,6 +18,8 @@
 ## stderr when that is unset), because a `--ic:on` build fans out a process per
 ## module per stage and interleaved writes would tear. Use `-d:icNoParallel`
 ## when the numbers need to be attributable to a particular module.
+## Actor workers keep thread-local counters per invocation and send the report
+## back to the coordinator, which writes it to the same destination serially.
 ##
 ## Counts are for volume, timings for cost, and the two answer different
 ## questions: the accessors turned out to be 700k calls worth 8ms, while `info`
@@ -75,8 +77,8 @@ when defined(icBNodeProf):
     ## the dump can report total process wall time and the startup share can be
     ## derived as `Process - Stage`.
 
-  var profStageName* = "frontend"
-  var profTag* = ""
+  var profStageName* {.threadvar.}: string
+  var profTag* {.threadvar.}: string
     ## What this process worked on — the batch members for a backend stage —
     ## so a line in a parallel build's profile can be traced to its modules.
     ## Which invocation this is: the backend stage name, or "frontend" for a
@@ -84,26 +86,29 @@ when defined(icBNodeProf):
     ## a backend stage. Without it the `Process - Stage` startup figure is
     ## meaningless — 204 frontend processes' whole runtime lands in it.
 
-  var profCounts: array[ProfSlot, int]
-  var profMem: array[MemSlot, int]
-  var profNanos: array[TimeSlot, int64]
-  var profMaxNanos: array[TimeSlot, int64]
+  var profCounts {.threadvar.}: array[ProfSlot, int]
+  var profMem {.threadvar.}: array[MemSlot, int]
+  var profNanos {.threadvar.}: array[TimeSlot, int64]
+  var profMaxNanos {.threadvar.}: array[TimeSlot, int64]
     ## The largest SINGLE activation of a `timedOutermost` slot. A sum says
     ## what parallelism could remove; the max says what it cannot — it is the
     ## critical path of the region.
-  var profRuns: array[TimeSlot, int]
+  var profRuns {.threadvar.}: array[TimeSlot, int]
     ## Outermost activations of a `timedOutermost` slot.
-  var profDepth: array[TimeSlot, int]
-  var profStart: array[TimeSlot, MonoTime]
-  var profMemDelta: array[TimeSlot, int64]
+  var profDepth {.threadvar.}: array[TimeSlot, int]
+  var profStart {.threadvar.}: array[TimeSlot, MonoTime]
+  var profMemDelta {.threadvar.}: array[TimeSlot, int64]
     ## Net change of the occupied heap across each timed region, so a slot
     ## says what it ALLOCATED AND KEPT, not only how long it took. Nested the
     ## same way the times are.
-  var profMemStart: array[TimeSlot, int64]
-  var profArmed = false
+  var profMemStart {.threadvar.}: array[TimeSlot, int64]
+  var profArmed {.threadvar.}: bool
+  var profJob {.threadvar.}: bool
+  var jobStart {.threadvar.}: MonoTime
 
-  proc profDump() =
-    var line = "BNODEPROF stage=" & profStageName
+  proc profReport(): string =
+    var line = "BNODEPROF stage=" &
+      (if profStageName.len > 0: profStageName else: "frontend")
     if profTag.len > 0: line.add " tag=" & profTag
     for s in ProfSlot: line.add " " & ($s)[1..^1] & "=" & $profCounts[s]
     for s in TimeSlot: line.add " " & ($s)[1..^1] & "ms=" & $(profNanos[s] div 1_000_000)
@@ -114,7 +119,8 @@ when defined(icBNodeProf):
       if profRuns[s] > 0:
         line.add " " & ($s)[1..^1] & "n=" & $profRuns[s]
         line.add " " & ($s)[1..^1] & "maxus=" & $(profMaxNanos[s] div 1000)
-    line.add " Processms=" & $((getMonoTime() - procStart).inNanoseconds div 1_000_000)
+    let started = if profJob: jobStart else: procStart
+    line.add " Processms=" & $((getMonoTime() - started).inNanoseconds div 1_000_000)
     profMem[mAtExit] = getOccupiedMem() div (1024*1024)
     for s in MemSlot: line.add " " & ($s)[1..^1] & "MB=" & $profMem[s]
     when defined(posix):
@@ -123,6 +129,9 @@ when defined(icBNodeProf):
       var ru = default(Rusage)
       if getrusage(RUSAGE_SELF, addr ru) == 0:
         line.add " PeakRssMB=" & $(ru.ru_maxrss div 1024)
+    result = move(line)
+
+  proc writeIcProfile*(line: string) =
     let f = getEnv("NIM_IC_BNODE_PROF")
     if f.len > 0:
       let h = open(f, fmAppend)
@@ -130,15 +139,46 @@ when defined(icBNodeProf):
       h.close()
     else:
       stderr.writeLine line
+
+  proc profDump() =
+    writeIcProfile(profReport())
     when defined(nimTypeNames) and not defined(gcOrc) and not defined(gcArc):
       # A per-type heap census (refc builds only: `--mm:refc -d:nimTypeNames`),
       # for when the slots above say WHEN memory grew but not WHAT it is.
       dumpNumberOfInstances()
 
+  proc beginIcProfile*() =
+    ## Each actor invocation owns its counters. Worker reports travel with
+    ## diagnostics to the coordinator, without process-global exit hooks.
+    reset(profCounts)
+    reset(profMem)
+    reset(profNanos)
+    reset(profMaxNanos)
+    reset(profRuns)
+    reset(profDepth)
+    reset(profStart)
+    reset(profMemDelta)
+    reset(profMemStart)
+    reset(profStageName)
+    reset(profTag)
+    profArmed = false
+    profJob = true
+    jobStart = getMonoTime()
+
+  proc endIcProfile*(): string =
+    result = ""
+    if profArmed: result = profReport()
+    profArmed = false
+    profJob = false
+
   template armProf() =
     if not profArmed:
       profArmed = true
-      addExitProc profDump
+      if not profJob:
+        # Process mode registers on the main thread. Actor workers call
+        # beginIcProfile first and never touch the global exit-hook list.
+        {.cast(gcsafe).}:
+          addExitProc profDump
 
   template prof*(s: ProfSlot; n = 1) =
     armProf()

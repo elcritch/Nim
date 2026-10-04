@@ -128,6 +128,7 @@ try:
   doAssert jobProfiles.len == 1 and buildProfiles.len == 1
   doAssert jobProfiles[0]["thread"].getInt != mainThread
   doAssert jobProfiles[0]["durationNs"].getBiggestInt >= 0
+  doAssert jobProfiles[0]["queueNs"].getBiggestInt >= 0
   doAssert buildProfiles[0]["executed"].getInt == 1
   doAssert buildProfiles[0]["workers"].getInt == 1 # capped by job count
 
@@ -140,6 +141,21 @@ try:
     IcJob(arguments: @["ordered", "join"], dependencies: @[0, 2])],
     execute, workers = 1, report = proc(s: string) = dispatchOrder.add s) == 0
   doAssert dispatchOrder == @["critical", "short", "middle", "join"]
+
+  # At equal dependency depth, start large backend modules first to keep
+  # their tail from running alone. Dependencies still outrank file size.
+  let large = dir / "large.bif"
+  writeFile(large, repeat('x', 1024))
+  dispatchOrder.setLen 0
+  doAssert runIcJobs(@[
+    IcJob(command: "nim_nifc", inputs: @[left],
+      arguments: @["ordered", "small", "--icBackendStage:lower"]),
+    IcJob(command: "nim_nifc", inputs: @[large],
+      arguments: @["ordered", "large", "--icBackendStage:lower"]),
+    IcJob(arguments: @["ordered", "critical"]),
+    IcJob(arguments: @["ordered", "dependent"], dependencies: @[2])],
+    execute, workers = 1, report = proc(s: string) = dispatchOrder.add s) == 0
+  doAssert dispatchOrder == @["critical", "large", "small", "dependent"]
 
   # The same OS worker must start each compiler invocation with fresh state.
   doAssert runIcJobs(@[IcJob(arguments: @["environment"]),

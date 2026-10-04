@@ -3,7 +3,8 @@
 
 import std/[os, parseopt, strutils, strtabs, monotimes, times, json]
 import ../[options, commands, cmdlinehelper, pathutils, idents, modulegraphs,
-  ast, ast2nif, icbif, icconfig, extccomp, condsyms, cgendata, vmdef, debugutils]
+  ast, ast2nif, icbif, icconfig, extccomp, condsyms, cgendata, vmdef, debugutils,
+  icprof]
 import jobtypes, workercontext, sharedcounters
 
 proc processArgs(pass: TCmdLinePass; args: seq[string]; conf: ConfigRef) =
@@ -34,6 +35,7 @@ proc compileIcJob*(args: seq[string];
   var dispatched = false
   var reportProfile = false
   var stage = "frontend"
+  when defined(icBNodeProf): beginIcProfile()
   beginIcWorker()
   clearIcDecodeState()
   registerNifAstTags()
@@ -96,6 +98,7 @@ proc compileIcJob*(args: seq[string];
     releaseIcAst()
     clearIcDecodeState()
     endIcWorker()
+    when defined(icBNodeProf): result.profile = endIcProfile()
     if reportProfile:
       output.add "ICCOMPILE " & $(%*{"thread": getThreadId(), "stage": stage,
         "setupNs": (workStarted - started).inNanoseconds,

@@ -38,6 +38,7 @@
 ## the accessors work on an eager pool as they do on any other.
 
 import std / [assertions, hashes, tables, varints, times]
+from std/strutils import rfind
 from std/os import FileInfo, getFileInfo, absolutePath
 import ic/workercontext
 import "../dist/nimony/src/lib" / [bitabs, lineinfos, vfs]
@@ -62,6 +63,8 @@ type
   BifIndex* = ref object
     entries*: seq[IndexEntry]
     bySym*: seq[int32]  # symbol id -> last declaration in entries
+    byBasename: Table[string, seq[SymId]]
+    basenamesReady: bool
 
   IndexedBif* = object
     buf*: TokenBuf
@@ -107,7 +110,8 @@ var lazyPools {.threadvar.}: Table[Pool, LazyPool]
   ## address cannot be reused for another one.
 var jobImages {.threadvar.}: seq[BifImage]
 var dependencyCache {.threadvar.}: Table[string, CachedImage]
-var cacheBudget, cacheBytes {.threadvar.}: int
+var cacheBudget {.threadvar.}: int
+var cacheBytes {.threadvar.}: int
 var cacheClock {.threadvar.}: uint64
 var cacheStats {.threadvar.}: DependencyCacheStats
 var cacheCleanupRegistered {.threadvar.}: bool
@@ -288,6 +292,23 @@ proc findSym*(p: Pool; name: string): SymId =
   else:
     result = getKeyId(p.syms, name)
 
+proc symbolsWithBasename*(index: BifIndex; p: Pool; name: string): seq[SymId] =
+  ## Compiler-proc lookup knows the basename but not the overload number.
+  ## Build this immutable name index once per cached image instead of scanning
+  ## every declaration for every runtime helper in every backend job. Keep
+  ## declaration order and the final definition of forward-declared symbols.
+  if not index.basenamesReady:
+    for i, entry in index.entries:
+      if index.bySym[entry.sym.int] != int32(i): continue
+      let full = poolSym(p, entry.sym)
+      let moduleDot = full.rfind('.')
+      if moduleDot <= 0: continue
+      let disambDot = full.rfind('.', 0, moduleDot - 1)
+      if disambDot > 0:
+        index.byBasename.mgetOrPut(full[0 ..< disambDot], @[]).add entry.sym
+    index.basenamesReady = true
+  result = index.byBasename.getOrDefault(name)
+
 # ── loading ───────────────────────────────────────────────────────────────
 # Mirrors `bif.load` byte for byte — the header, the pad before the token
 # block, the pools in id order, the index — so the two must agree on the
@@ -386,7 +407,8 @@ proc readImage(filename: string): BifImage =
     # reverse hash tables and indexes. Active job leases can exceed the cache
     # budget; only data retained between jobs is subject to this bound.
     result.weight = result.blob.size * 2 +
-      (nStrings + nSyms + nFiles + nTags) * 64 + nIndex * sizeof(IndexEntry) +
+      (nStrings + nSyms + nFiles + nTags) * 64 +
+      nIndex * (sizeof(IndexEntry) + 96) +
       result.index.bySym.len * sizeof(int32)
 
 proc sameVersion(a, b: FileInfo): bool =

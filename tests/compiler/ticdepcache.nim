@@ -10,6 +10,7 @@ import ../../compiler/icbif
 import ../../compiler/ic/workercontext
 
 var opened, closed: Atomic[int]
+var budgetPhase: Atomic[int]
 
 proc countedClose(blob: var VfsBlob) =
   let backing = cast[ptr VfsBlob](blob.cookie)
@@ -40,6 +41,7 @@ proc valueCursor(module: var IndexedBif): Cursor =
   doAssert module.index.bySym[symbol.int] == 1
   doAssert icbif.findSym(module.buf.pool, "value.0.cache") == symbol
   doAssert icbif.poolSym(module.buf.pool, symbol) == "value.0.cache"
+  doAssert symbolsWithBasename(module.index, module.buf.pool, "value") == @[symbol]
   result = module.buf.cursorAt(module.index.entries[1].pos)
   inc result # sd
   inc result # symbol
@@ -64,6 +66,33 @@ proc cacheWorker(path: string) {.thread.} =
     let stats = dependencyCacheStats()
     doAssert stats.misses == 1 and stats.hits == 19
     # The thread destruction handler must release the final cached mapping.
+
+proc budgetWorker(args: tuple[path: string, cached: bool]) {.thread.} =
+  template awaitPhase(phase: int) =
+    let deadline = epochTime() + 5
+    while budgetPhase.load() != phase and epochTime() < deadline: sleep(1)
+    doAssert budgetPhase.load() == phase
+  {.cast(gcsafe).}:
+    if args.cached:
+      setDependencyCacheBudget(DefaultDependencyCacheBytes)
+      beginIcWorker()
+      doAssert readValue(args.path) == "new"
+      finishJob()
+      budgetPhase.store(1)
+      awaitPhase(2)
+      beginIcWorker()
+      doAssert readValue(args.path) == "new"
+      finishJob()
+      doAssert dependencyCacheStats().hits == 1,
+        "another worker's zero budget must not disable this worker's cache"
+    else:
+      awaitPhase(1)
+      setDependencyCacheBudget(0)
+      beginIcWorker()
+      doAssert readValue(args.path) == "new"
+      finishJob()
+      doAssert dependencyCacheStats().entries == 0
+      budgetPhase.store(2)
 
 let directory = createTempDir("nim-ic-depcache-", "")
 let previousOpen = openMmapRelay
@@ -139,10 +168,47 @@ try:
   doAssert dependencyCacheStats().entries == 0
   doAssert opened.load() == closed.load()
 
+  # Runtime helper lookup must preserve overload/definition order, cache
+  # misses as well as hits, and discard its name index on file replacement.
+  let helpers = directory / "helpers.bif"
+  proc writeHelpers(names: openArray[string]) =
+    var buffer = createTokenBuf()
+    buffer.buildTree buffer.tags.registerTag("stmts"):
+      for name in names:
+        buffer.buildTree buffer.tags.registerTag("sd"):
+          buffer.addSymDef(name)
+          buffer.addDotToken
+    bif.store(buffer, helpers)
+  proc helperNames(module: var IndexedBif; name: string): seq[string] =
+    for id in symbolsWithBasename(module.index, module.buf.pool, name):
+      result.add icbif.poolSym(module.buf.pool, id)
+  writeHelpers(["helper.3.helpers", "helper.1.helpers", "helper.3.helpers",
+                "helperExtra.0.helpers", "with.dot.7.helpers"])
+  beginIcWorker()
+  block:
+    var module = loadIndexed(helpers)
+    doAssert helperNames(module, "helper") == @["helper.1.helpers", "helper.3.helpers"]
+    doAssert helperNames(module, "missing").len == 0
+    doAssert helperNames(module, "with.dot") == @["with.dot.7.helpers"]
+    writeHelpers(["helper.9.helpers", "missing.0.helpers"])
+    var replaced = loadIndexed(helpers)
+    doAssert helperNames(replaced, "helper") == @["helper.9.helpers"]
+    doAssert helperNames(replaced, "missing") == @["missing.0.helpers"]
+    doAssert helperNames(module, "helper") == @["helper.1.helpers", "helper.3.helpers"]
+  finishJob()
+  clearDependencyCache()
+  doAssert opened.load() == closed.load()
+
   var workers: array[2, Thread[string]]
   for worker in workers.mitems: createThread(worker, cacheWorker, path)
   joinThreads(workers)
   doAssert opened.load() == closed.load(), "worker exit must unmap cached files"
+
+  var budgets: array[2, Thread[tuple[path: string, cached: bool]]]
+  createThread(budgets[0], budgetWorker, (path, true))
+  createThread(budgets[1], budgetWorker, (path, false))
+  joinThreads(budgets)
+  doAssert opened.load() == closed.load()
 finally:
   clearLazyPools()
   clearDependencyCache()

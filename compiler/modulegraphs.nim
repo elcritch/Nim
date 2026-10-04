@@ -1230,7 +1230,15 @@ when not defined(nimKochBootstrap):
     # loading finishes so no var argument points into a reallocated sequence.
     var interf = initStrTable()
     var interfHidden = initStrTable()
-    result = loadNifModule(ast.program, fileIdx, interf, interfHidden, flags, moduleResolver(g))
+    # Backend symbols already carry their resolved NIF names. Only system's
+    # interface is consulted by name (getSysSym/getSysMagic); constructing
+    # every dependency's frontend lookup table repeatedly creates unused
+    # stubs. Runtime helpers resolve directly through the declaration index.
+    let loadFlags =
+      if g.config.cmd == cmdNifC and fileIdx != g.config.m.systemFileIdx:
+        flags + {SkipInterfaceTables}
+      else: flags
+    result = loadNifModule(ast.program, fileIdx, interf, interfHidden, loadFlags, moduleResolver(g))
     g.ifaces[fileIdx.int].interf = move interf
     g.ifaces[fileIdx.int].interfHidden = move interfHidden
     # The full interface stays lazy until `ensureHiddenIface` is asked for it.

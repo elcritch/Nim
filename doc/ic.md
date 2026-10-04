@@ -42,9 +42,10 @@ and schedules its rules on Sigils actors:
    semmed NIFs, generates C, compiles and links.
 
 The coordinator orders steps by their input/output files. Among ready jobs it
-starts the longest remaining dependency chains first. A completion signal
-releases dependent actors immediately; there is no barrier between unrelated
-modules at the same graph depth. Timestamps are checked after dependencies
+starts the longest remaining dependency chains first. At the same depth,
+larger lowering/codegen inputs take priority so small jobs can fill their tail.
+A completion signal releases dependent actors immediately; there is no barrier
+between unrelated modules at the same graph depth. Timestamps are checked after dependencies
 complete, so an unchanged interface cookie still stops a rebuild cascade.
 
 Sigils module workers
@@ -56,6 +57,21 @@ Each scheduled module job is an ``AgentActor`` moved into a
 return its exit status and buffered compiler diagnostics. The coordinator alone
 owns dependency counts. Failed prerequisites block their dependents while
 independent jobs finish; the pool is joined before IC returns.
+
+An actor represents one module/stage invocation, not a permanently assigned OS
+thread. An idle worker leases the next ready actor exclusively. Each job gets
+one request and one reply; inputs, outputs and dependency lists stay with the
+coordinator. Completed actors are released immediately. A module's later stages
+can run on another worker, so the dependency cache belongs to the OS worker,
+not the module actor.
+
+The preliminary ``nifler deps`` scans and graph traversal still run serially
+in the driver. These extract imports before the pool's full parsing and semantic
+jobs can be scheduled. The scans launch directly through ``startProcess``,
+allowing POSIX spawn without an intermediate shell, including between rounds
+when the compiler retains large caches. Newly discovered imports enter the next
+round; graph expansion does not yet insert jobs into a running round. Semantic
+work inside one module also remains sequential.
 
 A successful job that stops to discover an import has no module output yet.
 Its dependents wait for the next discovery round while independent branches
@@ -74,7 +90,9 @@ canonical-type caches, AST decoder state and macro-counter lock handles are
 thread-local and cleared between jobs. ASTs are never sent between actors.
 Symbol/type cycles and VM/codegen backreferences are explicitly released at
 job completion. Each worker retains a bounded cache of dependency BIF mappings,
-name tables, lazy name lookup indexes and declaration indexes. Later jobs on
+name tables, lazy name lookup indexes and declaration indexes. Runtime helper
+lookup also retains an index by basename, including overloads and misses,
+instead of scanning every declaration for each lookup. Later jobs on
 that worker reuse this data while constructing fresh ASTs, symbol/type IDs,
 VMs and module graphs. Cached buffers never cross OS threads.
 
@@ -96,6 +114,22 @@ own OS worker. Sigils transfers actor/message ownership, gives an actor an
 exclusive worker lease, and uses synchronized shared delivery endpoints.
 ``--mm:atomicArc`` remains supported for compiler builds.
 
+The ownership/liveness decision is an exception to worker-local storage: the
+merge actor publishes its finished value tables through an atomic ``ConstPtr``.
+Every rendering actor borrows that same immutable snapshot instead of parsing
+and rebuilding the tables. A file-version check prevents stale reuse; a missing
+snapshot is loaded once under a lock. Readers retain their leases across
+replacement, and the pool releases the cached snapshot after joining workers.
+
+More declaration data could use this model, but the current decoded AST mixes
+stable facts with mutable state. Lazy loading fills symbol/type objects;
+resolved IDs depend on the job's graph; type layout, transformed bodies, VM
+slots and codegen locations change during compilation. The BIF's token bytes
+and declaration facts are stable, but its lazy name pools and cursor ownership
+are also mutable. Sharing those safely requires frozen storage with stable
+identities plus job-local decoding and annotation tables. Atomic reference
+counting alone would not make the current AST objects safe to share.
+
 Compile-time environment changes are local to a job, including the environment
 passed to ``staticExec``. An import cycle remains one semantic job, since its
 members must resolve each other in the same graph.
@@ -115,20 +149,38 @@ bound, or ``-d:icNoParallel`` for one worker. The default is the available CPU
 count. ``-d:icProcesses`` selects the previous ``nifmake`` process runner for
 comparison and troubleshooting. Compilers built without ARC/atomic ARC and
 threads, or
-with the optional native FFI or IC profiling instrumentation, also use the
+with the optional native FFI or process-only IC diagnostics, also use the
 process runner. Native FFI can mutate process-global library state, and those
 profilers use process-wide counters and exit hooks.
 
 ``-d:icProfile`` works with actors and prints JSON records through the
-coordinator: ``ICJOB`` gives the worker, output, start time and execution time;
+coordinator: ``ICJOB`` gives the worker, output, start time, request delivery
+time (``queueNs``) and execution time;
 ``ICCOMPILE`` separates setup, compiler work and cleanup by stage; ``ICBUILD``
 reports the actual pool size, executed/skipped/deferred/blocked counts and
 aggregate busy time. Times are in nanoseconds, with job starts relative to that
-build round. This measures actor occupancy, not CPU utilization: the ``link``
+build round. Request delivery starts when the coordinator creates the actor;
+it excludes time a ready job waits for an available pool slot. This measures
+actor occupancy, not CPU utilization: the ``link``
 actor also drives C compiler subprocesses in parallel through
 ``--parallelBuild:N``. The backend's lowering barrier ensures code generation
 sees complete lowered dependencies; main-module codegen, ownership merging and
 linking have additional whole-program dependencies.
+
+Backend workers build frontend name lookup tables only for ``system``, whose
+builtins are still looked up by name. Other modules' symbols are already
+resolved in their NIF artifacts. After merging ownership and liveness, actors
+render C in a few batches balanced by module image size, bounded by the pool
+size and averaging at least 16 modules per batch. Rendering shares no AST and
+preserves the same content-stable C outputs. The process runner retains one
+render invocation to avoid repeated process startup.
+
+For detailed compiler phase counters, build the compiler with
+``-d:icBNodeProf``. Actor counters are thread-local and reset for each job;
+the coordinator writes ``BNODEPROF`` records to ``NIM_IC_BNODE_PROF`` when set,
+or to stderr. ``Processms`` measures the job lifetime in actor mode, and
+``PeakRssMB`` is the peak for the entire compiler process. Instrumented builds
+are for diagnosis; use a normal release compiler for speed comparisons.
 
 For example, use an empty cache directory to profile a clean compiler build:
 
@@ -159,6 +211,60 @@ A 48-module workload's median clean build improved from 4.39 to 2.69 seconds
 about 200 ms (five runs each). No-op artifact timestamps were unchanged;
 the actor and process runners produced identical primary artifacts for both
 this workload and the compiler self-build.
+
+A second profiling pass on the same machine, before the dependency-scan launch
+fix, reduced the clean actor compiler build from 34.58 to 32.58 seconds
+(two-run means on the same source tree for both compilers,
+with the run order reversed for the second comparison). The updated process
+runner averaged 33.00 seconds. Actor trials ranged from 32.22 to 32.93 seconds,
+so the small lead over processes remains within the observed variation.
+Indexed runtime-helper lookup, avoiding unused backend interfaces, starting
+large backend jobs earlier, and parallel rendering with shared merge decisions
+account for this change. The Nim backend excluding C compilation/linking fell
+from 6.49 to 4.36 seconds. The pool remains at 16 workers and the cache at
+512 MiB per worker. A 32-worker trial took 33.76 seconds and raised peak compiler
+RSS from about 4.1 to 5.8 GiB; dependency cache misses rose from about 8,200 to
+13,500 as more workers loaded their own images.
+
+Across 1,331 actor jobs, request delivery had a median of about 20 microseconds
+and a 95th percentile below 50 microseconds. Median job execution was about
+31 milliseconds. This does not suggest a signal-delivery bottleneck; reducing
+repeated decoding and shortening dependency chains remain the larger targets.
+
+On the 48-module workload, median clean time fell from 2.71 to 2.64 seconds
+(three runs), and a leaf body edit from 199 to 182 ms (five runs). No-op builds
+remained about 20–21 ms with unchanged artifact timestamps. The compiler
+self-build's 1,016 primary artifacts were identical between the updated actor
+and process runners; all 386 generated C files also matched the previous actor
+compiler.
+The small workload's 267 primary artifacts matched in all three modes.
+Explicit lowering/codegen batches of 2, 4 and 8 reduced aggregate CPU work but
+only saved about half a second in the backend; these retain their existing
+``-d:icBatchSize:N`` opt-in rather than changing incremental rebuild granularity.
+
+Kosmo (``src/merenda/kosmo/kosmo.nim`` in the Merenda checkout) exercises a
+larger graph: 1,004 semantic module artifacts and 17 frontend rounds. With its
+normal release/ARC/thread configuration, including native debug information,
+16 workers and a 512 MiB cache, clean actors averaged 153.32 seconds and
+processes 154.61 seconds over two runs each. Increasing the actor cache to
+1 GiB reduced a trial to 146.83 seconds and cut evictions from about 120,000
+to 26,000. After also launching dependency scans directly, a clean actor trial
+took 137.74 seconds versus 153.46 seconds for the updated process runner.
+These last figures are single trials, with peak actor compiler RSS of 11.0 GiB.
+Use ``-d:icDepCacheMiB:1024`` for this larger retention budget; the default
+remains 512 MiB.
+
+The direct-launch comparison reduced actor driver/configuration/graph time
+from 10.69 to 3.51 seconds, while scheduled frontend work remained about
+58 seconds. The updated frontend totaled 61.33 seconds for actors and
+79.29 seconds for processes. More workers alone cannot remove the remaining
+module dependency chains or parallelize semantic work inside a module.
+All 1,188 generated C files matched in the cold-build comparisons; after the
+actor warm rebuild pruned five unused platform files, the remaining 1,183
+still matched. Every resulting executable passed ``--help``. After one warm rebuild, the
+actor no-op took 0.45 seconds without changing primary artifact timestamps.
+The process runner still redid some frontend/backend work on unchanged sources
+and took about 9.1 seconds, so that is not a pure no-op comparison.
 
 ``koch boot`` fetches pinned Sigils, threading, variant and stack_strings sources
 under ``dist/sigils``. Sigils currently requires full system exports and classic

@@ -4115,18 +4115,12 @@ proc tryResolveCompilerProc*(c: var DecodeContext; name: string; moduleFileIdx: 
   result = nil
   let suffix = moduleSuffix(c.infos.config, moduleFileIdx)
   let module = moduleId(c, suffix)
-  let prefix = name & "."
-  var candidates: seq[int] = @[]
   let m = c.mods[module]
-  for key, _ in m.index.pairs(m.buf):
-    if key.len > prefix.len and key.startsWith(prefix):
-      let sn = parseSymName(key)
-      if sn.name == name:
-        candidates.add sn.count
+  let candidates = symbolsWithBasename(m.index, m.buf.pool, name)
   # the loads below can grow `c.mods` (symbols reference other modules), so
   # resolve only after the index iteration is done
-  for count in candidates:
-    let sym = resolveSym(c, name & "." & $count & "." & suffix, true)
+  for id in candidates:
+    let sym = resolveSym(c, poolSym(m.buf.pool, id), true)
     if sym != nil:
       loadSym(c, sym)
       if sfCompilerProc in sym.flagsImpl:

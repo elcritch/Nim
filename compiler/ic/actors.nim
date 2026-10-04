@@ -11,7 +11,9 @@ import sigils
 import sigils/threads
 import "../../dist/nimony/src/lib" / [nifcore, nifcoreparse]
 import jobtypes
+import mergecache
 export jobtypes
+when defined(icBNodeProf): import ../icprof
 
 type
   IcJob* = object
@@ -138,19 +140,34 @@ proc needsRebuild*(job: IcJob): bool =
     if fileExists(path) and getLastModificationTime(path) > freshest:
       return true
 
+proc backendWeight(job: IcJob): int64 =
+  ## Lowering/codegen jobs at the same dependency depth vary greatly in cost.
+  ## Their first input is their own module image, a cheap estimate that starts
+  ## the large modules early enough for smaller jobs to fill the remaining tail.
+  ## Other commands retain source order, including frontend discovery.
+  if job.command == "nim_nifc" and job.inputs.len > 0 and
+      ("--icBackendStage:lower" in job.arguments or
+       "--icBackendStage:cg" in job.arguments):
+    try: return getFileSize(job.inputs[0])
+    except OSError: discard
+  result = 0
+
 type
   IcWorkerPool* = ref object
     pool: SigilThreadPoolPtr
   ModuleAgent = ref object of AgentActor
-    job: IcJob
+    arguments: seq[string]
+    command: string
     id: int
     execute: IcExecutor
     profile: bool
+    submitted: MonoTime
   Request = ref object of Agent
   Completion = object
     id: int
     outcome: IcJobResult
     started, finished: MonoTime
+    queueNs: int64
     thread: int
   Coordinator = ref object of Agent
     completed: Deque[Completion]
@@ -162,15 +179,16 @@ proc process(self: ModuleAgent) {.slot.} =
   let started = if self.profile: getMonoTime() else: default(MonoTime)
   var outcome = default(IcJobResult)
   try:
-    outcome = self.execute(self.job.arguments)
+    outcome = self.execute(self.arguments)
   except CatchableError as e:
     outcome = IcJobResult(exitCode: 1,
-      output: "IC " & self.job.command & ": " & e.msg & "\n" & e.getStackTrace())
+      output: "IC " & self.command & ": " & e.msg & "\n" & e.getStackTrace())
   except Defect as e:
     outcome = IcJobResult(exitCode: 1, output: e.msg & "\n" & e.getStackTrace())
   let finished = if self.profile: getMonoTime() else: default(MonoTime)
   emit self.finished(Completion(id: self.id, outcome: move(outcome),
-    started: started, finished: finished, thread: getThreadId()))
+    started: started, finished: finished, thread: getThreadId(),
+    queueNs: (if self.profile: (started - self.submitted).inNanoseconds else: 0)))
 
 proc record(self: Coordinator; value: Completion) {.slot.} =
   self.completed.addLast value
@@ -188,6 +206,7 @@ proc close*(workers: IcWorkerPool) =
   workers.pool = nil
   pool.stop()
   pool.join() # also runs dependency-cache cleanup on every OS worker
+  clearMergeSnapshot()
   # The pinned Sigils pool is manually allocated and has no dispose API.
   # No proxy or worker may retain it past this point.
   reset(pool[].references)
@@ -236,14 +255,15 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
 
   # Start the longest remaining dependency chains first. A FIFO lets a large
   # wave of unrelated parser jobs delay system/sem jobs that unlock the tree.
-  # Equal priorities keep source order, so a single worker is deterministic.
+  # Equal priorities prefer larger backend modules, then source order.
   var rank = newSeq[int](jobs.len)
   for i in countdown(order.high, 0):
     let id = order[i]
     for dep in jobs[id].dependencies:
       rank[dep] = max(rank[dep], rank[id] + 1)
-  var ready = initHeapQueue[tuple[priority, id: int]]()
-  for id in roots: ready.push((-rank[id], id))
+  var ready = initHeapQueue[tuple[priority: int, weight: int64, id: int]]()
+  template enqueue(id: int) = ready.push((-rank[id], -backendWeight(jobs[id]), id))
+  for id in roots: enqueue(id)
 
   startLocalThreadDefault()
   let home = getCurrentSigilThread()
@@ -267,7 +287,7 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
         for next in dependents[id]:
           blocked[next] = blocked[next] or failed
           dec pending[next]
-          if pending[next] == 0: ready.push((-rank[next], next))
+          if pending[next] == 0: enqueue(next)
 
       while remaining > 0:
         while ready.len > 0 and active < pool[].workerCount:
@@ -279,8 +299,9 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
             inc skipped
             complete(id, false)
           else:
-            var actor = ModuleAgent(job: jobs[id], id: id, execute: execute,
-                                    profile: profile)
+            var actor = ModuleAgent(arguments: jobs[id].arguments,
+              command: jobs[id].command, id: id, execute: execute, profile: profile,
+              submitted: (if profile: getMonoTime() else: default(MonoTime)))
             proxies[id] = actor.moveToThread(pool)
             requests[id] = Request()
             connectThreaded(requests[id], requested, proxies[id], process)
@@ -298,6 +319,9 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
               onComplete(jobs[completion.id], completion.outcome.exitCode)
             if completion.outcome.output.len > 0 and report != nil:
               report(completion.outcome.output)
+            when defined(icBNodeProf):
+              if completion.outcome.profile.len > 0:
+                writeIcProfile(completion.outcome.profile)
             if profile and report != nil:
               let job = jobs[completion.id]
               let duration = (completion.finished - completion.started).inNanoseconds
@@ -306,6 +330,7 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
                 "thread": completion.thread, "command": job.command,
                 "output": (if job.outputs.len > 0: job.outputs[0] else: ""),
                 "startNs": (completion.started - started).inNanoseconds,
+                "queueNs": completion.queueNs,
                 "durationNs": duration, "exitCode": completion.outcome.exitCode}))
             let failed = completion.outcome.exitCode != 0
             if failed: result = completion.outcome.exitCode
@@ -322,6 +347,11 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
                   break
               if incomplete: inc deferred
             complete(completion.id, failed or incomplete)
+            # The one request/reply exchange is done. Sigils retains a running
+            # actor's lease until its slot returns, including when the proxy
+            # closes just after its completion signal reaches us.
+            reset(requests[completion.id])
+            reset(proxies[completion.id])
       if profile and report != nil:
         report("ICBUILD " & $(%*{"workers": pool[].workerCount,
           "executed": executed, "skipped": skipped, "peakActive": peakActive,

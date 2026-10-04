@@ -168,9 +168,13 @@ proc runNifler(c: DepContext; nimFile: string): bool =
   # Create output directory if needed
   createDir(parentDir(depsPath))
 
-  # Run nifler deps
-  let cmd = quoteShell(c.nifler) & " deps " & quoteShell(nimFile) & " " & quoteShell(depsPath)
-  let exitCode = execShellCmd(cmd)
+  # This pre-scan also runs between discovery rounds, when the actor process
+  # retains large dependency caches. Launch directly so POSIX can use spawn
+  # instead of forking that address space through an intermediate shell.
+  let process = startProcess(c.nifler, args = ["deps", nimFile, depsPath],
+    options = {poUsePath, poParentStreams})
+  defer: process.close()
+  let exitCode = process.waitForExit()
   result = exitCode == 0
   if result:
     # The build graph's `nifler parse --deps` rule outputs BOTH the parsed
@@ -1506,10 +1510,10 @@ proc backendBatchSize(conf: ConfigRef; liveCount: int): int =
   result = max(1, result)
 
 proc emitBatches(c: DepContext; live: seq[bool];
-                 shared: seq[seq[int]]): seq[seq[int]] =
-  ## emit's partition. Unlike `lower`/`cg` it takes the MAIN module too and, by
-  ## default, puts every live node in one batch: emit owns no decisions, so
-  ## there is nothing for a grouping to get wrong (see the rule that uses this).
+                 shared: seq[seq[int]]; workers: int): seq[seq[int]] =
+  ## emit's partition. Unlike `lower`/`cg` it takes the MAIN module too.
+  ## Actors use coarse batches; process mode uses one invocation. Rendering
+  ## owns no cross-module decisions, so this partition cannot change the code.
   ## An explicit `-d:icBatchSize` reuses the shared partition instead, plus main,
   ## so the fan-out remains available to compare against.
   if isDefined(c.config, "icBatchSize"):
@@ -1519,7 +1523,28 @@ proc emitBatches(c: DepContext; live: seq[bool];
     var all: seq[int] = @[]
     for i in 0 ..< c.nodes.len:
       if live[i]: all.add i
-    result = if all.len > 0: @[all] else: @[]
+    # Rendering owns no AST or cross-module decisions. A few coarse actor
+    # jobs overlap this formerly serial stage without paying for a process
+    # and a full merge-decision read per module. Keep at least 16 modules per
+    # job on average; small programs and process mode retain one batch.
+    let count = min(workers, max(1, all.len div 16))
+    if count <= 1:
+      return if all.len > 0: @[all] else: @[]
+    var sizes = newSeq[int64](c.nodes.len)
+    for i in all:
+      try: sizes[i] = getFileSize(c.semmedFile(c.nodes[i].files[0]))
+      except OSError: discard
+    all.sort(proc(a, b: int): int =
+      result = cmp(sizes[b], sizes[a])
+      if result == 0: result = cmp(a, b))
+    result = newSeq[seq[int]](count)
+    var weights = newSeq[int64](count)
+    for i in all:
+      var lightest = 0
+      for j in 1..<count:
+        if weights[j] < weights[lightest]: lightest = j
+      result[lightest].add i
+      weights[lightest] += max(1'i64, sizes[i])
 
 proc backendBatches(c: DepContext; live: seq[bool]): seq[seq[int]] =
   ## Partition the live non-main nodes into batches of node indices. The main
@@ -1546,7 +1571,8 @@ proc backendBatches(c: DepContext; live: seq[bool]): seq[seq[int]] =
     result.add batch
     i = j
 
-proc generateBackendBuildFile(c: DepContext; forwardedArgs: seq[string]): string =
+proc generateBackendBuildFile(c: DepContext; forwardedArgs: seq[string];
+                              emitWorkers = 1): string =
   ## Per-module backend build file. One `nim_nifc` command template (the actual
   ## stage/module switches ride in each rule's `(args …)`), then the stages of
   ## the per-module backend as separate nifmake rules:
@@ -1834,7 +1860,7 @@ proc generateBackendBuildFile(c: DepContext; forwardedArgs: seq[string]): string
 
   # emit: render each module's `.c` from its `.c.nif` + the merge decision.
   #
-  # ONE rule for everything, main included. emit is a pure function of a
+  # emit is a pure function of a
   # `.c.nif` and the merge decision — `renderCFromArtifact` filters text and
   # touches no AST, and the stage loads no module graph at all — so batching it
   # cannot change what it produces, and measurement agrees: 67 processes and one
@@ -1843,8 +1869,10 @@ proc generateBackendBuildFile(c: DepContext; forwardedArgs: seq[string]): string
   # fire-all: every `emit` re-fires whenever `merge` rewrites the decision, which
   # is every edit that reaches the backend. That now costs one process start.
   #
-  # `-d:icBatchSize:N` still splits it, for A/B-ing against the fan-out.
-  for batch in emitBatches(c, live, batches):
+  # Actors instead use a few balanced batches to overlap rendering. The
+  # process runner retains one invocation, and `-d:icBatchSize:N` overrides
+  # either policy for comparison.
+  for batch in emitBatches(c, live, batches, emitWorkers):
     b.addTree "do"
     b.addIdent "nim_nifc"
     b.withTree "args":
@@ -2207,7 +2235,8 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false; execute: IcExecutor = nil
     # An IDE query (`frontendOnly`) stops after Phase 1: the `.s.bif` it scans
     # are all produced by the frontend; codegen + link would be wasted work.
     if frontendOk and not frontendOnly:
-      let backendFile = generateBackendBuildFile(c, forwardedArgs)
+      let backendFile = generateBackendBuildFile(c, forwardedArgs,
+        emitWorkers = (if useActors: workers else: 1))
       rawMessage(conf, hintSuccess, "generated: " & backendFile)
       let exitCode = runBuild(backendFile)
       if exitCode != 0:
