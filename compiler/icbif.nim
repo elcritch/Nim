@@ -37,7 +37,8 @@
 ## `-d:icEagerPools` materializes every name during `load`, for an A/B;
 ## the accessors work on an eager pool as they do on any other.
 
-import std / [assertions, hashes, tables, varints]
+import std / [assertions, hashes, tables, varints, times]
+from std/os import FileInfo, getFileInfo, absolutePath
 import ic/workercontext
 import "../dist/nimony/src/lib" / [bitabs, lineinfos, vfs]
 import "../dist/nimony/src/lib/nifcore" except symName, strVal, poolSym, poolStr, lineInfoFile
@@ -58,19 +59,96 @@ type
   LazyPool = ref object
     strings, syms, filenames: LazyNames
 
+  BifIndex* = ref object
+    entries*: seq[IndexEntry]
+    bySym*: seq[int32]  # symbol id -> last declaration in entries
+
+  IndexedBif* = object
+    buf*: TokenBuf
+    index*: BifIndex
+
+  BifImageObj = object
+    blob: VfsBlob
+    tokens: pointer
+    tokenCount: int
+    pool: Pool
+    tags: TagPool
+    names: LazyPool
+    index: BifIndex
+    weight: int
+  BifImage = ref BifImageObj
+
+  CachedImage = object
+    image: BifImage
+    stamp: FileInfo
+    used: uint64
+
+  DependencyCacheStats* = object
+    hits*, misses*, evictions*, entries*, retainedBytes*: int
+
+{.push warning[BareExcept]: off.}
+proc `=destroy`(image: var BifImageObj) =
+  # Job leases outlive every AST/cursor referring into this mapping. Cache
+  # eviction drops only the cache's lease; a running job can keep reading it.
+  reset(image.pool)
+  reset(image.tags)
+  reset(image.names)
+  reset(image.index)
+  # VFS cleanup callbacks have no exception constraint. Finalization must
+  # release the remaining images even if a custom backend's close fails.
+  try: closeBlob(image.blob)
+  except Exception: discard
+{.pop.}
+
 proc hash(p: Pool): Hash = hash(cast[pointer](p))
 
 var lazyPools {.threadvar.}: Table[Pool, LazyPool]
   ## The pools `load` filled, by identity. The table holds the pool, so its
   ## address cannot be reused for another one.
-var jobMappings {.threadvar.}: seq[VfsBlob]
+var jobImages {.threadvar.}: seq[BifImage]
+var dependencyCache {.threadvar.}: Table[string, CachedImage]
+var cacheBudget, cacheBytes {.threadvar.}: int
+var cacheClock {.threadvar.}: uint64
+var cacheStats {.threadvar.}: DependencyCacheStats
+var cacheCleanupRegistered {.threadvar.}: bool
+
+const DefaultDependencyCacheBytes* = 128 * 1024 * 1024
 
 proc lazyOf(p: Pool): LazyPool {.inline.} = lazyPools.getOrDefault(p)
 
 proc clearLazyPools*() =
+  ## Release this job's leases after its ASTs and cursors have gone away.
+  ## Cached images retain their names and indexes for the next job on this
+  ## worker. No pool or CursorOwner is shared between OS threads.
   reset(lazyPools)
-  for mapping in mitems(jobMappings): closeBlob(mapping)
-  reset(jobMappings)
+  reset(jobImages)
+
+proc clearDependencyCache*() =
+  reset(dependencyCache)
+  cacheBytes = 0
+
+proc dependencyCacheStats*(): DependencyCacheStats =
+  result = cacheStats
+  result.entries = dependencyCache.len
+  result.retainedBytes = cacheBytes
+
+proc setDependencyCacheBudget*(bytes: int) =
+  let budget = max(0, bytes)
+  if budget != cacheBudget:
+    clearDependencyCache()
+    cacheBudget = budget
+  when compileOption("threads"):
+    if budget > 0 and not cacheCleanupRegistered:
+      cacheCleanupRegistered = true
+      onThreadDestruction(proc() {.gcsafe, raises: [].} =
+        # VFS relays predate effect annotations. The disk relay's close
+        # operation already handles OS errors; a custom relay may raise.
+        {.cast(gcsafe).}:
+          try:
+            clearLazyPools()
+            clearDependencyCache()
+          except CatchableError:
+            discard)
 
 # ── names in the mapping ──────────────────────────────────────────────────
 
@@ -253,16 +331,18 @@ proc rNames[Id, T](r: var Reader; t: var BiTable[Id, T]; n: int; empty: T): Lazy
     r.pos += len
     discard t.addOrdered(empty)
 
-proc load*(filename: string): BifModule =
-  ## `bif.load`, with the string, symbol and filename pools left in the
-  ## mapping. Tags are few and always read, and stay eager.
+proc readImage(filename: string): BifImage =
+  ## Decode file layout and indexes once. Lazy name materialization is safe
+  ## to retain because an image is only ever used by its owning OS worker.
+  result = BifImage(blob: vfsOpenMmap(filename), pool: newPool(),
+                    tags: newTagPool(), names: LazyPool(), index: BifIndex())
   block:
-    let blob = vfsOpenMmap(filename)      # left mapped for the buffer's lifetime
-    if inIcWorker: jobMappings.add blob
-    var r = Reader(base: cast[ptr UncheckedArray[char]](blob.data), pos: 0, size: blob.size)
+    var r = Reader(base: cast[ptr UncheckedArray[char]](result.blob.data),
+                   pos: 0, size: result.blob.size)
     assert r.size >= Magic.len, "bif: file too small"
     for i in 0 ..< Magic.len:
       if r.base[i] != Magic[i]:
+        if inIcWorker: exitIcJob(1, "bif: bad magic / incompatible format: " & filename)
         quit "bif: bad magic / incompatible format: " & filename
     assert uint64(r.size) <= uint64(high(uint32)), "bif: file too large: " & filename
     r.pos = Magic.len
@@ -277,22 +357,90 @@ proc load*(filename: string): BifModule =
     r.pos += (a - (r.pos and (a - 1))) and (a - 1)
     let tokenBytes = tokenCount * sizeof(NifToken)
     assert r.pos + tokenBytes <= r.size, "bif: truncated token block"
-    result = BifModule(buf: adoptForeignTokens(addr r.base[r.pos], tokenCount))
+    result.tokens = addr r.base[r.pos]
+    result.tokenCount = tokenCount
     r.pos += tokenBytes
-    for _ in 1 .. nTags: discard result.buf.tags.tags.addOrdered(rStr(r))
-    let lazy = LazyPool()
-    lazy.strings = rNames(r, result.buf.pool.strings, nStrings, "")
-    lazy.syms = rNames(r, result.buf.pool.symbols, nSyms, NifSymbol())
-    lazy.filenames = rNames(r, result.buf.pool.filenames, nFiles, "")
-    lazyPools[result.buf.pool] = lazy
+    for _ in 1 .. nTags: discard result.tags.tags.addOrdered(rStr(r))
+    let lazy = result.names
+    lazy.strings = rNames(r, result.pool.strings, nStrings, "")
+    lazy.syms = rNames(r, result.pool.symbols, nSyms, NifSymbol())
+    lazy.filenames = rNames(r, result.pool.filenames, nFiles, "")
     when defined(icEagerPools):
-      for i in 1 .. nStrings: discard poolStr(result.buf.pool, StrId(i))
-      for i in 1 .. nSyms: discard poolSym(result.buf.pool, SymId(i))
-      for i in 1 .. nFiles: discard poolFile(result.buf.pool, FileId(i))
+      for i in 1 .. nStrings: fill(result.pool.strings, lazy.strings, StrId(i))
+      for i in 1 .. nSyms: fillSym(result.pool, lazy.syms, SymId(i))
+      for i in 1 .. nFiles: fill(result.pool.filenames, lazy.filenames, FileId(i))
     let nIndex = int rVarint(r)
-    result.index = newSeq[IndexEntry](nIndex)
+    result.index.entries = newSeq[IndexEntry](nIndex)
+    var maxId = -1
     for i in 0 ..< nIndex:
       let sym = SymId rVarint(r)
       let pos = int32(rVarint(r))
       let v = int rVarint(r)
-      result.index[i] = IndexEntry(sym: sym, pos: pos, vis: IndexVis(v))
+      result.index.entries[i] = IndexEntry(sym: sym, pos: pos, vis: IndexVis(v))
+      maxId = max(maxId, sym.int)
+    result.index.bySym = newSeq[int32](maxId + 1)
+    for i in 0 ..< result.index.bySym.len: result.index.bySym[i] = -1
+    for i, entry in result.index.entries:
+      result.index.bySym[entry.sym.int] = int32(i)
+    # Charge mapped bytes plus an estimate for fully materialized names,
+    # reverse hash tables and indexes. Active job leases can exceed the cache
+    # budget; only data retained between jobs is subject to this bound.
+    result.weight = result.blob.size * 2 +
+      (nStrings + nSyms + nFiles + nTags) * 64 + nIndex * sizeof(IndexEntry) +
+      result.index.bySym.len * sizeof(int32)
+
+proc sameVersion(a, b: FileInfo): bool =
+  a.id == b.id and a.size == b.size and a.lastWriteTime == b.lastWriteTime and
+    a.creationTime == b.creationTime
+
+proc removeCached(path: string) =
+  cacheBytes -= dependencyCache[path].image.weight
+  dependencyCache.del(path)
+
+proc imageFor(filename: string): BifImage =
+  if not inIcWorker or cacheBudget == 0:
+    inc cacheStats.misses
+    return readImage(filename)
+  let path = absolutePath(filename)
+  let stamp = getFileInfo(path)
+  inc cacheClock
+  if path in dependencyCache:
+    if sameVersion(dependencyCache[path].stamp, stamp):
+      inc cacheStats.hits
+      dependencyCache[path].used = cacheClock
+      return dependencyCache[path].image
+    removeCached(path)
+  inc cacheStats.misses
+  result = readImage(path)
+  if result.weight > cacheBudget or not sameVersion(stamp, getFileInfo(path)):
+    return
+  while cacheBytes + result.weight > cacheBudget:
+    var oldest = ""
+    var used = high(uint64)
+    for key, entry in dependencyCache:
+      if entry.used < used:
+        oldest = key
+        used = entry.used
+    removeCached(oldest)
+    inc cacheStats.evictions
+  dependencyCache[path] = CachedImage(image: result, stamp: stamp, used: cacheClock)
+  cacheBytes += result.weight
+
+proc loadIndexed*(filename: string): IndexedBif =
+  ## Reuse names and declaration indexes, but create an independent cursor
+  ## owner for each buffer view. AST decoding and all compiler IDs remain
+  ## job-local. A job lease also protects evicted/replaced images until its
+  ## final cursor has been released and clearLazyPools is called.
+  ## Consumers must not mutate the index or intern into these pools; the
+  ## lazy name accessors are the only operations that fill their entries.
+  let image = imageFor(filename)
+  lazyPools[image.pool] = image.names
+  jobImages.add image
+  result = IndexedBif(
+    buf: adoptForeignTokens(image.tokens, image.tokenCount, image.pool, image.tags),
+    index: image.index)
+
+proc load*(filename: string): BifModule =
+  ## Compatibility entry point for readers expecting the library's BifModule.
+  var module = loadIndexed(filename)
+  result = BifModule(buf: move(module.buf), index: module.index.entries)

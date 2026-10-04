@@ -2098,13 +2098,21 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false; execute: IcExecutor = nil
       elif conf.numberOfProcessors > 0: conf.numberOfProcessors
       else: countProcessors()
 
+    when hasIcActors:
+      var workerPool: IcWorkerPool = nil
+      defer: workerPool.close()
+
     proc runBuild(buildFile: string): int =
       if useActors:
         when hasIcActors:
           rawMessage(conf, hintExecuting, "IC Sigils workers: " & $workers)
           try:
-            result = runIcJobs(loadIcJobs(buildFile), execute, workers,
-              proc(output: string) = msgWriteln(conf, output.strip(leading = false)))
+            let jobs = loadIcJobs(buildFile)
+            if workerPool == nil:
+              workerPool = newIcWorkerPool(min(workers, max(1, jobs.len)))
+            result = runIcJobs(jobs, execute, workers,
+              proc(output: string) = msgWriteln(conf, output.strip(leading = false)),
+              session = workerPool)
           except CatchableError as e:
             rawMessage(conf, errGenerated, e.msg)
             result = 1

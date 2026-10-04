@@ -10,12 +10,18 @@ import compiler/ic/workercontext
 
 var entered: Atomic[int]
 var calls: Atomic[int]
+var workerVisits {.threadvar.}: int
+var reusedWorker: Atomic[int]
 let mainThread = getThreadId()
 
 proc execute(args: seq[string]): IcJobResult {.gcsafe.} =
   doAssert getThreadId() != mainThread
   calls.atomicInc()
   case args[0]
+  of "reuse":
+    inc workerVisits
+    reusedWorker.store(workerVisits)
+    return
   of "parallel":
     entered.atomicInc()
     let deadline = epochTime() + 5
@@ -96,6 +102,19 @@ try:
   doAssert runIcJobs(@[IcJob(arguments: @["environment"]),
     IcJob(arguments: @["environment"])], execute, workers = 1) == 0
   doAssert not existsEnv("NIM_IC_ACTOR_UNIT_LOCAL")
+
+  # Discovery rounds and backend work retain the same OS workers, including
+  # after a failed job. The caller closes the pool after the final round.
+  let session = newIcWorkerPool(workers = 1)
+  try:
+    doAssert runIcJobs(@[IcJob(arguments: @["reuse"])], execute, session = session) == 0
+    doAssert reusedWorker.load() == 1
+    doAssert runIcJobs(@[IcJob(arguments: @["raise"])], execute, session = session) == 1
+    doAssert runIcJobs(@[IcJob(arguments: @["reuse"])], execute, session = session) == 0
+    doAssert reusedWorker.load() == 2
+  finally:
+    session.close()
+  session.close() # idempotent cleanup
 finally:
   removeDir(dir)
 

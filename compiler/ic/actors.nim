@@ -136,6 +136,8 @@ proc needsRebuild*(job: IcJob): bool =
       return true
 
 type
+  IcWorkerPool* = ref object
+    pool: SigilThreadPoolPtr
   ModuleAgent = ref object of AgentActor
     job: IcJob
     id: int
@@ -164,8 +166,36 @@ proc process(self: ModuleAgent) {.slot.} =
 proc record(self: Coordinator; value: Completion) {.slot.} =
   self.completed.addLast value
 
+proc newIcWorkerPool*(workers = countProcessors()): IcWorkerPool =
+  ## One compiler invocation can run several discovery rounds and backend
+  ## phases on the same OS workers, retaining their dependency caches.
+  startLocalThreadDefault()
+  result = IcWorkerPool(pool: newSigilThreadPool(workers = max(1, workers)))
+  result.pool.start()
+
+proc close*(workers: IcWorkerPool) =
+  if workers == nil or workers.pool == nil: return
+  let pool = workers.pool
+  workers.pool = nil
+  pool.stop()
+  pool.join() # also runs dependency-cache cleanup on every OS worker
+  # The pinned Sigils pool is manually allocated and has no dispose API.
+  # No proxy or worker may retain it past this point.
+  reset(pool[].references)
+  reset(pool[].agent)
+  reset(pool[].signaled)
+  reset(pool[].toCancel)
+  reset(pool[].ready)
+  reset(pool[].states)
+  reset(pool[].workers)
+  deinitCond(pool[].queueCond)
+  deinitLock(pool[].queueLock)
+  deinitLock(pool[].signaledLock)
+  deallocShared(pool)
+
 proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
-                workers = countProcessors(); report: IcReporter = nil): int =
+                workers = countProcessors(); report: IcReporter = nil;
+                session: IcWorkerPool = nil): int =
   result = 0
   if jobs.len == 0: return 0
   # Validate and topologically check BEFORE starting any work: a cycle must
@@ -193,8 +223,10 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
 
   startLocalThreadDefault()
   let home = getCurrentSigilThread()
-  let pool = newSigilThreadPool(workers = max(1, min(workers, jobs.len)))
-  pool.start()
+  let owner = if session != nil: session
+              else: newIcWorkerPool(min(workers, jobs.len))
+  let pool = owner.pool
+  if pool == nil: invalid("worker pool is closed")
   try:
     block:
       let coordinator = Coordinator()
@@ -238,21 +270,7 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
             complete(completion.id, failed)
       # Drop proxies while their scheduler is alive; all results have arrived.
   finally:
-    pool.stop()
-    pool.join()
-    # The pinned Sigils pool is manually allocated and has no dispose API.
-    # No proxy or worker may retain it past this point.
-    reset(pool[].references)
-    reset(pool[].agent)
-    reset(pool[].signaled)
-    reset(pool[].toCancel)
-    reset(pool[].ready)
-    reset(pool[].states)
-    reset(pool[].workers)
-    deinitCond(pool[].queueCond)
-    deinitLock(pool[].queueLock)
-    deinitLock(pool[].signaledLock)
-    deallocShared(pool)
+    if session == nil: owner.close()
 
 proc runExternalJob*(arguments: seq[string]): IcJobResult {.gcsafe.} =
   if arguments.len == 0: invalid("empty command")

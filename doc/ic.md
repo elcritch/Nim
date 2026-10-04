@@ -60,11 +60,26 @@ Semantic analysis and the ``lower``, ``cg``, ``merge``, ``emit`` and ``link``
 commands run **inside the compiler's worker threads**, through
 ``compiler/ic/compilejobs.nim``. Each invocation constructs its own
 ``ConfigRef``, ``IdentCache``, ``ModuleGraph`` and VM. The NIF intern pools,
-canonical-type caches, lazy BIF loader and macro-counter lock handles are
+canonical-type caches, AST decoder state and macro-counter lock handles are
 thread-local and cleared between jobs. ASTs are never sent between actors.
 Symbol/type cycles and VM/codegen backreferences are explicitly released at
-job completion. Mapped BIF files stay alive until the job's last AST and cursor
-have been released, then are unmapped before that thread accepts another job.
+job completion. Each worker retains a bounded cache of dependency BIF mappings,
+name tables, lazy name lookup indexes and declaration indexes. Later jobs on
+that worker reuse this data while constructing fresh ASTs, symbol/type IDs,
+VMs and module graphs. Cached buffers never cross OS threads.
+
+The cache checks file identity, size and timestamps before every reuse, so an
+atomic replacement invalidates it even if its size and modification time are
+unchanged. Active jobs hold leases on their images: eviction or replacement
+cannot unmap data while a cursor still uses it. Job leases are released after
+the last AST and cursor; cached images are released when the worker exits.
+The default budget is 128 MiB per worker, charged against mapped file bytes and
+an estimate of decoded tables and names. Active job data can exceed that budget.
+``-d:icDepCacheMiB:N`` sets the budget; ``-d:icNoDepCache`` disables reuse for
+comparison. ``-d:icDepCacheStats`` prints per-job hits, misses, evictions and
+retained bytes. One worker pool lives across frontend discovery rounds and
+backend processing, and is joined at the end of the compiler invocation.
+
 Compile-time environment changes are local to a job, including the environment
 passed to ``staticExec``. An import cycle remains one semantic job, since its
 members must resolve each other in the same graph.

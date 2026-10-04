@@ -31,7 +31,7 @@ import "../dist/nimony/src/lib" / [bitabs, lineinfos,
 # a loaded buffer's pool keeps its names in the mapped file until they are
 # read, and nifcore's own accessors do not know that.
 import "../dist/nimony/src/lib/nifcore" except pool, symName, strVal, poolSym, poolStr, lineInfoFile
-from "../dist/nimony/src/lib" / bif import BifModule, IndexVis, ivHidden, IndexEntry
+from "../dist/nimony/src/lib" / bif import IndexVis, ivHidden, IndexEntry
 import icbif
 import typekeys
 import icnifcore
@@ -2474,7 +2474,7 @@ proc loadBool(n: var Cursor): bool =
     raiseAssert "(true)/(false) expected"
 
 type
-  NifIndex = object
+  NifIndex = BifIndex
     ## A module's name -> declaration-position index, as the `.bif` carries it:
     ## `bif.IndexEntry` is (pool `SymId`, token position, visibility), twelve
     ## bytes, and the NAME is the file's own symbol pool's business. Looking a
@@ -2486,8 +2486,6 @@ type
     ## its own: 46MB of a whole-program `cg`'s 152MB heap, 10MB of the average
     ## per-module one's 40MB (`-d:icBNodeProf`, `PosIndexdKB`), for names the
     ## pool was holding anyway.
-    entries: seq[IndexEntry]  ## in file order, which is source order
-    bySym: seq[int32]         ## `SymId.int` -> position in `entries`, or -1
 
   NifModule = ref object
     buf: TokenBuf      # the WHOLE module, parsed eagerly (Step 2: replaces the
@@ -2721,7 +2719,7 @@ proc rescanPosIndex(buf: var TokenBuf; suffix: string): Table[string, NifIndexEn
     else:
       inc c
 
-proc indexFromBif(m: var BifModule): NifIndex =
+proc indexFromBif(m: var IndexedBif): NifIndex =
   ## The module's name -> token-position index, taken from the index the `.bif`
   ## ALREADY CARRIES rather than recomputed.
   ##
@@ -2739,12 +2737,8 @@ proc indexFromBif(m: var BifModule): NifIndex =
   ## the reader would have formed — so the two filters select the same symbols,
   ## and the `vis` rule (a `DotToken` marker after the def means hidden) is the
   ## same test on the same token.
-  result = NifIndex(entries: move m.index)
-  var maxId = -1
-  for e in result.entries: maxId = max(maxId, e.sym.int)
-  result.bySym = newSeq[int32](maxId + 1)
-  for i in 0 ..< result.bySym.len: result.bySym[i] = -1'i32
-  for i, e in result.entries: result.bySym[e.sym.int] = int32 i
+  # The worker's dependency image retains this immutable index across jobs.
+  result = m.index
 
 proc toNifIndexEntry(e: IndexEntry): NifIndexEntry {.inline.} =
   NifIndexEntry(offset: int(e.pos), info: NoLineInfo,
@@ -2754,6 +2748,7 @@ proc find(ix: NifIndex; buf: TokenBuf; name: string): int =
   ## Position in `ix.entries` of the declaration named `name`, or -1.
   # The pool's names are looked up in the mapped file, and the index for that
   # is built by the first lookup into THIS file (`icbif.findSym`).
+  if ix == nil: return -1
   let id = findSym(buf.pool, name)
   if id.int == 0: return -1
   let i = id.int
@@ -2796,7 +2791,7 @@ proc semIndexEntry(m: NifModule; name: string): NifIndexEntry {.inline.} =
 proc hasIndexEntry(m: NifModule; name: string): bool {.inline.} =
   m.index.find(m.buf, name) >= 0
 
-proc indexFromBif(m: var BifModule; suffix: string): NifIndex =
+proc indexFromBif(m: var IndexedBif; suffix: string): NifIndex =
   result = indexFromBif(m)
   when defined(icIndexCheck):
     let want = rescanPosIndex(m.buf, suffix)
@@ -2843,10 +2838,10 @@ proc moduleId(c: var DecodeContext; suffix: string; flags: set[LoadFlag] = {}): 
     # load the LOWERED whole-module `.t.bif` (transformed bodies + lambda-lifted
     # signatures/entities baked in by the `lower` stage — see writeLoweredModule);
     # the `lower` stage and the frontend (`cmdM`) load the semchecked `.s.bif`.
-    # This mirrors `toNifFilename` (kept in sync). `bif.load` mints FRESH per-file
-    # pools, so the buffer's literals/tags resolve through its own
+    # This mirrors `toNifFilename` (kept in sync). Every file has its own
+    # pools, reused by jobs on the same worker. Literals/tags resolve through
     # `cursorPool(n)`/`n.tags` (the reader is pool-agnostic); the token-position
-    # index is taken from the one the file carries (`indexFromBif`).
+    # index is retained with the cached file (`indexFromBif`).
     let conf = c.infos.config
     let useLowered = conf.cmd == cmdNifC and
                      (conf.icBackendStage == "cg" or conf.icBackendStage == "emit")
@@ -2859,7 +2854,7 @@ proc moduleId(c: var DecodeContext; suffix: string; flags: set[LoadFlag] = {}): 
         ". This can happen when loading a module from NIF that references another module " &
         "whose NIF file hasn't been written yet."
     icProfStart(tBifLoad)
-    var m = icbif.load(modFile)
+    var m = icbif.loadIndexed(modFile)
     prof pBifLoads
     icProfStop(tBifLoad)
     icProfStart(tPosIndex)
@@ -2887,7 +2882,7 @@ proc ensureSemBuf(c: var DecodeContext; module: FileIndex) =
   m.semTried = true
   let semFile = (getNimcacheDir(c.infos.config) / RelativeFile(m.suffix & ".s.bif")).string
   if not fileExists(semFile): return
-  var sm = icbif.load(semFile)
+  var sm = icbif.loadIndexed(semFile)
   prof pBifLoads
   prof pSemBufLoads
   m.semIndex = indexFromBif(sm, m.suffix)

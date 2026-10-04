@@ -1,10 +1,9 @@
 ## A complete compiler invocation with job-owned configuration and graph.
 ## Only argv and diagnostics cross the actor boundary; ASTs and VM state do not.
 
-import std/[os, parseopt]
-when defined(icWorkerStats): import std/strutils
+import std/[os, parseopt, strutils, strtabs]
 import ../[options, commands, cmdlinehelper, pathutils, idents, modulegraphs,
-  ast, ast2nif, icconfig, extccomp, condsyms, cgendata, vmdef, debugutils]
+  ast, ast2nif, icbif, icconfig, extccomp, condsyms, cgendata, vmdef, debugutils]
 import jobtypes, workercontext, sharedcounters
 
 proc processArgs(pass: TCmdLinePass; args: seq[string]; conf: ConfigRef) =
@@ -35,6 +34,8 @@ proc compileIcJob*(args: seq[string];
   registerNifAstTags()
   var output = ""
   var graph: ModuleGraph = nil
+  let cacheBefore = dependencyCacheStats()
+  var reportCache = false
   when defined(icWorkerStats):
     let memoryBefore = getOccupiedMem()
   try:
@@ -53,6 +54,15 @@ proc compileIcJob*(args: seq[string];
       raise newException(ValueError, "missing or incompatible IC configuration")
     extccomp.initVars(conf)
     processArgs(passCmd2, args, conf)
+    var cacheBudget = DefaultDependencyCacheBytes
+    if isDefined(conf, "icDepCacheMiB"):
+      let mib = parseInt(conf.symbols["icDepCacheMiB"])
+      if mib < 0 or mib > high(int) div (1024 * 1024):
+        raise newException(ValueError, "icDepCacheMiB must be a nonnegative memory budget")
+      cacheBudget = mib * 1024 * 1024
+    if isDefined(conf, "icNoDepCache"): cacheBudget = 0
+    setDependencyCacheBudget(cacheBudget)
+    reportCache = isDefined(conf, "icDepCacheStats")
     if conf.selectedGC == gcUnselected: initOrcDefines(conf)
     graph = newModuleGraph(newIdentCache(), conf)
     dispatch(graph)
@@ -75,6 +85,13 @@ proc compileIcJob*(args: seq[string];
     releaseIcAst()
     clearIcDecodeState()
     endIcWorker()
+    if reportCache:
+      let stats = dependencyCacheStats()
+      output.add "ICDEPCACHE " & $getThreadId() &
+        " hits=" & $(stats.hits - cacheBefore.hits) &
+        " misses=" & $(stats.misses - cacheBefore.misses) &
+        " evictions=" & $(stats.evictions - cacheBefore.evictions) &
+        " entries=" & $stats.entries & " bytes=" & $stats.retainedBytes & "\n"
     when defined(icWorkerStats):
       output.add "ICMEM " & $getThreadId() & " " & args.join(" ") &
         " before=" & $memoryBefore & " live=" & $memoryPeak &
