@@ -91,8 +91,13 @@ and ``ParseIncludeus`` from the rest of semantic work, preserving timings for
 small files that take less than a millisecond to parse.
 
 A successful job that stops to discover an import has no module output yet.
-Its dependents wait for the next discovery round while independent branches
-finish. Only jobs that actually ran can confirm fresh dependency sidecars.
+The actor runner finishes jobs already running, then yields to the driver to
+update the graph. It leaves other ready jobs for the next round rather than
+waiting through all their dependency chains before admitting newly discovered
+imports. Completed artifacts and the worker pool are retained. Only jobs that
+actually ran can confirm fresh dependency sidecars. ``-d:icBatchDiscovery``
+restores draining the whole ready graph for comparison. Backend stages always
+drain their graph; this early yield applies only to frontend discovery.
 An unknown ``when`` guard applies to the import edge in that module; once the
 edge is confirmed, the imported module's unconditional dependency subtree is
 available to the pool. All imports in a selected import statement are recorded
@@ -179,7 +184,8 @@ coordinator: ``ICJOB`` gives the worker, output, start time, request delivery
 time (``queueNs``) and execution time;
 ``ICCOMPILE`` separates setup, compiler work and cleanup by stage; ``ICBUILD``
 reports the actual pool size, executed/skipped/deferred/blocked counts and
-aggregate busy time. Times are in nanoseconds, with job starts relative to that
+jobs left pending for the next discovery round, plus aggregate busy time.
+Times are in nanoseconds, with job starts relative to that
 build round. ``ICSCANJOB`` and ``ICSCAN`` report the corresponding per-file
 parse jobs and growing scan queue, including cached/skipped files, peak active
 workers, aggregate busy time and elapsed time. Request delivery starts when the coordinator creates the actor;
@@ -314,6 +320,27 @@ were effectively unchanged, 59.63 versus 59.66 seconds, so the full-build
 difference remains within observed variation. Peak RSS was 10.8 GiB. All 1,188
 generated C files matched, both executables passed ``--help``, and the settled
 no-op took 0.45 seconds with unchanged primary artifact timestamps.
+
+The next experiment targeted the discovery barrier itself. In one round, a
+missing import was known after 1.35 seconds but could not be scheduled for
+another 9.53 seconds while unrelated dependency chains drained. Yielding after
+the running jobs finish reduced isolated frontend trials to 55.10 and 54.78
+seconds, about 7.6% below the preceding 59.46-second trial. There were 28–29
+shorter rounds instead of 17; the benefit comes from scheduling discoveries
+earlier, not from minimizing the number of rounds. The same 1,004 semantic
+artifacts were produced, with only benchmark cache paths differing. Routine
+bodies still run sequentially within each module, and importers still need
+their dependencies' completed semantic artifacts. Early interface publication
+and parallel body tasks remain the larger design in ``parallel_compiler.md``;
+the existing ``--deferBodies`` prototype does not yet provide those guarantees.
+
+Two complete builds with early discovery took 132.46 and 129.53 seconds
+(130.99 mean), compared with the preceding 135.61-second mean, a 3.4% reduction.
+Their frontend mean fell from 59.63 to 54.86 seconds, an 8.0% reduction.
+Aggregate CPU time increased by 1.4%, and peak RSS was 10.9 GiB with the same
+16 workers and 1 GiB per-worker cache budget. All 1,188 generated C files were
+identical to the preceding compiler's output. After a 3.87-second warm rebuild,
+the settled no-op took 0.45 seconds without changing primary artifact timestamps.
 
 For frontend-only measurements, use ``nim track`` without a definition/use
 query, with a fresh ``--nimcache`` and the same project options as the full

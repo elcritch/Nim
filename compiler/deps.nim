@@ -2226,7 +2226,7 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false; execute: IcExecutor = nil
 
     var completedSem = initHashSet[string]()
 
-    proc runBuild(buildFile: string): int =
+    proc runBuild(buildFile: string; frontend = false): int =
       completedSem.clear()
       if useActors:
         when hasIcActors:
@@ -2236,6 +2236,7 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false; execute: IcExecutor = nil
             result = runIcJobs(jobs, execute, workers,
               proc(output: string) = msgWriteln(conf, output.strip(leading = false)),
               session = workerPool, profile = isDefined(conf, "icProfile"),
+              yieldOnDiscovery = frontend and not isDefined(conf, "icBatchDiscovery"),
               onComplete = proc(job: IcJob; exitCode: int) =
                 if job.command == "nim_m" and exitCode == 0:
                   for output in job.outputs:
@@ -2263,7 +2264,7 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false; execute: IcExecutor = nil
           rawMessage(conf, hintSuccess, "generated: " & backendFile)
           rawMessage(conf, hintSuccess, "run:" & " nifmake run" & parallel & " " & backendFile)
         return
-      let exitCode = runBuild(buildFile)
+      let exitCode = runBuild(buildFile, frontend = true)
       # A child that met an import no rule produced yet records it in its
       # `.s.deps`, removes its own NIF and exits successfully (see
       # `pipelines.compilePipelineModule`), so a clean exit is not enough.

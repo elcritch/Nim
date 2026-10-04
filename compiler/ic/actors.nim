@@ -225,7 +225,11 @@ proc close*(workers: IcWorkerPool) =
 proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
                 workers = countProcessors(); report: IcReporter = nil;
                 session: IcWorkerPool = nil; profile = false;
-                onComplete: IcJobObserver = nil): int =
+                onComplete: IcJobObserver = nil;
+                yieldOnDiscovery = false): int =
+  ## With `yieldOnDiscovery`, a successful job with missing outputs ends this
+  ## round after running jobs finish. The caller must expand the dependency
+  ## graph and resubmit unfinished work; this does not cancel any running job.
   let started = if profile: getMonoTime() else: default(MonoTime)
   result = 0
   if jobs.len == 0: return 0
@@ -282,6 +286,7 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
       var remaining = jobs.len
       var executed, skipped, deferred, blockedJobs, peakActive: int
       var busyNs: int64
+      var discoveryPending = false
 
       proc complete(id: int; failed: bool) =
         dec remaining
@@ -291,7 +296,7 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
           if pending[next] == 0: enqueue(next)
 
       while remaining > 0:
-        while ready.len > 0 and active < pool[].workerCount:
+        while ready.len > 0 and active < pool[].workerCount and not discoveryPending:
           let id = ready.pop().id
           if blocked[id]:
             inc blockedJobs
@@ -338,25 +343,34 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
             # A semantic job stops successfully when it discovers an import
             # that has not been built yet. Its missing outputs mean that its
             # dependents cannot run this round, even though it did not fail.
-            # Let independent branches finish and the driver discover the new
-            # edges, instead of repeatedly starting the entire importer chain.
+            # Block the importer chain until the driver discovers the new edges.
+            # Frontend rounds may yield after the currently running jobs finish;
+            # other callers continue through their independent ready branches.
             var incomplete = false
             if not failed:
               for output in jobs[completion.id].outputs:
                 if not fileExists(output):
                   incomplete = true
                   break
-              if incomplete: inc deferred
+              if incomplete:
+                inc deferred
+                if yieldOnDiscovery: discoveryPending = true
             complete(completion.id, failed or incomplete)
             # The one request/reply exchange is done. Sigils retains a running
             # actor's lease until its slot returns, including when the proxy
             # closes just after its completion signal reaches us.
             reset(requests[completion.id])
             reset(proxies[completion.id])
+        # Publish the newly discovered imports as soon as running jobs have
+        # finished. Continuing through every unrelated ready dependency chain
+        # can postpone discovery for seconds. Unstarted jobs remain untouched
+        # and are reconsidered against the expanded graph in the next round.
+        if discoveryPending and active == 0: break
       if profile and report != nil:
         report("ICBUILD " & $(%*{"workers": pool[].workerCount,
           "executed": executed, "skipped": skipped, "peakActive": peakActive,
           "deferred": deferred, "blocked": blockedJobs,
+          "pending": remaining,
           "busyNs": busyNs, "wallNs": (getMonoTime() - started).inNanoseconds}))
       # Drop proxies while their scheduler is alive; all results have arrived.
   finally:

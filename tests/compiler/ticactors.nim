@@ -13,6 +13,7 @@ var calls: Atomic[int]
 var workerVisits {.threadvar.}: int
 var reusedWorker: Atomic[int]
 var expandedChild: Atomic[bool]
+var observedDiscovery: Atomic[bool]
 let mainThread = getThreadId()
 
 proc execute(args: seq[string]): IcJobResult {.gcsafe.} =
@@ -30,6 +31,10 @@ proc execute(args: seq[string]): IcJobResult {.gcsafe.} =
     doAssert entered.load() == 2, "two independent actors must overlap"
   of "fail": return IcJobResult(exitCode: 7, output: "intentional failure")
   of "defer": return # successful discovery stop, no module output yet
+  of "wait-for-discovery":
+    let deadline = epochTime() + 5
+    while not observedDiscovery.load() and epochTime() < deadline: sleep(1)
+    doAssert observedDiscovery.load(), "running jobs must finish after discovery"
   of "ordered": return IcJobResult(output: args[1])
   of "raise": raise newException(ValueError, "worker exception")
   of "wait-for-child":
@@ -107,6 +112,33 @@ try:
   doAssert calls.load() == beforeDeferred + 2
   doAssert not fileExists(afterDeferred)
   doAssert fileExists(independentDeferred)
+
+  # A discovery round may yield without starting an unrelated ready chain.
+  # No unfinished job is marked complete: after the driver adds the missing
+  # import, the next round must run both the importer and the untouched chain.
+  for workers in 1..2:
+    let a = dir / ("early-importer" & $workers)
+    let b = dir / ("early-dependent" & $workers)
+    let x = dir / ("early-independent" & $workers)
+    let y = dir / ("early-independent-child" & $workers)
+    var jobs = @[
+      IcJob(arguments: @["defer"], outputs: @[a]),
+      IcJob(arguments: @["join", b, a], inputs: @[a], outputs: @[b], dependencies: @[0]),
+      IcJob(arguments: @["wait-for-discovery", x], outputs: @[x]),
+      IcJob(arguments: @["join", y, x], inputs: @[x], outputs: @[y], dependencies: @[2])]
+    let before = calls.load()
+    observedDiscovery.store(false)
+    doAssert runIcJobs(jobs, execute, workers = workers, yieldOnDiscovery = true,
+      onComplete = proc(job: IcJob; exitCode: int) =
+        if job.arguments[0] == "defer": observedDiscovery.store(true)) == 0
+    doAssert calls.load() == before + workers
+    for path in [a, b, y]: doAssert not fileExists(path)
+    doAssert fileExists(x) == (workers == 2), "running jobs must finish before yielding"
+    jobs[0].arguments = @["join", a]
+    doAssert runIcJobs(jobs, execute, workers = workers, yieldOnDiscovery = true) == 0
+    doAssert calls.load() == before + 5
+    for path in [a, b, x, y]: doAssert fileExists(path)
+
   doAssert runIcJobs(@[IcJob(arguments: @["raise"], outputs: @[failedOutput])],
     execute, workers = 1) == 1
 
