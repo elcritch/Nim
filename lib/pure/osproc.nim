@@ -948,10 +948,14 @@ elif not defined(useNimRtl):
 
   const useProcessAuxSpawn = declared(posix_spawn) and not defined(useFork) and
                              not (defined(useClone) and defined(linux))
+  # These posix_spawn bindings have no portable chdir file action. Use fork for
+  # case instead of temporarily changing the cwd of every thread in the parent.
+  # NuttX has posix_spawn but no fork; preserve its existing implementation.
+  const forkForWorkingDir = useProcessAuxSpawn and not defined(nuttx)
   when useProcessAuxSpawn:
     proc startProcessAuxSpawn(data: StartProcessData): Pid {.
       raises: [OSError], tags: [ExecIOEffect, ReadEnvEffect, ReadDirEffect, RootEffect], gcsafe.}
-  else:
+  when not useProcessAuxSpawn or forkForWorkingDir:
     proc startProcessAuxFork(data: StartProcessData): Pid {.
       raises: [OSError], tags: [ExecIOEffect, ReadEnvEffect, ReadDirEffect, RootEffect], gcsafe.}
     {.push stacktrace: off, profiler: off.}
@@ -1010,10 +1014,17 @@ elif not defined(useNimRtl):
     data.options = options
 
     when useProcessAuxSpawn:
-      var currentDir = getCurrentDir()
-      pid = startProcessAuxSpawn(data)
-      if workingDir.len > 0:
-        setCurrentDir(currentDir)
+      when forkForWorkingDir:
+        if workingDir.len > 0:
+          pid = startProcessAuxFork(data)
+        else:
+          pid = startProcessAuxSpawn(data)
+      else:
+        let currentDir = getCurrentDir()
+        try:
+          pid = startProcessAuxSpawn(data)
+        finally:
+          if workingDir.len > 0: setCurrentDir(currentDir)
     else:
       pid = startProcessAuxFork(data)
 
@@ -1080,8 +1091,9 @@ elif not defined(useNimRtl):
           chck posix_spawn_file_actions_adddup2(fops, data.pStderr[writeIdx], 2)
 
       var res: cint
-      if data.workingDir.len > 0:
-        setCurrentDir($data.workingDir)
+      when not forkForWorkingDir:
+        if data.workingDir.len > 0:
+          setCurrentDir($data.workingDir)
       var pid: Pid
 
       if (poUsePath in data.options):
@@ -1094,7 +1106,7 @@ elif not defined(useNimRtl):
       if res != 0'i32: raiseOSError(OSErrorCode(res), data.sysCommand)
 
       return pid
-  else:
+  when not useProcessAuxSpawn or forkForWorkingDir:
     proc startProcessAuxFork(data: StartProcessData): Pid =
       if pipe(data.pErrorPipe) != 0:
         raiseOSError(osLastError())
