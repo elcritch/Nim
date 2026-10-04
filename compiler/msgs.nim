@@ -13,6 +13,7 @@ import
   options, lineinfos, pathutils
 
 import ropes except `%`
+import ic/workercontext
 
 when defined(nimPreviewSlimSystem):
   import std/[syncio, assertions]
@@ -189,8 +190,12 @@ proc suggestWriteln*(conf: ConfigRef; s: string) =
     else:
       conf.writelnHook(s)
 
-proc msgQuit*(x: int8) = quit x
-proc msgQuit*(x: string) = quit x
+proc msgQuit*(x: int8) =
+  if inIcWorker: exitIcJob(x.int)
+  quit x
+proc msgQuit*(x: string) =
+  if inIcWorker: exitIcJob(1, x)
+  quit x
 
 proc suggestQuit*() =
   raise newException(ESuggestDone, "suggest done")
@@ -365,6 +370,9 @@ proc msgWriteln*(conf: ConfigRef; s: string, flags: MsgFlags = {}) =
   ## This is used for 'nim dump' etc. where we don't have nimsuggest
   ## support.
   #if conf.ideActive and optCDebug notin gGlobalOptions: return
+  # The worker hook captures CLI diagnostics. Unlike an IDE hook it must
+  # respect the diagnostic suppression used by `compiles` and overload probes.
+  if inIcWorker and conf.m.errorOutputs == {}: return
   let sep = if msgNoUnitSep notin flags: conf.unitSep else: ""
   if not isNil(conf.writelnHook) and msgSkipHook notin flags:
     conf.writelnHook(s & sep)
@@ -425,7 +433,9 @@ proc msgWrite(conf: ConfigRef; s: string) =
     conf.lastMsgWasDot.incl stdOrr.toStdOrrKind() # subsequent writes need `flushDot`
 
 template styledMsgWriteln(args: varargs[typed]) =
-  if not isNil(conf.writelnHook):
+  if inIcWorker and conf.m.errorOutputs == {}:
+    discard
+  elif not isNil(conf.writelnHook):
     callIgnoringStyle(callWritelnHook, nil, args)
   elif optStdout in conf.globalOptions:
     if eStdOut in conf.m.errorOutputs:
@@ -456,6 +466,7 @@ proc log*(s: string) =
     close(f)
 
 proc quit(conf: ConfigRef; msg: TMsgKind) {.gcsafe.} =
+  if inIcWorker: exitIcJob(1)
   if conf.isDefined("nimDebug"): quitOrRaise(conf, $msg)
   elif defined(debug) or msg == errInternal or conf.hasHint(hintStackTrace):
     {.gcsafe.}:

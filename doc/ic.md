@@ -4,8 +4,9 @@
 
 ``--ic:on`` turns an ordinary compile into an incremental one. It decomposes
 compilation into per-module steps whose results are cached as NIF files, and
-uses the external ``nifmake`` build tool to re-run only the steps whose inputs
-changed.
+uses a Sigils worker pool to re-run only the steps whose inputs changed.
+The compiler itself is built with ``--mm:atomicArc --threads:on``; the target
+program's memory manager is still selected independently.
 
 .. code-block:: cmd
 
@@ -22,14 +23,14 @@ This document describes **how IC works today**, including the edge cases
 that shaped the current design. The per-module backend rewrite that earlier
 editions of this document listed as a *Plan* has **landed**: the whole-program,
 reuse/redirect/def-retention backend is gone and codegen is now a set of
-`nifmake`-driven per-module rules (see *The backend*).
+per-module rules (see *The backend*).
 
 Overview
 ========
 
 The pipeline has two halves driven by one process (the *driver*, `commandIc` in
 ``compiler/deps.nim``) that constructs a dependency graph, writes a build file,
-and hands it to ``nifmake``:
+and schedules its rules on Sigils actors:
 
 1. **Frontend** — per module:
    - ``nifler parse --deps`` turns ``.nim`` source into a parsed NIF
@@ -40,12 +41,58 @@ and hands it to ``nifmake``:
 2. **Backend** — ``nim nifc`` (`cmdNifC`, ``compiler/nifbackend.nim``) reads the
    semmed NIFs, generates C, compiles and links.
 
-``nifmake`` orders the steps by their input/output files: every `nim m` runs
-before the `nim nifc` step that consumes its NIF, and a step re-fires only when
-one of its inputs is newer than its outputs. The driver invokes ``nifmake run
---parallel`` by default, so independent steps at the same DAG depth fan out
-across cores; pass ``-d:icNoParallel`` to serialize (readable child output when
-debugging a build).
+The coordinator orders steps by their input/output files. A completion signal
+releases dependent actors immediately; there is no barrier between unrelated
+modules at the same graph depth. Timestamps are checked after dependencies
+complete, so an unchanged interface cookie still stops a rebuild cascade.
+
+Sigils module workers
+--------------------
+
+``compiler/ic/actors.nim`` reads the generated frontend/backend build files.
+Each scheduled module job is an ``AgentActor`` moved into a
+``SigilThreadPool``. ``requested`` and ``finished`` signals dispatch work and
+return its exit status and buffered compiler diagnostics. The coordinator alone
+owns dependency counts. Failed prerequisites block their dependents while
+independent jobs finish; the pool is joined before IC returns.
+
+Semantic analysis and the ``lower``, ``cg``, ``merge``, ``emit`` and ``link``
+commands run **inside the compiler's worker threads**, through
+``compiler/ic/compilejobs.nim``. Each invocation constructs its own
+``ConfigRef``, ``IdentCache``, ``ModuleGraph`` and VM. The NIF intern pools,
+canonical-type caches, lazy BIF loader and macro-counter lock handles are
+thread-local and cleared between jobs. ASTs are never sent between actors.
+Symbol/type cycles and VM/codegen backreferences are explicitly released at
+job completion. Mapped BIF files stay alive until the job's last AST and cursor
+have been released, then are unmapped before that thread accepts another job.
+Compile-time environment changes are local to a job, including the environment
+passed to ``staticExec``. An import cycle remains one semantic job, since its
+members must resolve each other in the same graph.
+
+The parser executable ``nifler``, C compiler, linker and initial configuration
+producer remain external tools. Their module jobs are still scheduled by the
+pool. Discovery of macro-generated imports uses the existing rounds and
+``.s.deps.bif`` sidecars. Workers report an early stop to the coordinator instead
+of exiting the compiler process.
+
+Use ``--parallelBuild:N`` to bound the pool, ``-d:icJobs:N`` to override that
+bound, or ``-d:icNoParallel`` for one worker. The default is the available CPU
+count. ``-d:icProcesses`` selects the previous ``nifmake`` process runner for
+comparison and troubleshooting. Compilers built without atomic ARC/threads, or
+with the optional native FFI or IC profiling instrumentation, also use the
+process runner. Native FFI can mutate process-global library state, and those
+profilers use process-wide counters and exit hooks.
+
+``koch boot`` fetches pinned Sigils, threading, variant and stack_strings sources
+under ``dist/sigils``. Sigils currently requires full system exports and classic
+method/destructor handling, so the final compiler build leaves the slim-system,
+vtable and non-var-destructor preview options disabled.
+The bootstrap applies ``tools/nimony-lifetimes.patch`` to release NIF buffer
+owners and pools, and ``tools/variant-typeids.patch`` to derive Variant IDs from
+type signatures. Compile-time counters are local to each module's VM and cannot
+serve as global type IDs; stable IDs let an IC-built compiler exchange Sigils
+messages correctly too. Rebuild the compiler with ``-d:icWorkerStats`` to include
+per-job heap measurements in its diagnostics.
 
 Artifacts (the NIF zoo)
 =======================
@@ -133,13 +180,13 @@ tooling; they are not a trace of call-site overload resolution.
 Shared compile-time counters
 ============================
 
-``CacheCounter`` state cannot live in the memory of a single ``nim m`` process:
-sibling modules are compiled by separate, possibly parallel processes and would
+``CacheCounter`` state cannot live in the memory of a single ``nim m`` job:
+sibling modules have separate, possibly parallel VMs and would
 allocate from the same initial state (#26201). Instead the counters are stored in
 ``<nimcache>/ic.counters``, guarded by the OS file lock ``ic.counters.lock``.
-A process takes the lock on its first counter operation, loads the file, writes
+A job opens its own lock handle on its first counter operation, loads the file, writes
 it through on every ``inc`` and keeps the lock until it is done with its module,
-so ``ids.inc; ids.value`` observes its own increment. No process waits on
+so ``ids.inc; ids.value`` observes its own increment. No job waits on
 another one while holding the lock, so this cannot deadlock.
 
 The file survives across builds and records, per counter, the high-water mark

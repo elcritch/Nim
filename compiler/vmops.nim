@@ -23,7 +23,7 @@ when declared(math.signbit):
   from std/math as math3 import signbit
 
 
-from std/envvars import getEnv, existsEnv, delEnv, putEnv, envPairs
+import ic/workercontext
 from std/os import getAppFilename
 from std/private/oscommon import dirExists, fileExists
 from std/private/osdirs import walkDir, createDir
@@ -253,10 +253,14 @@ proc registerAdditionalOps*(c: PCtx) =
   registerCallback(c, "stdlib.math.mod", `mod Wrapper`)
 
   when defined(nimcore):
-    wrap2s(getEnv, envvarsop)
-    wrap1s(existsEnv, envvarsop)
-    wrap2svoid(putEnv, envvarsop)
-    wrap1svoid(delEnv, envvarsop)
+    registerCallback c, "stdlib.envvars.getEnv", proc(a: VmArgs) {.nimcall.} =
+      setResult(a, compilerGetEnv(getString(a, 0), getString(a, 1)))
+    registerCallback c, "stdlib.envvars.existsEnv", proc(a: VmArgs) {.nimcall.} =
+      setResult(a, compilerExistsEnv(getString(a, 0)))
+    registerCallback c, "stdlib.envvars.putEnv", proc(a: VmArgs) {.nimcall.} =
+      compilerPutEnv(getString(a, 0), getString(a, 1))
+    registerCallback c, "stdlib.envvars.delEnv", proc(a: VmArgs) {.nimcall.} =
+      compilerDelEnv(getString(a, 0))
     wrap1s(dirExists, oscommonop)
     wrap1s(fileExists, oscommonop)
     wrapDangerous2svoid(writeFile, ioop)
@@ -355,7 +359,7 @@ proc registerAdditionalOps*(c: PCtx) =
       setResult(a, getCurrentDir())
     registerCallback c, "stdlib.osproc.execCmdEx", proc (a: VmArgs) {.nimcall.} =
       let options = getNode(a, 1).fromLit(set[osproc.ProcessOption])
-      a.setResult osproc.execCmdEx(getString(a, 0), options).toLit
+      a.setResult osproc.execCmdEx(getString(a, 0), options, env = icEnvironment).toLit
     registerCallback c, "stdlib.times.getTimeImpl", proc (a: VmArgs) =
       let obj = a.getNode(0).typ.n
       setResult(a, times.getTime().toTimeLit(c, obj, a.currentLineInfo))
@@ -406,7 +410,7 @@ proc registerAdditionalOps*(c: PCtx) =
     setResult(a, formatBiggestFloat(a.getFloat(0), FloatFormatMode(a.getInt(1)),
                                     a.getInt(2), chr(a.getInt(3))))
 
-  wrapIterator("stdlib.envvars.envPairsImplSeq"): envPairs()
+  wrapIterator("stdlib.envvars.envPairsImplSeq"): compilerEnvPairs()
 
   registerCallback c, "stdlib.marshal.toVM", proc(a: VmArgs) =
     let typ = a.getNode(0).typ

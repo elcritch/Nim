@@ -15,6 +15,10 @@ const
   AtlasStableCommit = "aa6fb162006f3015aa84c4305e15cb4d230f5ad6"     # 0.14.7
   ChecksumsStableCommit = "5c132cd332cce5d64a0da9ac3e4c9664313dccb4" # 0.2.2
   SatStableCommit = "9d52513b3c68bfb929dbd687d4fb2836cfee6936"
+  SigilsStableCommit = "27b1508b0b1c6b3a2742b87a276cd4ef129c3864"
+  ThreadingStableCommit = "c5a39a039f24d48ba9503dcb9a0aee68a0fbb36d"
+  VariantStableCommit = "097031a499d18d5f4b1fe2f4c16d3f1ded8c7f45"
+  StackStringsStableCommit = "8fa11c46787a7754d6fc13df1e51f7193bbab5e8"
 
   NimonyStableCommit = "668edddcaa5651051e7683a38a04f31fba778f35" # unversioned \
     # Note that Nimony uses Nim as a git submodule but we don't want to install
@@ -188,11 +192,29 @@ proc bundleAtlasExe(latest: bool, args: string) =
              options = "-d:release --noNimblePath -d:nimAtlasBootstrap " & args)
 
 proc bundleChecksums(latest: bool) =
+  cloneDependency(distDir, "https://github.com/elcritch/sigils.git",
+    SigilsStableCommit, allowBundled = true)
+  let sigilsDeps = distDir / "sigils" / "deps"
+  cloneDependency(sigilsDeps / "threading", "https://github.com/nim-lang/threading.git",
+    ThreadingStableCommit, appendRepoName = false, allowBundled = true)
+  cloneDependency(sigilsDeps / "variant", "https://github.com/yglukhov/variant.git",
+    VariantStableCommit, appendRepoName = false, allowBundled = true)
+  cloneDependency(sigilsDeps / "stack_strings", "https://github.com/termermc/nim-stack-strings.git",
+    StackStringsStableCommit, appendRepoName = false, allowBundled = true)
+  if "nimIcStableVariantIds" notin readFile(sigilsDeps / "variant/variant.nim"):
+    exec "git -C " & quoteShell(sigilsDeps / "variant") & " apply " &
+      quoteShell(absolutePath("tools/variant-typeids.patch"))
   let checksumsCommit = if latest: "HEAD" else: ChecksumsStableCommit
   cloneDependency(distDir, "https://github.com/nim-lang/checksums.git", checksumsCommit, allowBundled = true)
 
   let nimonyCommit = if latest: "HEAD" else: NimonyStableCommit
   cloneDependency(distDir, "https://github.com/nim-lang/nimony.git", nimonyCommit, allowBundled = true)
+
+  # The pinned token buffers assumed process-exit cleanup. Persistent IC
+  # workers must release their pools and borrowed-storage owner headers.
+  if "nimIcTokenBufLifetimes" notin readFile(distDir / "nimony/src/lib/nifcore.nim"):
+    exec "git -C " & quoteShell(distDir / "nimony") & " apply " &
+      quoteShell(absolutePath("tools/nimony-lifetimes.patch"))
 
   # These are host tools: their build must not be affected by whatever
   # `nim.cfg`/`config.nims` happens to live above the Nim checkout. Projects that
@@ -213,7 +235,7 @@ proc bundleChecksums(latest: bool) =
   let nimonyHead = block:
     let (outp, status) = osproc.execCmdEx(
       "git -C " & quoteShell(distDir / "nimony") & " rev-parse HEAD")
-    if status == 0: outp.strip else: ""
+    if status == 0: outp.strip & "+ic-lifetimes-v1" else: ""
 
   proc bundleNifTool(name, src: string) =
     let stamp = "bin" / ("." & name & ".nimony-commit")

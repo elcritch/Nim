@@ -532,6 +532,11 @@ var gconfig {.threadvar.}: Gconfig
 
 proc setUseIc*(useIc: bool) = gconfig.useIc = useIc
 
+proc resetCompilerAst*() =
+  reset(gconfig)
+  nifcBackendActive = false
+  when not defined(nimKochBootstrap): reset(program)
+
 proc comment*(n: PNode): string =
   if nfHasComment in n.flags:
     # NIF-based IC doesn't serialize comments, but the comment table is keyed by
@@ -857,9 +862,9 @@ proc newSym*(symKind: TSymKind, name: PIdent, idgen: IdGenerator; owner: PSym,
         stderr.writeLine "SYMMINT total=" & $symMintTotal
         for k, v in symMints: stderr.writeLine "SYMMINT " & k & "=" & $v
   let id = nextSymId idgen
-  result = PSym(name: name, kindImpl: symKind, flagsImpl: {}, infoImpl: info, itemId: id,
+  result = ownIc(PSym(name: name, kindImpl: symKind, flagsImpl: {}, infoImpl: info, itemId: id,
                 optionsImpl: options, ownerFieldImpl: owner, offsetImpl: defaultOffset,
-                disamb: getOrDefault(idgen.disambTable, name).int32)
+                disamb: getOrDefault(idgen.disambTable, name).int32))
   idgen.disambTable.inc name
   when false:
     if id.module == 48 and id.item == 39:
@@ -1181,9 +1186,9 @@ iterator signature*(t: PType): PType =
 
 proc newType*(kind: TTypeKind; idgen: IdGenerator; owner: PSym; son: sink PType = nil): PType =
   let id = nextTypeId idgen
-  result = PType(kind: kind, ownerFieldImpl: owner, sizeImpl: defaultSize,
+  result = ownIc(PType(kind: kind, ownerFieldImpl: owner, sizeImpl: defaultSize,
                  alignImpl: defaultAlignment, itemId: id,
-                 bindingId: id, sonsImpl: @[])
+                 bindingId: id, sonsImpl: @[]))
   if son != nil:
     assert kind != tyProc
     result.sonsImpl.add son
@@ -1273,9 +1278,9 @@ proc exactReplica*(t: PType; idgen: IdGenerator): PType =
   ## losing their flag differences (use-site `tfUnresolved` typedescs) or
   ## their structure (meta instance bodies shadowing a generic's canonical
   ## body).
-  result = PType(kind: t.kind, ownerFieldImpl: t.owner, sizeImpl: defaultSize,
+  result = ownIc(PType(kind: t.kind, ownerFieldImpl: t.owner, sizeImpl: defaultSize,
                  alignImpl: defaultAlignment, itemId: nextTypeId(idgen),
-                 bindingId: t.bindingId)
+                 bindingId: t.bindingId))
   assignType(result, t)
   result.symImpl = t.sym          # backend-info should not be copied
 

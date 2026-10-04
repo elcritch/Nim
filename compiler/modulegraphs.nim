@@ -1133,9 +1133,9 @@ when not defined(nimKochBootstrap):
         # symbol (same shape as moduleFromNifFile's) gives the drain an idgen/info
         # context; it is not registered, so a later direct import still loads fully.
         if g.config.cmd == cmdM:
-          let m = PSym(kindImpl: skModule, itemId: itemId(int32(fileIdx), 0'i32),
+          let m = ownIc(PSym(kindImpl: skModule, itemId: itemId(int32(fileIdx), 0'i32),
                        name: getIdent(g.cache, splitFile(toFullPath(g.config, fileIdx)).name),
-                       infoImpl: newLineInfo(fileIdx, 1, 1), positionImpl: int(fileIdx))
+                       infoImpl: newLineInfo(fileIdx, 1, 1), positionImpl: int(fileIdx)))
           setOwner(m, getPackage(g.config, g.cache, fileIdx))
           g.pendingNifInit.add (m, precomp.topLevel)
         # Rebuild generic TYPE- and PROC-instance offers across the WHOLE closure,
@@ -1170,10 +1170,10 @@ when not defined(nimKochBootstrap):
         g.ifaces[fIdx.int].module.name.s == mname:
       # properly registered already (directly imported earlier): reuse it
       return g.ifaces[fIdx.int].module
-    result = PSym(kindImpl: skModule, itemId: itemId(int32(fIdx), 0'i32),
+    result = ownIc(PSym(kindImpl: skModule, itemId: itemId(int32(fIdx), 0'i32),
                   name: getIdent(g.cache, mname),
                   infoImpl: newLineInfo(fIdx, 1, 1),
-                  positionImpl: int(fIdx))
+                  positionImpl: int(fIdx)))
     setOwner(result, getPackage(g.config, g.cache, fIdx))
     if g.ifaces[fIdx.int].module == nil and
         not g.icQualIfaces.containsOrIncl(fIdx.int):
@@ -1207,12 +1207,12 @@ when not defined(nimKochBootstrap):
     # Create module symbol
     let filename = AbsoluteFile toFullPath(g.config, fileIdx)
 
-    let m = PSym(
+    let m = ownIc(PSym(
       kindImpl: skModule,
       itemId: itemId(int32(fileIdx), 0'i32),
       name: getIdent(g.cache, splitFile(filename).name),
       infoImpl: newLineInfo(fileIdx, 1, 1),
-      positionImpl: int(fileIdx))
+      positionImpl: int(fileIdx)))
     setOwner(m, getPackage(g.config, g.cache, fileIdx))
     # Register module in graph
     registerModule(g, m)

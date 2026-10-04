@@ -191,7 +191,7 @@ proc fitNodeConsiderViewType(c: PContext, formal: PType, arg: PNode; info: TLine
 proc inferWithMetatype(c: PContext, formal: PType,
                        arg: PNode, coerceDistincts = false): PNode
 
-template commonTypeBegin*(): PType = PType(kind: tyUntyped)
+template commonTypeBegin*(): PType = ownIc(PType(kind: tyUntyped))
 
 proc commonType*(c: PContext; x, y: PType): PType =
   # new type relation that is used for array constructors,

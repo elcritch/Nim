@@ -27,7 +27,9 @@
 ##   the value); classic scanners never read those payloads.
 
 import std / tables
-import "../dist/nimony/src/lib" / nifpools
+import "../dist/nimony/src/lib/nifpools" except pool, globalTags,
+  createTokenBuf, initTokenBuf, registerTag, addStrLit, addIdent, insert,
+  setSymId, parseFromFile, parseFromBuffer, copyIntoUnchecked
 # `except`: the frontend went all-NifLineInfo; the classic side keeps speaking
 # PackedLineInfo, so nifpools' same-name/same-params variants must not leak
 # through (`info(n: NifToken)` differs only in return type, `NoLineInfo` is a
@@ -39,9 +41,79 @@ import "../dist/nimony/src/lib" / nifpools
 # correct one here. The name accessors are excluded because a `.bif`-loaded
 # buffer's pool keeps its names in the mapped file until they are read, which
 # nifcore's accessors do not know; `icbif` provides them under the same names.
-export nifpools except info, NoLineInfo, tagId, symName, strVal, poolSym, poolStr, lineInfoFile
+export nifpools except info, NoLineInfo, tagId, symName, strVal, poolSym, poolStr, lineInfoFile,
+  pool, globalTags, createTokenBuf, initTokenBuf, registerTag, addStrLit,
+  addIdent, insert, setSymId, parseFromFile, parseFromBuffer, copyIntoUnchecked
 import "../dist/nimony/src/lib" / lineinfos
 export lineinfos
+from "../dist/nimony/src/lib" / nifcore import nil
+from "../dist/nimony/src/lib" / nifcoreparse import nil
+from "../dist/nimony/src/models" / tags import TagEnum, TagData, InvalidTagId
+
+var localPool {.threadvar.}: Pool
+var localTags {.threadvar.}: TagPool
+
+proc getPool(): Pool =
+  if localPool == nil: localPool = newPool()
+  localPool
+
+proc getTags(): TagPool =
+  if localTags == nil:
+    localTags = newTagPool()
+    for e in low(TagEnum)..high(TagEnum):
+      if e != InvalidTagId:
+        discard nifcore.registerTag(localTags, TagData[e][0])
+  localTags
+
+template pool*: Pool = getPool()
+template globalTags*: TagPool = getTags()
+
+proc registerTag*(tag: string): TagId = nifcore.registerTag(globalTags, tag)
+proc registerTag*(tags: TagPool; tag: string): TagId = nifcore.registerTag(tags, tag)
+
+proc createTokenBuf*(cap = 16): TokenBuf =
+  nifcore.createTokenBuf(cap, pool, globalTags)
+
+proc initTokenBuf*(): TokenBuf = nifcore.initTokenBuf(pool, globalTags)
+
+proc addStrLit*(dest: var TokenBuf; s: StrId; info: NifLineInfo) =
+  nifcore.addStrLit(dest, pool.strings[s])
+  if info.isValid: appendLineInfo(dest, info)
+
+proc addStrLit*(dest: var TokenBuf; s: string; info = NoNifLineInfo) =
+  nifcore.addStrLit(dest, s)
+  if info.isValid: appendLineInfo(dest, info)
+
+proc addIdent*(dest: var TokenBuf; s: StrId; info: NifLineInfo) =
+  nifcore.addIdent(dest, pool.strings[s])
+  if info.isValid: appendLineInfo(dest, info)
+
+proc addIdent*(dest: var TokenBuf; s: string; info = NoNifLineInfo) =
+  nifcore.addIdent(dest, s)
+  if info.isValid: appendLineInfo(dest, info)
+
+proc insert*(dest: var TokenBuf; src: Cursor; pos: int) =
+  var tmp = createTokenBuf(subtreeWidth(src) + 2)
+  tmp.addSubtree src
+  nifcore.insert(dest, tmp, pos)
+
+proc setSymId*(dest: var NifToken; sym: SymId) =
+  dest = internedSymToken(pool,
+    (if dest.kind == SymbolDef: SymbolDef else: Symbol), sym)
+
+proc parseFromFile*(filename: string; sizeHint = 100): TokenBuf =
+  nifcoreparse.parseFromFile(filename, sizeHint, pool, globalTags,
+    denseLineInfo = true)
+
+proc parseFromBuffer*(input: string; thisModule: sink string; sizeHint = 100): TokenBuf =
+  nifcoreparse.parseFromBuffer(input, thisModule, sizeHint, pool, globalTags,
+    denseLineInfo = true)
+
+template copyIntoUnchecked*(dest: var TokenBuf; tag: string;
+                            info: NifLineInfo; body: untyped) =
+  addParLe(dest, registerTag(tag), info)
+  body
+  closeTag(dest)
 
 from "../dist/nimony/src/lib" / nifreader import Reader, ExpandedToken, decodeStr
 
@@ -67,7 +139,7 @@ proc symId*(n: NifToken): SymId {.inline.} = SymId(uoperand(n) shr 1)
 proc litId*(c: Cursor): StrId {.inline.} = strId(c)
 proc firstSon*(n: Cursor): Cursor {.inline.} = childCursor(n)
 
-var lineMan*: LineInfoManager
+var lineMan* {.threadvar.}: LineInfoManager
   ## The classic packed line-info side channel (`pool.man`). Frontend code no
   ## longer uses it — it lives here purely for ast2nif's writer, which packs
   ## `TLineInfo` into `PackedLineInfo` and unpacks on emit.
@@ -138,7 +210,13 @@ type
 
 func `==`*(a, b: FloatId): bool {.borrow.}
 
-var globalFloats*: FloatPool
+var globalFloats* {.threadvar.}: FloatPool
+
+proc clearNifStreamPools*() =
+  reset(localPool)
+  reset(localTags)
+  reset(lineMan)
+  reset(globalFloats)
 
 template floats*(p: Pool): var FloatPool = globalFloats
 

@@ -263,6 +263,18 @@ proc newModuleList*(g: ModuleGraph): BModuleList =
     config: g.config, graph: g, nimtvDeclared: initIntSet(),
     icEmitted: initIntSet())
 
+proc releaseIcCodegen*(graph: ModuleGraph) =
+  ## Module lists own modules, whose init procedures and `g` fields point back
+  ## to them. ARC needs these backreferences severed when a worker job ends.
+  if graph.backend != nil and graph.backend of BModuleList:
+    let modules = BModuleList(graph.backend)
+    for m in modules.mods:
+      if m != nil: reset(m[])
+    for m in modules.modulesClosed:
+      if m != nil: reset(m[])
+    if modules.generatedHeader != nil: reset(modules.generatedHeader[])
+    reset(modules[])
+
 iterator cgenModules*(g: BModuleList): BModule =
   for m in g.modulesClosed:
     # iterate modules in the order they were closed

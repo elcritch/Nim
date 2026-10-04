@@ -22,6 +22,9 @@ import icmodnames
 import icnifcore
 from ic/replayer import BackendActionsExt, BodyDepsExt
 from commands import compileOptionValue
+import ic/jobtypes
+when hasIcActors:
+  import ic/actors
 
 type
   FilePair = object
@@ -1939,7 +1942,7 @@ proc allSemmed(c: DepContext): bool =
     if not node.deferred and not fileExists(c.semmedFile(node.files[0])):
       return false
 
-proc commandIc*(conf: ConfigRef; frontendOnly = false) =
+proc commandIc*(conf: ConfigRef; frontendOnly = false; execute: IcExecutor = nil) =
   ## Main entry point for `nim ic`. With `frontendOnly` (used by `nim track` for
   ## IDE queries) it runs only Phase 1 — the incremental nifler + `nim m`
   ## frontend that writes every module's `.s.bif` — and skips the whole-program
@@ -2069,31 +2072,53 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false) =
         "precompiled config missing: " & conf.icPreparsedConfig)
       return
     let nifmake = findNifmake()
-    # Build the per-module rules concurrently: nifmake fans out all commands at
-    # each DAG depth via execProcesses (defaults to all cores). Cold builds are
-    # otherwise serial (one child at a time) and leave the machine idle. An
-    # uncapped fan-out across many cores can exhaust RAM on a large project (each
-    # `nim m`/`cg` child holds its own module graph), which nifmake's own `-j:N`
-    # exists to bound. Concurrency is chosen (highest precedence first):
-    #   * `-d:icNoParallel`      -> serial (readable, non-interleaved child output)
+    # Each running semantic/backend job owns a module graph. Bound concurrency
+    # for both the actor pool and the fallback process runner, in this order:
+    #   * `-d:icNoParallel`      -> serial
     #   * `-d:icJobs:N`          -> cap at N (legacy IC-tuning define)
-    #   * `--parallelBuild:N`    -> cap at N (the standard Nim build-parallelism
-    #                               flag; a no-op for `nim c` under IC, so we give
-    #                               it meaning here — lets Nimbus devs pick their
-    #                               own value without a `-d:` define)
-    #   * otherwise              -> uncapped (all cores)
+    #   * `--parallelBuild:N`    -> cap at N
+    #   * otherwise              -> all cores
     let parallel =
       if isDefined(conf, "icNoParallel"): ""
       elif isDefined(conf, "icJobs"): " --parallel:" & conf.symbols["icJobs"]
       elif conf.numberOfProcessors > 0: " --parallel:" & $conf.numberOfProcessors
       else: " --parallel"
 
+    let useActors = hasIcActors and execute != nil and not isDefined(conf, "icProcesses")
+    let workers =
+      if isDefined(conf, "icNoParallel"): 1
+      elif isDefined(conf, "icJobs"):
+        try:
+          let n = parseInt(conf.symbols["icJobs"])
+          if n <= 0: raise newException(ValueError, "nonpositive worker count")
+          n
+        except ValueError:
+          rawMessage(conf, errGenerated, "icJobs must be a positive integer")
+          return
+      elif conf.numberOfProcessors > 0: conf.numberOfProcessors
+      else: countProcessors()
+
+    proc runBuild(buildFile: string): int =
+      if useActors:
+        when hasIcActors:
+          rawMessage(conf, hintExecuting, "IC Sigils workers: " & $workers)
+          try:
+            result = runIcJobs(loadIcJobs(buildFile), execute, workers,
+              proc(output: string) = msgWriteln(conf, output.strip(leading = false)))
+          except CatchableError as e:
+            rawMessage(conf, errGenerated, e.msg)
+            result = 1
+      else:
+        let cmd = quoteShell(nifmake) & " run" & parallel & " " & quoteShell(buildFile)
+        rawMessage(conf, hintExecuting, cmd)
+        result = execShellCmd(cmd)
+
     # Phase 1 — frontend (nifler + `nim m`), run to a discovery fixpoint.
     var frontendOk = false
     while true:
       let buildFile = generateFrontendBuildFile(c, forwardedArgs)
       rawMessage(conf, hintSuccess, "generated: " & buildFile)
-      if nifmake.len == 0:
+      if not useActors and nifmake.len == 0:
         rawMessage(conf, hintSuccess, "run:" & " nifmake run" & parallel & " " & buildFile)
         # without nifmake we can only print the manual commands; emit the
         # backend's too (best effort — discovery cannot run) and stop. An IDE
@@ -2103,9 +2128,7 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false) =
           rawMessage(conf, hintSuccess, "generated: " & backendFile)
           rawMessage(conf, hintSuccess, "run:" & " nifmake run" & parallel & " " & backendFile)
         return
-      let cmd = quoteShell(nifmake) & " run" & parallel & " " & quoteShell(buildFile)
-      rawMessage(conf, hintExecuting, cmd)
-      let exitCode = execShellCmd(cmd)
+      let exitCode = runBuild(buildFile)
       # A child that met an import no rule produced yet records it in its
       # `.s.deps`, removes its own NIF and exits successfully (see
       # `pipelines.compilePipelineModule`), so a clean exit is not enough.
@@ -2138,7 +2161,7 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false) =
         # "nifmake failed with exit code: 1" instead of what the compiler said.
         # The non-zero exit is what signals failure; this line is context.
         rawMessage(conf, hintExecuting,
-          "nifmake reported failures (exit code " & $exitCode & ")")
+          "IC frontend reported failures (exit code " & $exitCode & ")")
         # Fail the run without printing an `Error:` of our own (see above): the
         # exit code is derived from `errorCounter`.
         inc conf.errorCounter
@@ -2146,20 +2169,17 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false) =
 
     removeDeferredScans(c)
 
-    # Phase 2 — backend (whole-program `nim nifc`), run once over the now-final
-    # graph. Kept a separate nifmake run so backend rebuilds are decided purely
-    # by nifmake's input mtimes, independent of frontend discovery.
+    # Phase 2 — backend rules over the now-final graph. Backend rebuilds are
+    # decided by input mtimes, independent of frontend discovery.
     # An IDE query (`frontendOnly`) stops after Phase 1: the `.s.bif` it scans
     # are all produced by the frontend; codegen + link would be wasted work.
     if frontendOk and not frontendOnly:
       let backendFile = generateBackendBuildFile(c, forwardedArgs)
       rawMessage(conf, hintSuccess, "generated: " & backendFile)
-      let cmd = quoteShell(nifmake) & " run" & parallel & " " & quoteShell(backendFile)
-      rawMessage(conf, hintExecuting, cmd)
-      let exitCode = execShellCmd(cmd)
+      let exitCode = runBuild(backendFile)
       if exitCode != 0:
         rawMessage(conf, hintExecuting,
-          "nifmake reported backend failures (exit code " & $exitCode & ")")
+          "IC backend reported failures (exit code " & $exitCode & ")")
         inc conf.errorCounter
   else:
     rawMessage(conf, errGenerated, "nim ic not available in bootstrap build")

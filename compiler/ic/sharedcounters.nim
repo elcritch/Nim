@@ -73,10 +73,10 @@ type
     used: BiggestInt     # how many of them it did use
 
 var
-  held: File = nil # the lock file, while this process owns the counters
-  owner = ""
-  counters = initTable[string, Counter]()
-  mine = initTable[string, Mine]()
+  held {.threadvar.}: File # each job opens its own OS lock handle
+  owner {.threadvar.}: string
+  counters {.threadvar.}: Table[string, Counter]
+  mine {.threadvar.}: Table[string, Mine]
 
 proc counterFile(conf: ConfigRef): string =
   getNimcacheDir(conf).string / "ic.counters"
@@ -188,3 +188,6 @@ proc releaseSharedCounters*() =
     unlock(held)
     close(held)
     held = nil
+  reset(owner)
+  reset(counters)
+  reset(mine)

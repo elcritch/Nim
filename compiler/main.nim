@@ -32,11 +32,14 @@ import pipelines
 import icprof
 from icconfig import produceIcConfig, ensureIcConfig
 from ic/sharedcounters import releaseSharedCounters
+import ic/jobtypes
 
 when not defined(nimKochBootstrap):
   import nifbackend
   import deps
   import idetools
+  when hasIcActors:
+    import ic/[actors, compilejobs]
 
 when not defined(leanCompiler):
   import docgen
@@ -250,6 +253,21 @@ proc setOutFile*(conf: ConfigRef) =
       else: base & platform.OS[conf.target.targetOS].exeExt
     conf.outFile = RelativeFile targetName
 
+proc mainCommand*(graph: ModuleGraph)
+
+when hasIcActors:
+  proc executeIcJob(arguments: seq[string]): IcJobResult {.gcsafe.} =
+    if arguments.len > 1 and arguments[1] in ["m", "nifc"]:
+      # All mutable compiler state is created in this job or is thread-local.
+      # The command dispatcher predates gcsafe annotations; no graph/ref is
+      # sent between actors, including on dependency and completion signals.
+      {.cast(gcsafe).}:
+        result = compileIcJob(arguments[1..^1], mainCommand)
+    else:
+      result = runExternalJob(arguments)
+else:
+  const executeIcJob: IcExecutor = nil
+
 proc mainCommand*(graph: ModuleGraph) =
   let conf = graph.config
   let cache = graph.cache
@@ -300,7 +318,7 @@ proc mainCommand*(graph: ModuleGraph) =
           # now. (The driver then keeps the config IT parsed instead of replaying
           # the artifact; both come from the same files.)
           ensureIcConfig(conf)
-        commandIc(conf)
+        commandIc(conf, execute = executeIcJob)
       else:
         rawMessage(conf, errGenerated, "--ic:on not available in bootstrap build")
       return
@@ -455,7 +473,7 @@ proc mainCommand*(graph: ModuleGraph) =
     wantMainModule(conf)
     setOutFile(conf)
     when not defined(nimKochBootstrap):
-      commandIc(conf, frontendOnly = true)
+      commandIc(conf, frontendOnly = true, execute = executeIcJob)
       runIdeQuery(conf)
     else:
       rawMessage(conf, errGenerated, "nim track not available in bootstrap build")
@@ -486,7 +504,7 @@ proc mainCommand*(graph: ModuleGraph) =
     # the backend build file derives the link target from `conf.absOutFile`.
     setOutFile(conf)
     when not defined(nimKochBootstrap):
-      commandIc(conf)
+      commandIc(conf, execute = executeIcJob)
     else:
       rawMessage(conf, errGenerated, "nim deps not available in bootstrap build")
   of cmdIcConfig:

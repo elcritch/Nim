@@ -32,6 +32,7 @@ import
 import std/pathnorm
 
 from ast import setUseIc, eqTypeFlags, tfGcSafe, tfNoSideEffect
+from ic/workercontext import compilerPutEnv
 
 when defined(nimPreviewSlimSystem):
   import std/assertions
@@ -1166,7 +1167,7 @@ proc processSwitch*(switch, arg: string, pass: TCmdLinePass, info: TLineInfo;
   of "putenv":
     expectArg(conf, switch, arg, pass, info)
     splitSwitch(conf, arg, key, val, pass, info)
-    os.putEnv(key, val)
+    compilerPutEnv(key, val)
   of "cc":
     if conf.backend != backendJs: # bug #19330
       expectArg(conf, switch, arg, pass, info)

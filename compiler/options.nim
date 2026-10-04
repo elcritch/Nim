@@ -823,9 +823,13 @@ proc isDefined*(conf: ConfigRef; symbol: string): bool =
                             osDragonfly, osMacosx}
     else: result = false
 
+import ic/workercontext
+
 template quitOrRaise*(conf: ConfigRef, msg = "") =
   # xxx in future work, consider whether to also intercept `msgQuit` calls
-  if conf.isDefined("nimDebug"):
+  if inIcWorker:
+    exitIcJob(1, msg)
+  elif conf.isDefined("nimDebug"):
     raiseAssert msg
   else:
     quit(msg) # quits with QuitFailure

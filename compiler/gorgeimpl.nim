@@ -12,6 +12,7 @@
 import msgs, options, lineinfos, pathutils
 
 import std/[os, osproc, streams]
+import ic/workercontext
 
 when defined(nimPreviewSlimSystem):
   import std/syncio
@@ -41,7 +42,7 @@ proc opGorge*(cmd, input, cache: string, info: TLineInfo; conf: ConfigRef): (str
       return
     var readSuccessful = false
     try:
-      var p = startProcess(cmd, workingDir,
+      var p = startProcess(cmd, workingDir, env = icEnvironment,
                            options={poEvalCommand, poStdErrToStdOut})
       if input.len != 0:
         p.inputStream.write(input)
@@ -60,7 +61,7 @@ proc opGorge*(cmd, input, cache: string, info: TLineInfo; conf: ConfigRef): (str
           result = ("Error running startProcess: " & getCurrentExceptionMsg(), -1)
   else:
     try:
-      var p = startProcess(cmd, workingDir,
+      var p = startProcess(cmd, workingDir, env = icEnvironment,
                            options={poEvalCommand, poStdErrToStdOut})
       if input.len != 0:
         p.inputStream.write(input)

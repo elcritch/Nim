@@ -1,0 +1,31 @@
+diff --git a/variant.nim b/variant.nim
+index 17db046..edd8934 100644
+--- a/variant.nim
++++ b/variant.nim
+@@ -2,18 +2,16 @@ import macros
+ 
+ type TypeId* = int
+ 
+-var counter {.compileTime.} = 0
+-
+-proc nextTypeId(): int {.compileTime.} =
+-  inc counter
+-  counter
+-
+-proc typeIdAux[t](): int =
+-  var a {.global.} = nextTypeId()
+-  a
++macro stableVariantTypeId(t: typed): untyped =
++  # nimIcStableVariantIds: each module has a separate compile-time VM. Derive
++  # the ID from type identity so packing and unpacking agree across modules.
++  var h = 14695981039346656037'u64
++  for c in signatureHash(t):
++    h = (h xor uint64(ord(c))) * 1099511628211'u64
++  result = newLit(int(h and uint64(high(int))) or 1)
+ 
+ proc getTypeId*(t: typedesc): TypeId =
+-  return static(typeIdAux[t]())
++  return static(stableVariantTypeId(t))
+ 
+ const debugVariantTypes = defined(variantDebugTypes)
+ 

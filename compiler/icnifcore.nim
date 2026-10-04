@@ -12,7 +12,7 @@
 ## `doc/ic_nifcore_port.md`).
 ##
 ## It hosts:
-## * the process-wide shared `Pool`/`TagPool` that stands in for the old global
+## * the job-local `Pool`/`TagPool` that stands in for the old global
 ##   `nifstreams.pool`,
 ## * `writeFileStable`, the content-stable file writer mirroring
 ##   `nifcursors.writeFile(..., OnlyIfChanged)`,
@@ -27,13 +27,28 @@ from std / os import removeFile, moveFile
 import options, pathutils, typekeys
 import "../dist/nimony/src/lib" / [nifcore, nifcoreparse, nifreader, bif]
 
-# One shared literals pool + tag pool for the whole process — the nifcore
+# One literals pool + tag pool for the current compiler job — the nifcore
 # analogue of the old global `nifstreams.pool`. A single shared pool keeps
-# string/symbol/file ids stable across every TokenBuf the IC backend builds,
+# string/symbol/file ids stable across every TokenBuf the job builds,
 # preserving the old global-pool semantics during the migration. (Stage 6 may
 # move to fresh per-file pools for bif's fast path; see doc/ic_nifcore_port.md.)
-let icPool* = newPool()
-let icTags* = newTagPool()
+var localIcPool {.threadvar.}: Pool
+var localIcTags {.threadvar.}: TagPool
+
+proc getIcPool(): Pool =
+  if localIcPool == nil: localIcPool = newPool()
+  localIcPool
+
+proc getIcTags(): TagPool =
+  if localIcTags == nil: localIcTags = newTagPool()
+  localIcTags
+
+template icPool*: Pool = getIcPool()
+template icTags*: TagPool = getIcTags()
+
+proc clearIcPools*() =
+  reset(localIcPool)
+  reset(localIcTags)
 
 proc createIcBuf*(cap = 16): TokenBuf {.inline.} =
   ## A `TokenBuf` bound to the shared IC pools.

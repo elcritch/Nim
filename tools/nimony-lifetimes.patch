@@ -1,0 +1,86 @@
+diff --git a/src/lib/nifcore.nim b/src/lib/nifcore.nim
+index c907078c..cf0e8632 100644
+--- a/src/lib/nifcore.nim
++++ b/src/lib/nifcore.nim
+@@ -750,6 +750,7 @@ type
+   CursorOwnerObj = object
+     rc: int
+     data: Storage
++    borrowed: bool
+     pool: Pool      ## literals (sharable across adapters)
+     tags: TagPool   ## tag space (per-adapter)
+     ## Both ref-tracked manually via GC_ref/GC_unref since this object
+@@ -774,7 +775,7 @@ proc decRcAndFree(owner: CursorOwner) =
+   ## splice as the few tokens they read as: a nil test and a call.
+   dec owner.rc
+   if owner.rc == 0:
+-    if owner.data != nil: dealloc(owner.data)
++    if owner.data != nil and not owner.borrowed: dealloc(owner.data)
+     if owner.pool != nil:
+       GC_unref(owner.pool)
+       owner.pool = nil
+@@ -1410,10 +1411,17 @@ when defined(nimAllowNonVarDestructor) and defined(gcDestructors):
+   proc `=destroy`(dest: TokenBuf) {.inline.} =
+     if dest.owner != nil: decRcAndFree(dest.owner)
+     elif dest.data != nil: dealloc(dest.data)
++    # nimIcTokenBufLifetimes: user destructors must release managed fields too.
++    `=destroy`(dest.pool)
++    `=destroy`(dest.tags)
++    `=destroy`(dest.openTags)
+ else:
+   proc `=destroy`(dest: var TokenBuf) {.inline.} =
+     if dest.owner != nil: decRcAndFree(dest.owner)
+     elif dest.data != nil: dealloc(dest.data)
++    `=destroy`(dest.pool)
++    `=destroy`(dest.tags)
++    `=destroy`(dest.openTags)
+ 
+ template requirePools*(b: var TokenBuf) =
+   ## A buffer the interning builders and the cross-pool copy are about to write
+@@ -1467,12 +1475,10 @@ proc adoptForeignTokens*(data: pointer; count: int;
+   ## Build a buffer whose `count` tokens are BORROWED from `data` (e.g. an mmap'd
+   ## `.bif` region) rather than copied into a heap allocation — a zero-copy load.
+   ## The buffer reads like any other. It NEVER frees `data`: the block is handed to
+-  ## an eagerly-created cursor owner seeded with an EXTRA, permanent reference
+-  ## (`rc = 2` = the buffer's own ref plus one keep-alive), so `decRcAndFree` never
+-  ## reaches 0 and never `dealloc`s the borrowed storage. A *mutation* still works
+-  ## unchanged: because the owner is shared (`rc > 1`), `prepareMutation` forks a
+-  ## private heap copy and abandons the borrowed block — no special-casing anywhere
+-  ## else. The buffer does NOT own the mapping's lifetime: `data` must stay valid
++  ## an eagerly-created cursor owner marked as borrowed. The last cursor/buffer
++  ## releases the owner and its pools, without freeing the borrowed storage.
++  ## A mutation forks a private heap copy. The buffer does NOT own the mapping's
++  ## lifetime: `data` must stay valid
+   ## (and aligned for `NifToken`, 4 bytes) for as long as the buffer or any cursor
+   ## over it lives. The caller keeps the backing store resident — typically for the
+   ## whole process; an mmap left mapped costs only address space, reclaimed at exit.
+@@ -1484,17 +1490,15 @@ proc adoptForeignTokens*(data: pointer; count: int;
+     pool: (if sharedPool != nil: sharedPool else: newPool()),
+     tags: (if sharedTags != nil: sharedTags else: newTagPool())
+   )
+-  # Pin the borrowed block for the buffer's whole life via an owner seeded with a
+-  # permanent extra ref — same shape `ensureOwner` builds, but `rc = 2` so it is
+-  # never collected. (Mirrors `ensureOwner`, inlined because that proc is declared
+-  # further down and this one needs the non-default seed.)
++  # The caller owns the storage; the buffer and its cursors own this header.
+   result.owner = cast[CursorOwner](alloc0(sizeof(CursorOwnerObj)))
+   result.owner.data = cast[Storage](data)
+   result.owner.pool = result.pool
+   result.owner.tags = result.tags
+   GC_ref(result.owner.pool)
+   GC_ref(result.owner.tags)
+-  result.owner.rc = 2
++  result.owner.rc = 1
++  result.owner.borrowed = true
+ 
+ proc len*(b: TokenBuf): int {.inline.} = b.len
+ 
+@@ -1508,7 +1512,7 @@ proc `[]=`*(b: var TokenBuf; i: int; v: NifToken) {.inline.} =
+ 
+ proc prepareMutation*(b: var TokenBuf) {.inline.} =
+   if b.owner != nil:
+-    if b.owner.rc == 1:
++    if b.owner.rc == 1 and not b.owner.borrowed:
+       # Reclaim the owner header; b.data keeps its allocation. Detach
+       # data first so decRcAndFree's data-dealloc path doesn't free
+       # what the TokenBuf is about to keep using.

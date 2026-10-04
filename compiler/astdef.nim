@@ -11,13 +11,14 @@ import
   lineinfos, options, ropes, idents, int128
 
 import std/[tables, hashes]
+import ic/workercontext
 
 when defined(nimPreviewSlimSystem):
   import std/assertions
 
 export int128
 
-var nifcBackendActive* = false
+var nifcBackendActive* {.threadvar.}: bool
   ## Set only while the per-module NIF backend codegen stage runs
   ## (`nifbackend.generateCgStage`, `cmd == cmdNifC`). It gates `newSymNode`'s
   ## lazy-type marking so it applies ONLY in the backend — where syms are loaded
@@ -957,6 +958,29 @@ const
   defaultOffset* = -1
 
 
+var
+  icOwnedSyms {.threadvar.}: seq[PSym]
+  icOwnedTypes {.threadvar.}: seq[PType]
+
+proc ownIc*(s: PSym): PSym {.inline.} =
+  ## Symbol/type/AST backreferences form cycles even though these types are
+  ## marked acyclic. A process formerly reclaimed them at exit. Keep the job's
+  ## symbols and types alive until we can explicitly sever those cycles.
+  if inIcWorker: icOwnedSyms.add s
+  s
+
+proc ownIc*(t: PType): PType {.inline.} =
+  if inIcWorker: icOwnedTypes.add t
+  t
+
+proc releaseIcAst*() =
+  ## All roots are retained throughout teardown, so resetting one object
+  ## cannot invalidate another entry while its references are being cleared.
+  for t in icOwnedTypes: reset(t[])
+  for s in icOwnedSyms: reset(s[])
+  reset(icOwnedTypes)
+  reset(icOwnedSyms)
+
 var forceLazyBodyHook*: proc (n: PNode) {.nimcall, raises: [], tags: [], gcsafe.}
   ## Set by the IC loader (ast2nif). When a node carries `nfLazyBody`, any access
   ## to its children through `len` materializes the deferred routine body in place.
@@ -1044,7 +1068,7 @@ template hasSons*(n: PNode): bool =
 
 when defined(useNodeIds):
   const nodeIdToDebug* = -1 # 2322968
-  var gNodeId: int
+  var gNodeId {.threadvar.}: int
 
 template newNodeImpl(info2) {.dirty.} =
   result = PNode(kind: kind, info: info2)

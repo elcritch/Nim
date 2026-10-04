@@ -843,6 +843,7 @@ when defined(windows) and not defined(useNimRtl):
 
   proc errorStream(p: Process): Stream =
     streamAccess(p)
+    if poStdErrToStdOut in p.options: return outputStream(p)
     if p.errStream == nil:
       p.errStream = newFileHandleStream(p.errHandle)
     result = p.errStream
@@ -855,6 +856,7 @@ when defined(windows) and not defined(useNimRtl):
 
   proc peekableErrorStream(p: Process): Stream =
     streamAccess(p)
+    if poStdErrToStdOut in p.options: return peekableOutputStream(p)
     if p.errStream == nil:
       p.errStream = newFileHandleStream(p.errHandle).newPipeOutStream
     result = p.errStream
@@ -1197,10 +1199,13 @@ elif not defined(useNimRtl):
       else:
         discard close(p.outHandle)
 
-      if p.errStream != nil:
-        close(p.errStream)
-      else:
-        discard close(p.errHandle)
+      # A redirected stderr aliases stdout. Closing the descriptor twice can
+      # close a different worker's pipe if another thread reuses it meanwhile.
+      if p.errHandle != p.outHandle:
+        if p.errStream != nil:
+          close(p.errStream)
+        else:
+          discard close(p.errHandle)
 
   proc suspend(p: Process) =
     if kill(p.id, SIGSTOP) != 0'i32: raiseOSError(osLastError())
@@ -1452,6 +1457,7 @@ elif not defined(useNimRtl):
 
   proc errorStream(p: Process): Stream =
     streamAccess(p)
+    if poStdErrToStdOut in p.options: return outputStream(p)
     if p.errStream == nil:
       p.errStream = createStream(p.errHandle, fmRead)
     return p.errStream
@@ -1464,6 +1470,7 @@ elif not defined(useNimRtl):
 
   proc peekableErrorStream(p: Process): Stream =
     streamAccess(p)
+    if poStdErrToStdOut in p.options: return peekableOutputStream(p)
     if p.errStream == nil:
       p.errStream = createStream(p.errHandle, fmRead).newPipeOutStream
     return p.errStream

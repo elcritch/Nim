@@ -25,7 +25,7 @@ export stackframes
   # allows using things like: `setFrameMsg c.config$n.info & " " & $n.kind`
   # which doesn't log, but augments stacktrace with side channel information
 
-var conf0: ConfigRef
+var conf0 {.threadvar.}: ConfigRef
 
 proc onNewConfigRef*(conf: ConfigRef) {.inline.} =
   ## Caches `conf`, which can be retrieved with `getConfigRef`.

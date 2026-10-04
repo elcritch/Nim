@@ -251,11 +251,11 @@ const
     ## `(btyp <intlit>)` — the same for a node's type slot.
 
 var
-  sdefTag = registerTag(symDefTagName)
-  tdefTag = registerTag(typeDefTagName)
-  hiddenTypeTag = registerTag(hiddenTypeTagName)
-  bindingIdTag = registerTag(bindingIdTagName)
-  genericArgsTag = registerTag(genericArgsTagName)
+  sdefTag {.threadvar.}: TagId
+  tdefTag {.threadvar.}: TagId
+  hiddenTypeTag {.threadvar.}: TagId
+  bindingIdTag {.threadvar.}: TagId
+  genericArgsTag {.threadvar.}: TagId
 
 type
   Writer = object
@@ -648,15 +648,15 @@ proc canonHash(s: string): int32 =
     h = h * 0x01000193'u32
   result = int32(h and 0x3FFF_FFFF'u32) or CanonIdBias
 
-var canonTypeIds: Table[ItemId, int32]
-  ## Memo for `canonicalTypeItem`, deliberately PROCESS-global rather than
+var canonTypeIds {.threadvar.}: Table[ItemId, int32]
+  ## Memo for `canonicalTypeItem`, deliberately job-global rather than
   ## per-`Writer`. A type's mutable fields (its flag set, chiefly) can still be
   ## growing while an `--icGroup` cycle writes one member's NIF after another's,
   ## and the two writers must not disagree about its name. Pinning the id at its
-  ## first computation makes the process self-consistent; across processes the
+  ## first computation makes the job self-consistent; across jobs the
   ## question does not arise, since a consumer LOADS the id out of the name.
 
-var canonClaims: Table[ItemId, string]
+var canonClaims {.threadvar.}: Table[ItemId, string]
   ## `(module, canonical id) -> the key that minted it`, so a hash COLLISION
   ## cannot silently merge two unrelated types. `canonHash` has 30 usable bits;
   ## across a module's ~2000 types a birthday collision is unlikely but not
@@ -666,7 +666,7 @@ var canonClaims: Table[ItemId, string]
   ## below is: the mint counter is unique within the module, so nothing else can
   ## be wearing that name.
 
-var canonSigOwners: Table[string, ItemId]
+var canonSigOwners {.threadvar.}: Table[string, ItemId]
   ## `signature key -> the one PType allowed to wear it`. A signature name is an
   ## IDENTITY, not a digest: two `PType`s that agree on it are NOT
   ## interchangeable, so unlike a content key it must never be shared. A routine
@@ -1363,30 +1363,30 @@ proc trExport(w: var Writer; n: PNode) =
         w.deps.addSymUse pool.syms.getOrIncl(w.toNifSymName(s)), NoLineInfo
   w.deps.addParRi
 
-var replayTag = registerTag("replay")
-var repConverterTag = registerTag("repconverter")
-var repDestroyTag = registerTag("repdestroy")
-var repWasMovedTag = registerTag("repwasmoved")
-var repCopyTag = registerTag("repcopy")
-var repSinkTag = registerTag("repsink")
-var repDupTag = registerTag("repdup")
-var repTraceTag = registerTag("reptrace")
-var repDeepCopyTag = registerTag("repdeepcopy")
-var repEnumToStrTag = registerTag("repenumtostr")
-var repMethodTag = registerTag("repmethod")
-var repPureEnumTag = registerTag("reppureenum")
-var repCppMemberTag = registerTag("repcppmember")
+var replayTag {.threadvar.}: TagId
+var repConverterTag {.threadvar.}: TagId
+var repDestroyTag {.threadvar.}: TagId
+var repWasMovedTag {.threadvar.}: TagId
+var repCopyTag {.threadvar.}: TagId
+var repSinkTag {.threadvar.}: TagId
+var repDupTag {.threadvar.}: TagId
+var repTraceTag {.threadvar.}: TagId
+var repDeepCopyTag {.threadvar.}: TagId
+var repEnumToStrTag {.threadvar.}: TagId
+var repMethodTag {.threadvar.}: TagId
+var repPureEnumTag {.threadvar.}: TagId
+var repCppMemberTag {.threadvar.}: TagId
 #var repClassTag = registerTag("repclass")
-var includeTag = registerTag("include")
-var importTag = registerTag("import")
-var implTag = registerTag("implementation")
-var reexpModTag = registerTag("reexpmod")
-var offerTag = registerTag("offer")
-var typeOfferTag = registerTag("toffer")
-var modulesrcTag = registerTag("modulesrc")
-var expansionTag = registerTag("expansion")
-var interfaceTag = registerTag("interface")
-var hiddenInterfaceTag = registerTag("hiddeninterface")
+var includeTag {.threadvar.}: TagId
+var importTag {.threadvar.}: TagId
+var implTag {.threadvar.}: TagId
+var reexpModTag {.threadvar.}: TagId
+var offerTag {.threadvar.}: TagId
+var typeOfferTag {.threadvar.}: TagId
+var modulesrcTag {.threadvar.}: TagId
+var expansionTag {.threadvar.}: TagId
+var interfaceTag {.threadvar.}: TagId
+var hiddenInterfaceTag {.threadvar.}: TagId
 # `(sig <symUse @src>)*` — signature occurrences (parameter names and the symbols
 # in their type expressions). A semchecked routine's params are dropped from the
 # serialized AST (`skipParams`) and reconstructed from `s.typ`, which holds the
@@ -1395,14 +1395,14 @@ var hiddenInterfaceTag = registerTag("hiddeninterface")
 # the `expansion` records, these are teed into the `deps` side-channel: the loader
 # skips the tag, but `idetools` scans every Symbol token, so goto-def / find-usages
 # work on signatures.
-var sigTag = registerTag("sig")
+var sigTag {.threadvar.}: TagId
 # `(unusedid <int>)` — the module's first FREE itemId after the frontend
 # (`.s.bif`) or the lower stage (`.t.bif`). The backend seeds its per-module
 # sym/type counters here so freshly-minted backend ids (closure envs, RTTI
 # hooks, temps) start ABOVE every loaded id — no `toId` collision is possible
 # by construction (replaces relying on the `@bk` module-marker bit, which the
 # loader dropped on type USES). Mirrors NIF's `.unusedname` directive.
-var unusedIdTag = registerTag("unusedid")
+var unusedIdTag {.threadvar.}: TagId
 # `(modflags <int>)` — the MODULE symbol's backend-relevant flags. Only
 # `sfInjectDestructors` (bit 0) so far: sempass2 sets it on the module sym when
 # the module's TOP-LEVEL statements need the destructor pass, and `cgen.
@@ -1411,10 +1411,10 @@ var unusedIdTag = registerTag("unusedid")
 # and a NIF-loaded module's top-level locals were never destroyed (`block: let
 # h = openHandle()` leaked, silently and only under `nim ic`).
 const ModFlagInjectDestructors* = 1'i32
-var modFlagsTag = registerTag("modflags")
+var modFlagsTag {.threadvar.}: TagId
 # `(eagerproc <symuse>)` — an `{.exportc.}` routine's position among the
 # module's top-level statements; see `writeToplevelNode`.
-var eagerProcTag = registerTag("eagerproc")
+var eagerProcTag {.threadvar.}: TagId
 
 # `(nflags <ident> <symuse>)` — an `nkSym` NODE's own flags. A sym node is
 # normally emitted as a bare NIF `SymUse` token, which has nowhere to put them,
@@ -1427,19 +1427,14 @@ var eagerProcTag = registerTag("eagerproc")
 # Only wrap when there is something to say, so the common sym use stays a bare
 # token.
 const symNodeFlagsTagName* = "nflags"
-var symNodeFlagsTag = registerTag(symNodeFlagsTagName)
+var symNodeFlagsTag {.threadvar.}: TagId
 const PersistedSymNodeFlags = PersistentNodeFlags - {nfLazyType, nfHasComment}
 
 proc registerNifAstTags*() =
-  ## (Re)registers ast2nif's NIF tags explicitly. The top-level `registerTag`
-  ## initializers above depend on `nifstreams.pool` having been initialized
-  ## FIRST (`pool = createLiterals(TagData)` in nifstreams' module init) — an
-  ## inter-module init-order requirement. The IC-built compiler currently emits
-  ## module init calls in a different order, so the initializers registered
-  ## into a pool that was subsequently replaced: the tag ids then denoted
-  ## builtin tags (`replay` came out as `deref`, `repdestroy` as `pat`, ...)
-  ## and every written NIF was silently corrupted. Called from `nim.nim`
-  ## before any command runs; idempotent (`getOrIncl` by name).
+  ## Register tags in this job's pools. Explicit registration avoids module
+  ## initialization order dependencies and initializes fresh worker threads.
+  ## Idempotent within a job; called again after its pools have been cleared.
+  unusedIdTag = registerTag("unusedid")
   sdefTag = registerTag(symDefTagName)
   tdefTag = registerTag(typeDefTagName)
   hiddenTypeTag = registerTag(hiddenTypeTagName)
@@ -2557,7 +2552,7 @@ type
       ## many syms) attributed to duplication axis (which shared module).
 
 proc createDecodeContext*(config: ConfigRef; cache: IdentCache): DecodeContext =
-  ## Supposed to be a global variable
+  registerNifAstTags()
   result = DecodeContext(infos: newLineInfoWriter(config), cache: cache)
 
 var loadStatsInit {.threadvar.}: int          # 0=unknown 1=on 2=off
@@ -2936,7 +2931,7 @@ proc reconstructSysType(c: var DecodeContext; name: string; k: int; itemVal: int
   result = c.types.getOrDefault(name)[0]
   if result == nil:
     let id = itemId(-1'i32, itemVal)
-    result = PType(itemId: id, bindingId: id, kind: TTypeKind(k), state: Complete)
+    result = ownIc(PType(itemId: id, bindingId: id, kind: TTypeKind(k), state: Complete))
     if TTypeKind(k) == tyNil:
       result.sizeImpl = c.infos.config.target.ptrSize
       result.alignImpl = int16 c.infos.config.target.ptrSize
@@ -2974,8 +2969,8 @@ proc makePartialSymStub(c: var DecodeContext; symAsStr: string; sn: ParsedSymNam
   ## filled later by `loadSym` from `entry`. `stubKindAndName` strips NIF-only
   ## markers (e.g. a package's `PkgMarker`) so the backend mangles the clean name.
   let (stubKind, stubName) = stubKindAndName(c.cache, sn.name)
-  result = PSym(itemId: id, kindImpl: stubKind, name: stubName,
-                disamb: sn.count.int32, state: Partial)
+  result = ownIc(PSym(itemId: id, kindImpl: stubKind, name: stubName,
+                disamb: sn.count.int32, state: Partial))
   c.syms[symAsStr] = (result, entry)
 
 proc tryCreateTypeStub(c: var DecodeContext; name: string): PType =
@@ -3006,7 +3001,7 @@ proc tryCreateTypeStub(c: var DecodeContext; name: string): PType =
     let modFi = id.module.FileIndex
     if not hasTypeOffset(c, modFi, name):
       return nil
-    result = PType(itemId: id, bindingId: id, kind: TTypeKind(k), state: Partial)
+    result = ownIc(PType(itemId: id, bindingId: id, kind: TTypeKind(k), state: Partial))
     # `loadType` re-resolves the buffer via `typeCursor`, so the cached entry is a
     # don't-care for types — store the primary one if any (else a 0-offset stub).
     c.types[name] = (result, c.mods[modFi].indexEntry(name))
@@ -3050,8 +3045,8 @@ proc extractLocalSymsFromTree(c: var DecodeContext; n: var Cursor; thisModule: s
       # `stubKindAndName` strips NIF-only markers (e.g. a field's `` `f ``) so the
       # backend mangles the clean name; `loadSymFromCursor` then fills the real kind.
       let (_, stubName) = stubKindAndName(c.cache, sn.name)
-      let sym = PSym(itemId: id, kindImpl: skStub, name: stubName,
-                    disamb: sn.count.int32, state: Complete)
+      let sym = ownIc(PSym(itemId: id, kindImpl: skStub, name: stubName,
+                    disamb: sn.count.int32, state: Complete))
       localSyms[symName] = sym
       when defined(icLocalSymStats): inc lsExtractReg
       # `loadSymFromCursor` enters the `(sd` and consumes the whole block,
@@ -3096,8 +3091,8 @@ proc loadFieldStub(c: var DecodeContext; symAsStr: string; thisModule: string;
   let module = moduleId(c, thisModule)
   # `sn.count` is the field POSITION (see toNifSymName): tuple element access reads
   # it directly off this stub, so preserve it. Named-object uses re-navigate by name.
-  result = PSym(itemId: c.nextSymId(module, isBk = false), kindImpl: stubKind,
-                name: stubName, disamb: sn.count.int32, state: Complete)
+  result = ownIc(PSym(itemId: c.nextSymId(module, isBk = false), kindImpl: stubKind,
+                name: stubName, disamb: sn.count.int32, state: Complete))
   result.positionImpl = sn.count.int32
   # `{.cursor.}` rides in the marker (see `CursorFieldMarker`) because the move
   # optimizer reads it straight off the use site (`trees.isCursor`).
@@ -3137,9 +3132,9 @@ proc loadSymStub(c: var DecodeContext; symAsStr: string; thisModule: string;
       # `include`d symbol (`<module>.0.<suffix>`). Synthesize a resolvable
       # skModule stub (itemId item-0 = the module self-sym) instead of asserting
       # "symbol has no offset". `Complete` so accessors never try to lazy-load it.
-      result = PSym(itemId: itemId(module.int32, 0'i32), kindImpl: skModule,
+      result = ownIc(PSym(itemId: itemId(module.int32, 0'i32), kindImpl: skModule,
                     name: c.cache.getIdent(sn.name), disamb: sn.count.int32,
-                    infoImpl: newLineInfo(module, 1, 1), state: Complete)
+                    infoImpl: newLineInfo(module, 1, 1), state: Complete))
       c.syms[symAsStr] = (result, NifIndexEntry())
       return result
     result = c.makePartialSymStub(symAsStr, sn, id, offs)
@@ -3609,8 +3604,8 @@ proc loadNode(c: var DecodeContext; n: var Cursor; thisModule: string;
             # strip NIF-only markers (a field's `` `f ``) so the backend sees the
             # clean name; `loadSymFromCursor` below fills the real kind.
             let (_, stubName) = stubKindAndName(c.cache, sn.name)
-            sym = PSym(itemId: id, kindImpl: skStub, name: stubName,
-                       disamb: sn.count.int32, state: Complete)
+            sym = ownIc(PSym(itemId: id, kindImpl: skStub, name: stubName,
+                       disamb: sn.count.int32, state: Complete))
             localSyms[symName] = sym  # register for later references
             when defined(icLocalSymStats): inc lsSdReg
           # Now fully load the symbol from the sdef
@@ -3647,9 +3642,9 @@ proc loadNode(c: var DecodeContext; n: var Cursor; thisModule: string;
           else:
             sym = c.syms.getOrDefault(symName)[0]
             if sym == nil:
-              sym = PSym(itemId: c.nextSymId(m, isBk = false), kindImpl: skStub,
+              sym = ownIc(PSym(itemId: c.nextSymId(m, isBk = false), kindImpl: skStub,
                          name: c.cache.getIdent(sn.name), disamb: sn.count.int32,
-                         state: Partial)
+                         state: Partial))
             c.syms[symName] = (sym, NifIndexEntry())
             sym.state = c.loadedState
             loadSymFromCursor(c, sym, n, thisModule, localSyms)
@@ -4106,8 +4101,8 @@ proc resolveSym(c: var DecodeContext; symAsStr: string; alsoConsiderPrivate: boo
   if not alsoConsiderPrivate and offs.vis == Hidden:
     return nil
   # Create a stub symbol (skProc: `resolveSym` only resolves hook/routine syms).
-  result = PSym(itemId: c.nextSymId(module, isBk), kindImpl: skProc,
-                name: c.cache.getIdent(sn.name), disamb: sn.count.int32, state: Partial)
+  result = ownIc(PSym(itemId: c.nextSymId(module, isBk), kindImpl: skProc,
+                name: c.cache.getIdent(sn.name), disamb: sn.count.int32, state: Partial))
   c.syms[symAsStr] = (result, offs)
 
 proc resolveHookSym*(c: var DecodeContext; name: string): PSym =
@@ -4325,8 +4320,8 @@ proc classifyTopTag(name: string): TopTag =
     elif name == pragmaTag: ttPragma
     else: ttOther
 
-var topTagPool: TagPool = nil
-var topTagCache: seq[int8] = @[]
+var topTagPool {.threadvar.}: TagPool
+var topTagCache {.threadvar.}: seq[int8]
   ## `TagId -> TopTag`, -1 unresolved, for ONE tag pool. `topTagPool` holds the
   ## pool by REFERENCE so it stays alive and a freed pool cannot be replaced at
   ## the same address — the same argument `indexFromBif`'s and `bnode`'s memos
@@ -4794,3 +4789,17 @@ when isMainModule:
   echo obj.name, " ", obj.module, " ", obj.count
   let objb = parseSymName("abcdef.0121")
   echo objb.name, " ", objb.module, " ", objb.count
+
+proc clearIcDecodeState*() =
+  ## No cursor, mapped-name cache or canonical id from a completed job may
+  ## survive into the next module scheduled on this OS thread.
+  reset(canonTypeIds)
+  reset(canonClaims)
+  reset(canonSigOwners)
+  reset(topTagPool)
+  reset(topTagCache)
+  statsCtxPtr = nil
+  loaderCtx = nil
+  clearLazyPools()
+  clearIcPools()
+  clearNifStreamPools()

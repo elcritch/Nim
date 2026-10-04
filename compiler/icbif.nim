@@ -34,10 +34,11 @@
 ## and re-interning those components would hash a pool that is still all
 ## placeholders. `fillSym` puts the spelling back whole instead — see there.
 ##
-## `-d:icEagerPools` makes `load` the plain `bif.load`, for an A/B; the
-## accessors work on an eager pool as they do on any other.
+## `-d:icEagerPools` materializes every name during `load`, for an A/B;
+## the accessors work on an eager pool as they do on any other.
 
 import std / [assertions, hashes, tables, varints]
+import ic/workercontext
 import "../dist/nimony/src/lib" / [bitabs, lineinfos, vfs]
 import "../dist/nimony/src/lib/nifcore" except symName, strVal, poolSym, poolStr, lineInfoFile
 from "../dist/nimony/src/lib" / bif import BifModule, IndexEntry, IndexVis
@@ -59,11 +60,17 @@ type
 
 proc hash(p: Pool): Hash = hash(cast[pointer](p))
 
-var lazyPools: Table[Pool, LazyPool]
+var lazyPools {.threadvar.}: Table[Pool, LazyPool]
   ## The pools `load` filled, by identity. The table holds the pool, so its
   ## address cannot be reused for another one.
+var jobMappings {.threadvar.}: seq[VfsBlob]
 
 proc lazyOf(p: Pool): LazyPool {.inline.} = lazyPools.getOrDefault(p)
+
+proc clearLazyPools*() =
+  reset(lazyPools)
+  for mapping in mitems(jobMappings): closeBlob(mapping)
+  reset(jobMappings)
 
 # ── names in the mapping ──────────────────────────────────────────────────
 
@@ -249,10 +256,9 @@ proc rNames[Id, T](r: var Reader; t: var BiTable[Id, T]; n: int; empty: T): Lazy
 proc load*(filename: string): BifModule =
   ## `bif.load`, with the string, symbol and filename pools left in the
   ## mapping. Tags are few and always read, and stay eager.
-  when defined(icEagerPools):
-    result = bif.load(filename)
-  else:
+  block:
     let blob = vfsOpenMmap(filename)      # left mapped for the buffer's lifetime
+    if inIcWorker: jobMappings.add blob
     var r = Reader(base: cast[ptr UncheckedArray[char]](blob.data), pos: 0, size: blob.size)
     assert r.size >= Magic.len, "bif: file too small"
     for i in 0 ..< Magic.len:
@@ -279,6 +285,10 @@ proc load*(filename: string): BifModule =
     lazy.syms = rNames(r, result.buf.pool.symbols, nSyms, NifSymbol())
     lazy.filenames = rNames(r, result.buf.pool.filenames, nFiles, "")
     lazyPools[result.buf.pool] = lazy
+    when defined(icEagerPools):
+      for i in 1 .. nStrings: discard poolStr(result.buf.pool, StrId(i))
+      for i in 1 .. nSyms: discard poolSym(result.buf.pool, SymId(i))
+      for i in 1 .. nFiles: discard poolFile(result.buf.pool, FileId(i))
     let nIndex = int rVarint(r)
     result.index = newSeq[IndexEntry](nIndex)
     for i in 0 ..< nIndex:
