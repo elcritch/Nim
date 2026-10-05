@@ -7,6 +7,7 @@ import ../[options, commands, cmdlinehelper, pathutils, idents, modulegraphs,
   icprof, msgs]
 import jobtypes, workercontext, sharedcounters
 import semhandoff
+import bodycensus
 when defined(icBNodeProf):
   from ../icmodnames import moduleSuffix
 
@@ -77,6 +78,7 @@ proc compileIcJob*(args: seq[string];
     setDependencyCacheBudget(cacheBudget)
     reportCache = isDefined(conf, "icDepCacheStats")
     reportProfile = isDefined(conf, "icProfile")
+    bodyCensusEnabled = isDefined(conf, "icBodyStats")
     if conf.cmd == cmdNifC: stage = conf.icBackendStage
     if conf.selectedGC == gcUnselected: initOrcDefines(conf)
     when defined(icBNodeProf):
@@ -102,6 +104,7 @@ proc compileIcJob*(args: seq[string];
     let e = getCurrentException()
     output.add e.msg & "\n" & e.getStackTrace()
   finally:
+    output.add finishBodyCensus()
     result.usedHeaders = move(usedIcHeaders)
     result.changedHeader = changedIcHeader
     result.headerSnapshot = publishedIcHeader

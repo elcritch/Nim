@@ -114,6 +114,7 @@ proc getCompilerProc*(g: ModuleGraph; name: string): PSym =
   let ident = getIdent(g.cache, name)
   result = strTableGet(g.compilerprocs, ident)
   if result == nil:
+    g.requireModuleContext("compiler procedure: " & name)
     result = loadCompilerProc(g, name)
 
 proc registerCompilerProc*(g: ModuleGraph; s: PSym) =

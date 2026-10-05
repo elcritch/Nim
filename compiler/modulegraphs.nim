@@ -26,6 +26,9 @@ when defined(nimPreviewSlimSystem):
   import std/assertions
 
 type
+  BodyNeedsModule* = object of CatchableError
+    ## An isolated routine needs a service owned by its module's semantic pass.
+
   SigHash* = distinct MD5Digest
 
   Iface* = object       ## data we don't want to store directly in the
@@ -58,6 +61,9 @@ type
     Docgen2Pass
 
   ModuleGraph* {.acyclic.} = ref object
+    isolatedBody*: bool
+      ## Procedure actors have private headers, but no VM or instance publisher.
+    checkBodyCall*: proc(s: PSym) {.nimcall.}
     ifaces*: seq[Iface]  ## indexed by int32 fileIdx
 
     typeInstCache*: Table[ItemId, seq[PType]] # A symbol's ItemId.
@@ -1053,7 +1059,12 @@ proc needsCompilation*(g: ModuleGraph, fileIdx: FileIndex): bool =
     if m != nil and g.isDirty(m) and g.deps.contains(fileIdx.int32.dependsOn(i)):
       return true
 
+template requireModuleContext*(g: ModuleGraph; operation: string) =
+  if g.isolatedBody:
+    raise newException(BodyNeedsModule, operation)
+
 proc getBody*(g: ModuleGraph; s: PSym): PNode {.inline.} =
+  g.requireModuleContext("routine implementation: " & s.name.s)
   if g.config.cmd == cmdNifC: g.icBodyDeps.incl s.itemId.module
   result = s.ast[bodyPos]
   if result != nil and nfLazyBody in result.flags and forceLazyBodyHook != nil:

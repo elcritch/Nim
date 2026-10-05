@@ -469,6 +469,7 @@ proc generateInstance(c: PContext, fn: PSym, pt: LayeredIdTable,
     if result != nil:
       if result.kind == skMethod: finishMethod(c, result)
       return
+  c.graph.requireModuleContext("generic instantiation: " & fn.name.s)
   # generates an instantiated proc
   if c.instCounter > 50:
     globalError(c.config, info, "generic instantiation too nested")

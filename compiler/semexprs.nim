@@ -25,6 +25,7 @@ const
 
 proc semTemplateExpr(c: PContext, n: PNode, s: PSym,
                      flags: TExprFlags = {}; expectedType: PType = nil): PNode =
+  if c.graph.checkBodyCall != nil: c.graph.checkBodyCall(s)
   let info = getCallLineInfo(n)
   # `info` (the callee identifier's position, not the whole call node) is what
   # tooling wants to see as the usage site — matches `markUsed` below.
@@ -1129,6 +1130,7 @@ proc afterCallActions(c: PContext; n, orig: PNode, flags: TExprFlags; expectedTy
         c.config.expandLevels -= 1
 
   let callee = result[0].sym
+  if c.graph.checkBodyCall != nil: c.graph.checkBodyCall(callee)
   case callee.kind
   of skMacro: result = semMacroExpr(c, result, orig, callee, flags, expectedType)
   of skTemplate: result = semTemplateExpr(c, result, callee, flags, expectedType)
@@ -2596,6 +2598,7 @@ proc semSizeof(c: PContext, n: PNode): PNode =
   result = foldSizeOf(c.config, n, n)
 
 proc semMagic(c: PContext, n: PNode, s: PSym, flags: TExprFlags; expectedType: PType = nil): PNode =
+  if c.graph.checkBodyCall != nil: c.graph.checkBodyCall(s)
   # this is a hotspot in the compiler!
   result = n
   case s.magic # magics that need special treatment

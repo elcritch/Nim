@@ -9,9 +9,15 @@ actor to publish an immutable checked interface before draining its remaining
 routine bodies. Importers can start on other Sigils workers, with explicit
 implementation/effect and VM dependencies, version validation and affected-job
 replay. Mutable compiler graphs remain thread-owned under ordinary ARC.
-Bodies within one module still run sequentially; the per-routine scheduler and
-shared `PContext` described below remain a plan. See `doc/ic.md` for the flag,
-current restrictions and measurements.
+The separate `-d:icParallelBodies` experiment now dispatches independent whole
+procedures from a single module to spare workers in the same Sigils pool. Each job
+owns its mutable context and its results merge in declaration order, including
+symbol/type identities, literal caches and template expansion records. Checked
+runtime calls, concrete structured types, simple expression templates and cached
+generic instances are supported. Fresh generic instances, VM work, new hooks and
+unsupported syntax keep the module path. It does not enable interface handoff.
+General routine jobs, new generic-instance deltas and the shared `PContext`
+design below remain a plan. See `doc/ic.md` for coverage and measurements.
 
 ## 0. Goal, and the constraints that shape it
 

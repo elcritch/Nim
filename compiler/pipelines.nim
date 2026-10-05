@@ -233,7 +233,8 @@ proc processPipelineModuleImpl(graph: ModuleGraph; module: PSym; idgen: IdGenera
 
   prepareConfigNotes(graph, module)
   if inIcWorker and graph.config.cmd == cmdM and
-      graph.config.isDefined("icSplitBodies") and graph.config.icGroup.len == 0 and
+      (graph.config.isDefined("icSplitBodies") or
+       graph.config.isDefined("icParallelBodies")) and graph.config.icGroup.len == 0 and
       not graph.withinSystem and sfSystemModule notin module.flags:
     graph.config.globalOptions.incl optDeferBodies
   let ctx = preparePContext(graph, module, idgen)

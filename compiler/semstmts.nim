@@ -2433,7 +2433,8 @@ proc semMethodPrototype(c: PContext; s: PSym; n: PNode) =
 #
 # `--deferBodies:on` queues eligible top-level bodies in source order. IC's
 # interface handoff uses that boundary to release importers on other workers.
-# The module's own body batch and mutable graph stay on its owner thread.
+# `icParallelBodies` can dispatch isolated routine bodies into spare pool slots;
+# the module graph and the remaining bodies stay on the module's owner thread.
 #
 # What "top level" buys is that the unit needs nothing from the statement it was
 # declared in: positional state and lexical visibility are captured in the
@@ -2608,6 +2609,12 @@ proc drainBodyTasks*(c: PContext) =
   ## marks entries done early, never reorders them.
   var i = c.nextBodyTask
   while i < c.bodyTasks.len:
+    when hasIcActors:
+      if c.config.isDefined("icParallelBodies") and currentBodyPool != nil:
+        let completed = parallelBodyBatch(c, i)
+        if completed > 0:
+          i += completed
+          continue
     # not a `for`: a unit's body can enqueue nothing (nested routines are not
     # units) but CAN mark later ones done through `demandRoutineBody`, and the
     # length is re-read so a future stage that does enqueue still terminates.

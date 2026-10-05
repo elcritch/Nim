@@ -12,6 +12,7 @@ import sigils/threads
 import "../../dist/nimony/src/lib" / [nifcore, nifcoreparse]
 import jobtypes
 import semhandoff
+import bodypool
 import mergecache
 export jobtypes
 when defined(icBNodeProf): import ../icprof
@@ -157,6 +158,7 @@ proc backendWeight(job: IcJob): int64 =
 type
   IcWorkerPool* = ref object
     pool: SigilThreadPoolPtr
+    bodyBudget: ptr BodyPool
     headerSnapshots: HashSet[string]
     unstableHeaders: HashSet[string]
     semanticArtifacts: HashSet[string]
@@ -167,6 +169,7 @@ type
     execute: IcExecutor
     profile: bool
     earlyHeaders: bool
+    bodyBudget: ptr BodyPool
     submitted: MonoTime
   Request = ref object of Agent
   Completion = object
@@ -184,6 +187,11 @@ proc finished(self: ModuleAgent; value: Completion) {.signal.}
 proc headersReady(self: ModuleAgent; id: int) {.signal.}
 
 proc process(self: ModuleAgent) {.slot.} =
+  currentBodyPool = self.bodyBudget
+  var budgetReleased = false
+  defer:
+    currentBodyPool = nil
+    if not budgetReleased: self.bodyBudget.release()
   let started = if self.profile: getMonoTime() else: default(MonoTime)
   var outcome = default(IcJobResult)
   if self.earlyHeaders:
@@ -198,6 +206,8 @@ proc process(self: ModuleAgent) {.slot.} =
   except Defect as e:
     outcome = IcJobResult(exitCode: 1, output: e.msg & "\n" & e.getStackTrace())
   let finished = if self.profile: getMonoTime() else: default(MonoTime)
+  self.bodyBudget.release()
+  budgetReleased = true
   emit self.finished(Completion(id: self.id, outcome: move(outcome),
     started: started, finished: finished, thread: getThreadId(),
     queueNs: (if self.profile: (started - self.submitted).inNanoseconds else: 0)))
@@ -213,6 +223,8 @@ proc newIcWorkerPool*(workers = countProcessors()): IcWorkerPool =
   ## phases on the same OS workers, retaining their dependency caches.
   startLocalThreadDefault()
   result = IcWorkerPool(pool: newSigilThreadPool(workers = max(1, workers)))
+  result.bodyBudget = createShared(BodyPool)
+  result.bodyBudget.pool = result.pool
   result.pool.start()
 
 proc close*(workers: IcWorkerPool) =
@@ -221,6 +233,8 @@ proc close*(workers: IcWorkerPool) =
   workers.pool = nil
   pool.stop()
   pool.join() # also runs dependency-cache cleanup on every OS worker
+  deallocShared(workers.bodyBudget)
+  workers.bodyBudget = nil
   clearMergeSnapshot()
   # The pinned Sigils pool is manually allocated and has no dispose API.
   # No proxy or worker may retain it past this point.
@@ -367,6 +381,9 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
             inc skipped
             complete(id, false)
           else:
+            if not owner.bodyBudget.tryOccupy():
+              enqueue(id)
+              break
             var publishEarly = earlyInterfaces
             if earlyInterfaces:
               for output in jobs[id].outputs:
@@ -376,6 +393,7 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
             var actor = ModuleAgent(arguments: jobs[id].arguments,
               command: jobs[id].command, id: id, execute: execute, profile: profile,
               earlyHeaders: publishEarly,
+              bodyBudget: owner.bodyBudget,
               submitted: (if profile: getMonoTime() else: default(MonoTime)))
             proxies[id] = actor.moveToThread(pool)
             requests[id] = Request()
@@ -571,10 +589,14 @@ proc runIcWorkQueue*(initial: seq[IcJob]; execute: IcExecutor;
         inc skipped
         complete(job, default(IcJobResult))
       else:
+        if not session.bodyBudget.tryOccupy():
+          ready.addFirst job
+          break
         let id = available.pop()
         jobs[id] = job
         var actor = ModuleAgent(arguments: job.arguments, command: job.command,
           id: id, execute: execute, profile: profile,
+          bodyBudget: session.bodyBudget,
           submitted: (if profile: getMonoTime() else: default(MonoTime)))
         proxies[id] = actor.moveToThread(pool)
         requests[id] = Request()

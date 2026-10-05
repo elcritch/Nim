@@ -1462,6 +1462,7 @@ proc createTypeBoundOps(g: ModuleGraph; c: PContext; orig: PType; info: TLineInf
   ## to ensure we lift assignment, destructors and moves properly.
   ## The later 'injectdestructors' pass depends on it.
   if orig == nil or {tfCheckedForDestructor, tfHasMeta} * orig.flags != {}: return
+  g.requireModuleContext("type-bound operations")
   # IC: review this solution again later
   orig.inclDerived {tfCheckedForDestructor}
   # for user defined generic destructors:

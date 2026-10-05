@@ -8,6 +8,7 @@ import std/[os, times, tempfiles, atomics, strutils, assertions, json]
 import compiler/ic/actors
 import compiler/ic/workercontext
 import compiler/ic/semhandoff
+import compiler/ic/bodypool
 
 var entered: Atomic[int]
 var calls: Atomic[int]
@@ -16,12 +17,41 @@ var reusedWorker: Atomic[int]
 var expandedChild: Atomic[bool]
 var observedDiscovery: Atomic[bool]
 var headerConsumerStarted: Atomic[bool]
+var bodiesEntered: Atomic[int]
+var bodiesMayFinish: Atomic[bool]
+var bodyThreads: array[2, Atomic[int]]
 let mainThread = getThreadId()
+
+proc executeBody(data: pointer) {.gcsafe.} =
+  let index = cast[int](data)
+  bodyThreads[index].store(getThreadId())
+  bodiesEntered.atomicInc()
+  let deadline = epochTime() + 5
+  while bodiesEntered.load() < 2 and epochTime() < deadline: sleep(1)
+  doAssert bodiesEntered.load() == 2, "sibling body actors must overlap"
+  while not bodiesMayFinish.load() and epochTime() < deadline: sleep(1)
+  doAssert bodiesMayFinish.load()
 
 proc execute(args: seq[string]): IcJobResult {.gcsafe.} =
   doAssert getThreadId() != mainThread
   calls.atomicInc()
   case args[0]
+  of "nested-bodies":
+    doAssert currentBodyPool != nil
+    var tickets: array[2, BodyTicket]
+    doAssert currentBodyPool.tryOccupy(2)
+    for i in 0 .. 1:
+      tickets[i] = currentBodyPool.submitBody(cast[pointer](i), executeBody)
+    doAssert not currentBodyPool.tryOccupy(), "module and bodies fill three slots"
+    bodiesMayFinish.store(true)
+    for ticket in tickets.mitems: ticket.joinBody()
+    doAssert bodyThreads[0].load() != bodyThreads[1].load()
+    doAssert bodyThreads[0].load() != getThreadId()
+    doAssert bodyThreads[1].load() != getThreadId()
+    return
+  of "single-worker-body":
+    doAssert not currentBodyPool.tryOccupy(), "single worker keeps its bodies inline"
+    return
   of "reuse":
     inc workerVisits
     reusedWorker.store(workerVisits)
@@ -83,6 +113,13 @@ proc execute(args: seq[string]): IcJobResult {.gcsafe.} =
 
 let dir = createTempDir("nim-ic-actors-", "")
 try:
+  let nestedPool = newIcWorkerPool(3)
+  doAssert runIcJobs(@[IcJob(arguments: @["nested-bodies"])],
+    execute, workers = 3, session = nestedPool) == 0
+  nestedPool.close()
+  doAssert runIcJobs(@[IcJob(arguments: @["single-worker-body"])],
+    execute, workers = 1) == 0
+  calls.store(0)
   let left = dir / "left"
   let right = dir / "right"
   let root = dir / "root"

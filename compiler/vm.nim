@@ -2477,6 +2477,7 @@ proc setGlobalValue*(c: PCtx; s: PSym, val: PNode) =
 include vmops
 
 proc setupGlobalCtx*(module: PSym; graph: ModuleGraph; idgen: IdGenerator) =
+  graph.requireModuleContext("compile-time evaluation")
   if graph.vm.isNil:
     graph.vm = newCtx(module, graph.cache, graph, idgen)
     registerAdditionalOps(PCtx graph.vm)

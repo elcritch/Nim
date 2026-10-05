@@ -25,6 +25,24 @@ editions of this document listed as a *Plan* has **landed**: the whole-program,
 reuse/redirect/def-retention backend is gone and codegen is now a set of
 per-module rules (see *The backend*).
 
+Serial builds of different entry points can reuse shared modules' ``.s.bif``
+files when they use the same explicit ``--nimcache`` directory and compiler
+configuration. The default cache directory is named after the entry point, so
+two separately named tests normally use separate caches. For example:
+
+.. code-block:: cmd
+
+  nim c --ic:on --nimcache:nimcache/tests tests/test_a.nim
+  nim c --ic:on --nimcache:nimcache/tests tests/test_b.nim
+
+Shared-module names depend on their source paths, and the build signature
+excludes the entry-point path. Changing defines, memory management, backend or
+other signature inputs invalidates cached work. Merge decisions and linking
+remain program-specific, so semantic reuse does not imply that all generated
+C and object files can be reused. A two-entry-point check compiled the shared
+module once; building the second entry point left its ``.s.bif`` contents and
+mtime unchanged and scheduled no semantic job for that shared module.
+
 Overview
 ========
 
@@ -122,6 +140,91 @@ A complete clean Kosmo build with the split took 145.86 seconds and peaked at
 then the settled no-op took 0.49 seconds with all 7,809 primary artifact
 timestamps unchanged. The IC suite passed all 78 tests, and two clean compiler
 self-builds with the split produced identical binaries.
+
+Experimental procedure actors
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``nim c --ic:on -d:icParallelBodies --parallelBuild:16 project.nim`` runs
+eligible bodies from the same module as individual Sigils actors. This flag
+is independent of ``icSplitBodies`` and is also off by default. A job runs
+``semProcBody``, ``hloBody`` and ``trackProc``; lowering and C generation still
+use the ordinary module jobs.
+
+The unit is a complete procedure: its statements stay sequential while other
+procedures run on other workers. Jobs now support concrete object, reference,
+tuple, enum and collection types, field access, ordinary runtime calls, small
+expression templates, and reuse of already-published generic instances. At least
+64 parsed nodes are required. New generic instances, VM/macro execution, new
+type-bound operations and unsupported syntax return to the module thread. A
+pending callee's inferred effects end the current batch; callers can use its
+checked signature after that batch commits.
+
+Workers receive private copies of reachable declarations and compiler state.
+Scope depths, overload order, selective imports and aliases are preserved.
+Local variable names and known fields do not pull unrelated global declarations
+into the job. Existing generic-instance caches and type hooks are copied;
+services that need unpublished module state have explicit fallback guards.
+The copied environment is bounded to 4,096 symbols and 4,096 types, and larger
+jobs use the module path. This remains an experiment, not unrestricted parallel
+semantic checking: for loops, nested declarations, general templates, fresh generic
+instantiation and compile-time execution still limit its coverage.
+
+ASTs, symbols and types are rebound to module identities during a source-order
+merge. Integer-literal and nil caches are coalesced, temporary sentinel types
+retain their unallocated IDs, and diagnostics merge in declaration order.
+Template expansion records, implementation dependencies, template counters and
+parameter/result type updates also merge. Sealed type states are preserved so
+view types keep the ordinary copy-on-write behavior. The originals and identity
+maps stay on the waiting module thread.
+Ordinary ARC suffices. An isolated job that reports an error is checked again on
+the module thread for the normal diagnostics.
+
+Both module and procedure jobs reserve worker slots before entering the same
+pool. A module retains its slot while waiting for its procedures. Procedure
+batches require at least two spare workers and two ready bodies; a lone body
+stays on the module thread because offloading it would add overhead without
+creating overlap. There is no second pool or oversubscription, and nested jobs
+cannot strand all workers waiting for queued children.
+
+``-d:icProfile`` adds ``ICBODY`` records containing the module, routine, actual
+OS thread, preparation time, copied symbol/type counts, execution timestamps
+and fallback status. ``-d:icBodyStats`` adds per-module admission/fallback
+counts, including modules with no body jobs. Repeated module jobs can produce
+repeated records. Tests check actual overlap, agreement with classic compilation,
+byte-identical semantic artifacts with one and four workers, overload/import
+visibility, cached generics, template expansions, dependent callers,
+warm/no-op builds, edits to shared helpers, VM dependencies and diagnostics.
+
+Measured on FreeBSD with a Ryzen 7 8745HS (16 logical CPUs), ordinary ARC,
+16 pool workers and fresh caches, using the same compiler binary:
+
+| Frontend workload | Module actors | Module + procedure actors |
+|-------------------|--------------:|--------------------------:|
+| 24 independent procedures, 1,600 arithmetic statements each (mean of two runs) | 1.93 s | 1.34 s |
+| Kosmo, release, 1 GiB dependency cache (one run each) | 54.48 s | 57.29 s |
+
+These are ``nim track --ic:on`` frontend measurements, excluding C generation
+and linking. The synthetic case dispatched all 24 procedures across 15 OS
+workers without fallback; four pool workers took 1.52 seconds. Kosmo dispatched
+71 speculative body jobs, of which 19 succeeded. Its 29 frontend rounds and
+969 module executions still dominate, and the extra admission/copying work
+leaves it about 5% slower. Procedure actors therefore remain opt-in. Fresh
+generic instantiations, new type hooks, unsupported syntax and the need for
+ready siblings still prevent most real procedures from benefiting.
+
+Validation includes the 78-test IC suite with procedure actors enabled,
+structured-type and scalar integration tests, and a compiler self-build that
+reproduced an identical binary. The structured-type checks cover reference
+objects, enums, arrays, strings and ``var`` returns as well as actual overlap
+and byte-identical semantic artifacts across worker counts. A fresh full Kosmo
+build and its executable's ``--help`` passed; a warm rebuild passed, followed
+by a settled no-op with zero frontend or backend jobs.
+
+Validation also exposed a separate cache-rebuild failure: reordering command-line
+defines changes the build signature, and rebuilding Kosmo through that existing
+cache can report missing dependency ``.s.bif`` files. This reproduces with
+procedure actors disabled. Fresh caches and unchanged-command warm builds pass;
+the configuration-change rebuild issue is not addressed by this experiment.
 
 Dependency scanning uses a growing queue of per-file actors in the same pool.
 Each runs ``nifler parse --deps`` once, retaining both the parsed ``.p.nif`` and

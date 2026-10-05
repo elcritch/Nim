@@ -981,6 +981,11 @@ proc releaseIcAst*() =
   reset(icOwnedTypes)
   reset(icOwnedSyms)
 
+proc takeIcAst*(): tuple[syms: seq[PSym], types: seq[PType]] =
+  ## Transfer a completed isolated body's arena to its module. The receiving
+  ## thread adopts surviving objects before it breaks the private graph cycles.
+  result = (syms: move(icOwnedSyms), types: move(icOwnedTypes))
+
 var forceLazyBodyHook*: proc (n: PNode) {.nimcall, raises: [], tags: [], gcsafe.}
   ## Set by the IC loader (ast2nif). When a node carries `nfLazyBody`, any access
   ## to its children through `len` materializes the deferred routine body in place.

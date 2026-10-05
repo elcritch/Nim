@@ -23,6 +23,10 @@ import
 import vtables
 import icprof
 import std/[strtabs, math, tables, intsets, strutils, packedsets]
+import ic/jobtypes
+when hasIcActors:
+  import ic/[bodypool, bodycensus, workercontext]
+  import std/[sets, monotimes, times, json]
 
 when not defined(leanCompiler):
   import spawn
@@ -40,6 +44,8 @@ proc semExprWithType(c: PContext, n: PNode, flags: TExprFlags = {}, expectedType
 proc semExprNoType(c: PContext, n: PNode): PNode
 proc semExprNoDeref(c: PContext, n: PNode, flags: TExprFlags = {}): PNode
 proc semProcBody(c: PContext, n: PNode; expectedType: PType = nil): PNode
+when hasIcActors:
+  proc parallelBodyBatch(c: PContext; first: int): int
 
 proc fitNode(c: PContext, formal: PType, arg: PNode; info: TLineInfo): PNode
 proc changeType(c: PContext; n: PNode, newType: PType, check: bool)
@@ -884,6 +890,9 @@ proc preparePContext*(graph: ModuleGraph; module: PSym; idgen: IdGenerator): PCo
   if sfSystemModule in module.flags:
     graph.systemModule = module
   result.topLevelScope = openScope(result)
+
+when hasIcActors:
+  include semprocactors
 
 proc isImportSystemStmt(g: ModuleGraph; n: PNode): bool =
   if g.systemModule == nil: return false
