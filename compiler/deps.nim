@@ -2237,6 +2237,8 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false; execute: IcExecutor = nil
               proc(output: string) = msgWriteln(conf, output.strip(leading = false)),
               session = workerPool, profile = isDefined(conf, "icProfile"),
               yieldOnDiscovery = frontend and not isDefined(conf, "icBatchDiscovery"),
+              earlyInterfaces = frontend and hasIcBodyHandoff and
+                isDefined(conf, "icSplitBodies"),
               onComplete = proc(job: IcJob; exitCode: int) =
                 if job.command == "nim_m" and exitCode == 0:
                   for output in job.outputs:

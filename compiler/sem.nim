@@ -933,12 +933,13 @@ proc semStmtAndGenerateGenerics(c: PContext, n: PNode): PNode =
     result = n
   result = semStmt(c, result, {})
   # The body pass (doc/parallel_compiler.md §2.1, stage 1): the module's header
-  # is complete, so every unit's declare-before-use view is now the whole
-  # top-level scope. It runs BEFORE `hloStmt`/`trackStmt` so the module's own
+  # is complete. Each unit retains its declaration-time lexical scope.
+  # It runs BEFORE `hloStmt`/`trackStmt` so the module's own
   # top-level statements still see their callees' inferred effects — deferring
   # past that point would make every top-level call pessimistic, which is a
   # bigger change than this stage is trying to make.
   if optDeferBodies in c.config.globalOptions:
+    if c.onHeadersReady != nil: c.onHeadersReady(c, result)
     drainBodyTasks(c)
   when false:
     # Code generators are lazy now and can deal with undeclared procs, so these

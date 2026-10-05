@@ -7,6 +7,7 @@ discard """
 import std/[os, times, tempfiles, atomics, strutils, assertions, json]
 import compiler/ic/actors
 import compiler/ic/workercontext
+import compiler/ic/semhandoff
 
 var entered: Atomic[int]
 var calls: Atomic[int]
@@ -14,6 +15,7 @@ var workerVisits {.threadvar.}: int
 var reusedWorker: Atomic[int]
 var expandedChild: Atomic[bool]
 var observedDiscovery: Atomic[bool]
+var headerConsumerStarted: Atomic[bool]
 let mainThread = getThreadId()
 
 proc execute(args: seq[string]): IcJobResult {.gcsafe.} =
@@ -35,6 +37,27 @@ proc execute(args: seq[string]): IcJobResult {.gcsafe.} =
     let deadline = epochTime() + 5
     while not observedDiscovery.load() and epochTime() < deadline: sleep(1)
     doAssert observedDiscovery.load(), "running jobs must finish after discovery"
+  of "header-producer", "changing-header":
+    if onIcHeaderReady != nil:
+      writeFile(args[2], "interface")
+      writeFile(pendingMarker(args[1]), args[2])
+      onIcHeaderReady(args[1])
+      let deadline = epochTime() + 5
+      while not headerConsumerStarted.load() and epochTime() < deadline: sleep(1)
+      doAssert headerConsumerStarted.load(), "importer must overlap dependency bodies"
+      result.headerSnapshot = args[2]
+      result.changedHeader = args[0] == "changing-header"
+    writeFile(args[1], "final")
+    return
+  of "header-consumer", "body-consumer":
+    if onIcHeaderReady != nil and not headerConsumerStarted.load():
+      doAssert not fileExists(args[2]), "importer must start before body completion"
+      headerConsumerStarted.store(true)
+      if args[0] == "body-consumer":
+        return IcJobResult(waitFor: args[2])
+      result.usedHeaders.add IcHeaderUse(artifact: args[2], snapshot: args[3])
+    writeFile(args[1], "done")
+    return
   of "ordered": return IcJobResult(output: args[1])
   of "raise": raise newException(ValueError, "worker exception")
   of "wait-for-child":
@@ -141,6 +164,25 @@ try:
 
   doAssert runIcJobs(@[IcJob(arguments: @["raise"], outputs: @[failedOutput])],
     execute, workers = 1) == 1
+
+  # A checked header releases an importer while its producer is still running.
+  # Actual body demands yield their slot and retry after the producer finishes.
+  # A changed header discards speculative artifacts and replays the final graph.
+  for scenario in 0..2:
+    let a = dir / ("header-producer-" & $scenario & ".s.bif")
+    let b = dir / ("header-consumer-" & $scenario & ".s.bif")
+    let snapshot = dir / ("interface-" & $scenario)
+    headerConsumerStarted.store(false)
+    let before = calls.load()
+    let producer = if scenario == 2: "changing-header" else: "header-producer"
+    let consumer = if scenario == 1: "body-consumer" else: "header-consumer"
+    doAssert runIcJobs(@[
+      IcJob(arguments: @[producer, a, snapshot], outputs: @[a]),
+      IcJob(arguments: @[consumer, b, a, snapshot], outputs: @[b], dependencies: @[0])],
+      execute, workers = 2, earlyInterfaces = true) == 0
+    doAssert calls.load() == before + [2, 3, 3][scenario]
+    doAssert fileExists(a) and fileExists(b)
+    doAssert not fileExists(pendingMarker(a)) and not fileExists(pendingMarker(b))
 
   var rejected = false
   try:

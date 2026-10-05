@@ -1,11 +1,12 @@
 ## A complete compiler invocation with job-owned configuration and graph.
 ## Only argv and diagnostics cross the actor boundary; ASTs and VM state do not.
 
-import std/[os, parseopt, strutils, strtabs, monotimes, times, json]
+import std/[os, parseopt, strutils, strtabs, monotimes, times, json, tables]
 import ../[options, commands, cmdlinehelper, pathutils, idents, modulegraphs,
   ast, ast2nif, icbif, icconfig, extccomp, condsyms, cgendata, vmdef, debugutils,
-  icprof]
+  icprof, msgs]
 import jobtypes, workercontext, sharedcounters
+import semhandoff
 when defined(icBNodeProf):
   from ../icmodnames import moduleSuffix
 
@@ -39,6 +40,7 @@ proc compileIcJob*(args: seq[string];
   var stage = "frontend"
   when defined(icBNodeProf): beginIcProfile()
   beginIcWorker()
+  resetIcHandoff()
   clearIcDecodeState()
   registerNifAstTags()
   var output = ""
@@ -63,6 +65,8 @@ proc compileIcJob*(args: seq[string];
       raise newException(ValueError, "missing or incompatible IC configuration")
     extccomp.initVars(conf)
     processArgs(passCmd2, args, conf)
+    if hasIcBodyHandoff and conf.cmd == cmdM and isDefined(conf, "icSplitBodies"):
+      readIcHeaders = not isDefined(conf, "icNoEarlyInterfaces")
     var cacheBudget = DefaultDependencyCacheBytes
     if isDefined(conf, "icDepCacheMiB"):
       let mib = parseInt(conf.symbols["icDepCacheMiB"])
@@ -82,10 +86,26 @@ proc compileIcJob*(args: seq[string];
     dispatched = true
     dispatch(graph)
     result.exitCode = ord(conf.errorCounter != 0)
+  except IcBodyPending as e:
+    result.waitFor = e.artifact
+    result.waitReason = e.reason
+    if graph != nil:
+      for importer, deps in graph.importDeps.pairs:
+        var paths: seq[string] = @[]
+        for f in deps: paths.add toFullPath(graph.config, f)
+        writeSemDeps(graph.config, importer.int32, paths)
   except IcJobExit as e:
     result.exitCode = e.exitCode
     if e.msg.len > 0: output.add e.msg & "\n"
+  except CatchableError, Defect:
+    result.exitCode = 1
+    let e = getCurrentException()
+    output.add e.msg & "\n" & e.getStackTrace()
   finally:
+    result.usedHeaders = move(usedIcHeaders)
+    result.changedHeader = changedIcHeader
+    result.headerSnapshot = publishedIcHeader
+    resetIcHandoff()
     let cleanupStarted = getMonoTime()
     if not dispatched: workStarted = cleanupStarted
     when defined(icWorkerStats):

@@ -20,6 +20,9 @@ when not defined(leanCompiler):
 import std/[syncio, objectdollar, assertions, tables, strutils, strtabs, sets, intsets]
 import renderer
 import ic/replayer
+import ic/semhandoff
+from ic/workercontext import inIcWorker
+from typekeys import cachedModuleSuffix
 
 proc setPipeLinePass*(graph: ModuleGraph; pass: PipelinePass) =
   graph.pipelinePass = pass
@@ -113,6 +116,113 @@ proc prePass*(c: PContext; n: PNode) =
         else:
           discard
 
+when not defined(nimKochBootstrap):
+  proc persistSemanticModule(graph: ModuleGraph; module: PSym; idgen: IdGenerator;
+                             topLevelStmts: PNode; pendingRoutines: seq[PSym] = @[];
+                             headerOnly = false; compareHeader = false): string =
+    # Collect replay actions from both pragma computations and VM state diff
+    var replayActions: seq[PNode] = @[]
+    # Get pragma-recorded replay actions (compile, link, passC, passL, etc.)
+    if graph.nifReplayActions.hasKey(module.position.int32):
+      replayActions.add graph.nifReplayActions[module.position.int32]
+    # Also get VM state diff (macro cache operations)
+    if graph.vm != nil:
+      for (m, n) in PCtx(graph.vm).vmstateDiff:
+        if m == module:
+          replayActions.add n
+
+    # NeedsImpl edge recording: which modules' bodies this process consumed
+    # at compile time (VM/getImpl). For an --icGroup cycle every member gets
+    # the union; intra-group entries are filtered by the writer.
+    var implDeps: seq[int] = @[]
+    for id in graph.icImplDeps: implDeps.add id
+    # Generic-instance OFFERS: every instance THIS module created, so a
+    # consumer reuses it rather than re-instantiating in its own scope (which
+    # cannot see symbols visible only at the generic's definition site — e.g.
+    # a distinct type's `==`). See ast2nif.writeNifModule / moduleFromNifFile.
+    var genericOffers: seq[tuple[generic, inst: PSym;
+                                 concreteTypes: seq[PType]; genericParamsCount: int]] = @[]
+    for genItemId, instList in graph.procInstCache:
+      for inst in instList:
+        if inst.sym != nil and inst.sym.itemId.module == module.position and
+            inst.sym.instantiatedFrom != nil and inst.compilesId == 0:
+          # `concreteTypes` is pre-sized to `paramsLen+gp.len`; a tail slot can
+          # stay nil (e.g. fewer materialized params than `paramsLen`). Such an
+          # offer can't be serialized — skip it (the consumer re-instantiates,
+          # the prior behaviour) rather than emit a nil type reference.
+          var hasNil = false
+          for ct in inst.concreteTypes:
+            if ct == nil: hasNil = true; break
+          if not hasNil:
+            genericOffers.add (inst.sym.instantiatedFrom, inst.sym,
+                               inst.concreteTypes, inst.genericParamsCount)
+    # Generic TYPE-instance OFFERS: every `tyGenericInst` THIS module created,
+    # so a consumer reuses its baked structure (array bounds etc.) rather than
+    # re-instantiating with a scope-divergent bound. See ast2nif.writeNifModule.
+    var typeOffers: seq[tuple[generic: PSym; inst: PType]] = @[]
+    for genItemId, instList in graph.typeInstCache:
+      for inst in instList:
+        if inst != nil and inst.itemId.module == module.position and
+            inst.kidsLen > 0 and inst[0] != nil and
+            inst[0].kind == tyGenericBody and inst[0].sym != nil:
+          typeOffers.add (inst[0].sym, inst)
+    # The module's REAL resolved direct imports (incl. macro/template-generated
+    # ones with no surviving syntactic node). Passed to writeNifModule so the
+    # NIF `deps` section is complete (the backend closure walk needs it), and
+    # reused below for the `.s.deps` sidecar (frontend graph re-derivation).
+    let resolvedImportDeps = graph.importDeps.getOrDefault(module.position.FileIndex, @[])
+    # The frontend's highest used itemId (max of the sym and type counters):
+    # the backend seeds its id minting ABOVE this so closure envs / RTTI hooks
+    # never share a `toId` with a frontend sym/type. See ast2nif `(unusedid)`.
+    let firstUnusedId = max(idgen.symId, idgen.typeId)
+    var expansions: seq[(PSym, TLineInfo)] = @[]
+    if not headerOnly:
+      discard graph.nifExpansions.take(module.position.int32, expansions)
+    # The module symbol's own backend-relevant flags. `sfInjectDestructors` is
+    # set by sempass2 when the module's TOP-LEVEL statements need the
+    # destructor pass; `moduleFromNifFile` builds a fresh module PSym, so
+    # without persisting it `cgen.genTopLevelStmt` skipped
+    # `injectDestructorCalls` and top-level locals were never destroyed.
+    let moduleFlags =
+      if not headerOnly and sfInjectDestructors in module.flags: ModFlagInjectDestructors else: 0'i32
+    timed tWriteNif:
+      result = writeNifModule(graph.config, module.position.int32, topLevelStmts, graph.opsLog,
+                     replayActions, implDeps,
+                     genericOffers, typeOffers, resolvedImportDeps, firstUnusedId,
+                     expansions, moduleFlags,
+                     reexportedLocalSyms(graph, module),
+                     orderedInterface(graph, module),
+                     orderedInterface(graph, module, hidden = true),
+                     pendingRoutines, headerOnly, compareHeader)
+    if not headerOnly:
+      # The module's REAL direct imports (incl. macro-generated) for `nim ic`'s
+      # graph re-derivation; see ast2nif.writeSemDeps / semdata.addImportFileDep.
+      var semDepPaths: seq[string] = @[]
+      for f in resolvedImportDeps:
+        semDepPaths.add toFullPath(graph.config, f)
+      writeSemDeps(graph.config, module.position.int32, semDepPaths)
+
+  proc publishSemanticHeader(c: PContext; n: PNode) =
+    if c.headerDigest.len > 0 or c.config.errorCounter != 0: return
+    var pending = false
+    for task in c.bodyTasks:
+      pending = pending or task.state == btPending
+      # Earlier batches may already be checked. Keep their runtime bodies out
+      # of this temporary interface too: serializing them twice can cost more
+      # than the remaining batch. Importers demand the completed module when
+      # they need one of these routines or its inferred effects.
+      c.headerPending.add task.owner
+    if not pending: return
+    c.headerTree = n
+    c.headerDigest = persistSemanticModule(c.graph, c.module, c.idgen, n,
+      c.headerPending, headerOnly = true)
+    let artifact = toGeneratedFile(c.config,
+      AbsoluteFile(cachedModuleSuffix(c.config, c.module.position.FileIndex)), ".s.bif").string
+    writeFile(pendingMarker(artifact), publishedIcHeader)
+    if onIcHeaderReady != nil:
+      {.cast(gcsafe).}:
+        onIcHeaderReady(artifact)
+
 proc processPipelineModuleImpl(graph: ModuleGraph; module: PSym; idgen: IdGenerator;
                     stream: PLLStream): bool =
   if graph.stopCompile(): return true
@@ -122,7 +232,17 @@ proc processPipelineModuleImpl(graph: ModuleGraph; module: PSym; idgen: IdGenera
     fileIdx = module.fileIdx
 
   prepareConfigNotes(graph, module)
+  if inIcWorker and graph.config.cmd == cmdM and
+      graph.config.isDefined("icSplitBodies") and graph.config.icGroup.len == 0 and
+      not graph.withinSystem and sfSystemModule notin module.flags:
+    graph.config.globalOptions.incl optDeferBodies
   let ctx = preparePContext(graph, module, idgen)
+  when not defined(nimKochBootstrap):
+    if readIcHeaders and onIcHeaderReady != nil and
+        graph.config.cmd == cmdM and graph.config.icGroup.len == 0 and
+        graph.config.implicitIncludes.len == 0 and not graph.withinSystem and
+        sfSystemModule notin module.flags:
+      ctx.onHeadersReady = publishSemanticHeader
   let bModule: PPassContext =
     case graph.pipelinePass
     of CgenPass:
@@ -278,84 +398,20 @@ proc processPipelineModuleImpl(graph: ModuleGraph; module: PSym; idgen: IdGenera
            toFullPath(graph.config, module.position.FileIndex) in graph.config.icGroup)))
     if shouldWriteNif and not graph.config.isDefined("nimscript"):
       topLevelStmts.add finalNode
-      # Collect replay actions from both pragma computations and VM state diff
-      var replayActions: seq[PNode] = @[]
-      # Get pragma-recorded replay actions (compile, link, passC, passL, etc.)
-      if graph.nifReplayActions.hasKey(module.position.int32):
-        replayActions.add graph.nifReplayActions[module.position.int32]
-      # Also get VM state diff (macro cache operations)
-      if graph.vm != nil:
-        for (m, n) in PCtx(graph.vm).vmstateDiff:
-          if m == module:
-            replayActions.add n
-
-      # NeedsImpl edge recording: which modules' bodies this process consumed
-      # at compile time (VM/getImpl). For an --icGroup cycle every member gets
-      # the union; intra-group entries are filtered by the writer.
-      var implDeps: seq[int] = @[]
-      for id in graph.icImplDeps: implDeps.add id
-      # Generic-instance OFFERS: every instance THIS module created, so a
-      # consumer reuses it rather than re-instantiating in its own scope (which
-      # cannot see symbols visible only at the generic's definition site — e.g.
-      # a distinct type's `==`). See ast2nif.writeNifModule / moduleFromNifFile.
-      var genericOffers: seq[tuple[generic, inst: PSym;
-                                   concreteTypes: seq[PType]; genericParamsCount: int]] = @[]
-      for genItemId, instList in graph.procInstCache:
-        for inst in instList:
-          if inst.sym != nil and inst.sym.itemId.module == module.position and
-              inst.sym.instantiatedFrom != nil and inst.compilesId == 0:
-            # `concreteTypes` is pre-sized to `paramsLen+gp.len`; a tail slot can
-            # stay nil (e.g. fewer materialized params than `paramsLen`). Such an
-            # offer can't be serialized — skip it (the consumer re-instantiates,
-            # the prior behaviour) rather than emit a nil type reference.
-            var hasNil = false
-            for ct in inst.concreteTypes:
-              if ct == nil: hasNil = true; break
-            if not hasNil:
-              genericOffers.add (inst.sym.instantiatedFrom, inst.sym,
-                                 inst.concreteTypes, inst.genericParamsCount)
-      # Generic TYPE-instance OFFERS: every `tyGenericInst` THIS module created,
-      # so a consumer reuses its baked structure (array bounds etc.) rather than
-      # re-instantiating with a scope-divergent bound. See ast2nif.writeNifModule.
-      var typeOffers: seq[tuple[generic: PSym; inst: PType]] = @[]
-      for genItemId, instList in graph.typeInstCache:
-        for inst in instList:
-          if inst != nil and inst.itemId.module == module.position and
-              inst.kidsLen > 0 and inst[0] != nil and
-              inst[0].kind == tyGenericBody and inst[0].sym != nil:
-            typeOffers.add (inst[0].sym, inst)
-      # The module's REAL resolved direct imports (incl. macro/template-generated
-      # ones with no surviving syntactic node). Passed to writeNifModule so the
-      # NIF `deps` section is complete (the backend closure walk needs it), and
-      # reused below for the `.s.deps` sidecar (frontend graph re-derivation).
-      let resolvedImportDeps = graph.importDeps.getOrDefault(module.position.FileIndex, @[])
-      # The frontend's highest used itemId (max of the sym and type counters):
-      # the backend seeds its id minting ABOVE this so closure envs / RTTI hooks
-      # never share a `toId` with a frontend sym/type. See ast2nif `(unusedid)`.
-      let firstUnusedId = max(idgen.symId, idgen.typeId)
-      var expansions: seq[(PSym, TLineInfo)] = @[]
-      discard graph.nifExpansions.take(module.position.int32, expansions)
-      # The module symbol's own backend-relevant flags. `sfInjectDestructors` is
-      # set by sempass2 when the module's TOP-LEVEL statements need the
-      # destructor pass; `moduleFromNifFile` builds a fresh module PSym, so
-      # without persisting it `cgen.genTopLevelStmt` skipped
-      # `injectDestructorCalls` and top-level locals were never destroyed.
-      let moduleFlags =
-        if sfInjectDestructors in module.flags: ModFlagInjectDestructors else: 0'i32
-      timed tWriteNif:
-        writeNifModule(graph.config, module.position.int32, topLevelStmts, graph.opsLog,
-                       replayActions, implDeps,
-                       genericOffers, typeOffers, resolvedImportDeps, firstUnusedId,
-                       expansions, moduleFlags,
-                       reexportedLocalSyms(graph, module),
-                       orderedInterface(graph, module),
-                       orderedInterface(graph, module, hidden = true))
-      # The module's REAL direct imports (incl. macro-generated) for `nim ic`'s
-      # graph re-derivation; see ast2nif.writeSemDeps / semdata.addImportFileDep.
-      var semDepPaths: seq[string] = @[]
-      for f in resolvedImportDeps:
-        semDepPaths.add toFullPath(graph.config, f)
-      writeSemDeps(graph.config, module.position.int32, semDepPaths)
+      if ctx.headerDigest.len > 0:
+        let finalHeader = persistSemanticModule(graph, module, idgen, ctx.headerTree,
+          ctx.headerPending, headerOnly = true, compareHeader = true)
+        if finalHeader != ctx.headerDigest: changedIcHeader = true
+      # Cookie chaining and replay validation require completed dependencies.
+      # Yield the job if one is still checking bodies; never occupy a worker
+      # waiting for another queued actor or persist a provisional cookie.
+      requireCompleteHeaders("publish")
+      discard persistSemanticModule(graph, module, idgen, topLevelStmts)
+      if readIcHeaders:
+        let artifact = toNifFilename(graph.config, module.position.FileIndex, useHeader = false)
+        writeFile(headerValidation(artifact),
+          if changedIcHeader: "" else: publishedIcHeader)
+        removeFile(AbsoluteFile pendingMarker(artifact))
 
   result = true
 
@@ -508,7 +564,8 @@ proc compilePipelineModule*(graph: ModuleGraph; fileIdx: FileIndex; flags: TSymF
               # is removed so nothing loads it; its absence tells the driver the
               # round is incomplete. The driver fails the build itself if
               # discovery cannot make progress.
-              removeFile(AbsoluteFile toNifFilename(graph.config, graph.config.projectMainIdx))
+              removeFile(AbsoluteFile toNifFilename(graph.config, graph.config.projectMainIdx,
+                useHeader = false))
               msgQuit(0)
             globalError(graph.config, unknownLineInfo,
               "nim m requires precompiled NIF for import: " & toFullPath(graph.config, fileIdx) &

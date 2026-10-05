@@ -2431,16 +2431,13 @@ proc semMethodPrototype(c: PContext; s: PSym; n: PNode) =
 
 # ---- doc/parallel_compiler.md stage 1: deferred routine bodies --------------
 #
-# `--deferBodies:on` moves the sem of a top-level routine's BODY out of the
-# statement that declares it and into a pass that runs when the module's header
-# is complete. One worker, drained in key order: no threads, no scheduling, only
-# the order change — which is the half of the plan that changes results and so
-# has to be reviewed on its own (§5, stage 1). The parallel version of §5 stage
-# 4 must stay byte-identical to this.
+# `--deferBodies:on` queues eligible top-level bodies in source order. IC's
+# interface handoff uses that boundary to release importers on other workers.
+# The module's own body batch and mutable graph stay on its owner thread.
 #
 # What "top level" buys is that the unit needs nothing from the statement it was
-# declared in: everything positional is captured in the `BodyTask`, and the rest
-# of `PContext` is module-shared and does not move between declaration and drain.
+# declared in: positional state and lexical visibility are captured in the
+# `BodyTask`; statements that can observe prior bodies flush the batch first.
 
 proc semRoutineBodyUnit(c: PContext; s: PSym; n: PNode; resultType: PType;
                         isInlineIterator: bool) =
@@ -2469,7 +2466,7 @@ proc deferrableBody(c: PContext; s: PSym): bool =
   ## instantiation or a `static:` block belongs to whatever is driving that, so
   ## none of them is a unit of its own.
   result = optDeferBodies in c.config.globalOptions and
-    s.kind in {skProc, skFunc, skMethod, skIterator} and
+    s.kind in {skProc, skFunc} and
     s.magic == mNone and
     sfCompileTime notin s.flags and
     s.owner != nil and s.owner.kind == skModule and s.owner == c.module and
@@ -2477,18 +2474,38 @@ proc deferrableBody(c: PContext; s: PSym): bool =
     c.inGenericContext == 0 and c.inGenericInst == 0 and
     c.inStaticContext == 0 and c.inUnrolledContext == 0 and
     c.config.ideCmd == ideNone
+  # Inferred return types and inline iterators are themselves part of the
+  # interface. Their bodies must finish before the next declaration uses them.
+  if result:
+    result = (s.typ.returnType == nil or
+       s.typ.returnType.kind notin {tyAnything, tyUntyped, tyTyped, tyFromExpr})
+
+proc snapshotBodyScope(c: PContext; scope: PScope;
+                       top, module: var PScope): PScope =
+  ## Copy table storage, retaining symbol identity. Later declarations must
+  ## not enter a deferred body's overload set or its module-qualified lookup.
+  ## These snapshots are private to this module's worker, never shared ASTs.
+  if scope == nil: return nil
+  result = PScope(depthLevel: scope.depthLevel, symbols: scope.symbols,
+    allowPrivateAccess: scope.allowPrivateAccess, optionStackLen: scope.optionStackLen)
+  result.parent = snapshotBodyScope(c, scope.parent, top, module)
+  if scope == c.topLevelScope: top = result
+  if scope == c.moduleScope: module = result
 
 proc enqueueBodyTask(c: PContext; s: PSym; n: PNode; resultType: PType;
                      isInlineIterator: bool): PScope =
   ## Captures the unit and hands back the scope the caller must DETACH rather
   ## than close: the parameters have to still be in it when the body runs.
   result = c.currentScope
+  var top, module: PScope = nil
+  let scope = snapshotBodyScope(c, result, top, module)
   c.bodyTaskIndex[s.itemId] = c.bodyTasks.len
   c.bodyTasks.add BodyTask(
     key: uint64(c.bodyTasks.len), state: btPending,
     owner: s, def: n, resultType: resultType,
     isInlineIterator: isInlineIterator,
-    scope: result, procCon: c.p,
+    scope: scope, topLevelScope: top, moduleScope: module, procCon: c.p,
+    imports: c.imports, patterns: c.patterns,
     optionStack: c.optionStack,
     options: c.config.options, notes: c.config.notes,
     warningAsErrors: c.config.warningAsErrors, features: c.features)
@@ -2501,6 +2518,10 @@ proc runBodyTask(c: PContext; idx: int) =
   c.bodyTasks[idx].state = btRunning
   let
     savedScope = c.currentScope
+    savedTopScope = c.topLevelScope
+    savedModuleScope = c.moduleScope
+    savedImports = c.imports
+    savedPatterns = c.patterns
     savedProcCon = c.p
     savedOptionStack = c.optionStack
     savedOptions = c.config.options
@@ -2510,6 +2531,10 @@ proc runBodyTask(c: PContext; idx: int) =
     savedOwnerLen = c.graph.owners.len
   let t = c.bodyTasks[idx]
   c.currentScope = t.scope
+  c.topLevelScope = t.topLevelScope
+  c.moduleScope = t.moduleScope
+  c.imports = t.imports
+  c.patterns = t.patterns
   c.p = t.procCon
   c.p.next = savedProcCon
   c.optionStack = t.optionStack
@@ -2529,12 +2554,28 @@ proc runBodyTask(c: PContext; idx: int) =
     c.bodyTasks[idx].state = btDone
     setLen(c.graph.owners, savedOwnerLen)
     c.currentScope = savedScope
+    c.topLevelScope = savedTopScope
+    c.moduleScope = savedModuleScope
+    c.imports = savedImports
+    c.patterns = savedPatterns
     c.p = savedProcCon
     c.optionStack = savedOptionStack
     c.config.options = savedOptions
     c.config.notes = savedNotes
     c.config.warningAsErrors = savedWarningAsErrors
     c.features = savedFeatures
+    # Finished units retain their identity for on-demand lookups, but no
+    # longer need copies of the module's lexical tables or option stacks.
+    c.bodyTasks[idx].scope = nil
+    c.bodyTasks[idx].topLevelScope = nil
+    c.bodyTasks[idx].moduleScope = nil
+    c.bodyTasks[idx].procCon = nil
+    c.bodyTasks[idx].imports.setLen 0
+    c.bodyTasks[idx].patterns.setLen 0
+    c.bodyTasks[idx].optionStack.setLen 0
+    while c.nextBodyTask < c.bodyTasks.len and
+        c.bodyTasks[c.nextBodyTask].state == btDone:
+      inc c.nextBodyTask
 
 proc demandRoutineBody(c: PContext; prc: PSym) =
   ## §2.3's "run it inline": something needs a unit's body before the body pass
@@ -2557,7 +2598,7 @@ proc demandRoutineBody(c: PContext; prc: PSym) =
     # `processCallbacksAndTimers` (declared 1100 lines above), which then had no
     # effect list yet — so `runOnce` was inferred GC-unsafe and its `{.gcsafe.}`
     # forward declaration rejected it.
-    for i in 0 .. idx: runBodyTask(c, i)
+    for i in c.nextBodyTask .. idx: runBodyTask(c, i)
   elif c.prevDemandRoutineBody != nil:
     c.prevDemandRoutineBody(prc)
 
@@ -2565,7 +2606,7 @@ proc drainBodyTasks*(c: PContext) =
   ## The body pass. In key order, which for stage 1 is simply front to back:
   ## the header pass appended in source order and the on-demand path only ever
   ## marks entries done early, never reorders them.
-  var i = 0
+  var i = c.nextBodyTask
   while i < c.bodyTasks.len:
     # not a `for`: a unit's body can enqueue nothing (nested routines are not
     # units) but CAN mark later ones done through `demandRoutineBody`, and the
@@ -2573,13 +2614,31 @@ proc drainBodyTasks*(c: PContext) =
     runBodyTask(c, i)
     inc i
 
-const
-  DeferrableNeighbours = {nkProcDef, nkFuncDef, nkMethodDef, nkIteratorDef,
-                          nkConverterDef, nkTemplateDef, nkMacroDef,
-                          nkTypeSection, nkCommentStmt, nkEmpty, nkPragma,
-                          nkWhenStmt, nkStmtList}
-    ## Top-level statements a pending unit may safely outlive. A run of
-    ## declarations defers as a batch; anything else flushes it first.
+proc headerMayRunCode(n: PNode): bool =
+  ## Calls in defaults, type expressions and user pragmas can enter the VM or
+  ## inspect an earlier routine. Finish prior units before such a header.
+  result = false
+  case n.kind
+  of nkCallKinds, nkPragmaExpr, nkDo, nkLambda:
+    return true
+  of nkIdent:
+    return n.ident.s in ["auto", "typed", "untyped"]
+  else:
+    for child in n:
+      if headerMayRunCode(child): return true
+
+proc routineNeedsPriorBodies(c: PContext; stmt: PNode): bool =
+  if stmt.kind notin {nkProcDef, nkFuncDef}: return true
+  if stmt[genericParamsPos].kind != nkEmpty: return true
+  if stmt[pragmasPos].kind != nkEmpty: return true
+  if headerMayRunCode(stmt[paramsPos]): return true
+  # A forward implementation can mutate the symbol shared by an earlier
+  # body's scope. Finish the earlier body while that symbol is still forward.
+  var name = stmt[namePos]
+  if name.kind == nkPostfix: name = name[1]
+  if name.kind == nkIdent:
+    return strTableGet(c.topLevelScope.symbols, name.ident) != nil
+  true
 
 proc flushBodiesBeforeTopLevelStmt*(c: PContext; stmt: PNode) =
   ## Units live only until the next top-level statement that could OBSERVE one.
@@ -2590,18 +2649,18 @@ proc flushBodiesBeforeTopLevelStmt*(c: PContext; stmt: PNode) =
   ## answering the demand there means running sem — and a nested VM session —
   ## while one is already executing on the graph's single `PCtx`. That is §4.6
   ## step 2, "the hardest single item in this plan", and the doc allows it to be
-  ## deferred behind a restriction until it is done. This is that restriction,
-  ## and it is a cheap one: modules are long runs of routine definitions, so a
-  ## run defers as a batch and only a `const`, `static:`, `var` initialiser or
-  ## plain expression ends one.
+  ## deferred behind a restriction until it is done. A run of simple routine
+  ## declarations defers as a batch. Compile-time declarations, inferred
+  ## signatures, pragmas, imports and top-level expressions end the batch.
   ##
   ## Flushing HERE and not at the VM's own entry matters: this is a statement
   ## boundary at module scope, where the only live state is the module's, and
   ## running a unit is safe. `vm.setupGlobalCtx` is reached from inside generic
   ## instantiations and template expansions, where it is not.
-  if c.bodyTasks.len > 0 and stmt.kind notin DeferrableNeighbours and
-      c.currentScope.depthLevel <= 2:
-    drainBodyTasks(c)
+  if c.nextBodyTask < c.bodyTasks.len and c.currentScope.depthLevel <= 2:
+    if stmt.kind notin {nkCommentStmt, nkEmpty, nkStmtList} and
+        routineNeedsPriorBodies(c, stmt):
+      drainBodyTasks(c)
 
 proc drainBeforeModulePass*(c: PContext) =
   ## About to compile another module from inside this one's header pass.
@@ -2900,6 +2959,15 @@ proc semProcAux(c: PContext, n: PNode, kind: TSymKind,
         if deferrableBody(c, s):
           deferredScope = enqueueBodyTask(c, s, n, resultType, isInlineIterator)
         else:
+          # Some signatures imply eager checking only AFTER parameter/type
+          # analysis (notably NimNode makes a routine compile-time). Such a
+          # body must see earlier routines' inferred effects, just as it does
+          # in source order. Never drain later units from inside a running one.
+          if s.owner == c.module:
+            var running = false
+            for i in c.nextBodyTask ..< c.bodyTasks.len:
+              if c.bodyTasks[i].state == btRunning: running = true; break
+            if not running: drainBodyTasks(c)
           semRoutineBodyUnit(c, s, n, resultType, isInlineIterator)
       else:
         if (s.typ.returnType != nil and s.kind != skIterator):

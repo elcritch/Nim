@@ -65,6 +65,64 @@ coordinator. Completed actors are released immediately. A module's later stages
 can run on another worker, so the dependency cache belongs to the OS worker,
 not the module actor.
 
+Experimental interface/body overlap
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``nim c --ic:on -d:icSplitBodies --parallelBuild:16 project.nim`` enables
+early interface handoff between module actors. It is off by default.
+``headersReady`` releases an importer's dependency edge while the producer
+continues checking its queued routine bodies. The producer's mutable graph
+and its body batch remain on one worker; this does not distribute individual
+routines from the same module across workers.
+
+An early interface is a versioned, immutable ``.h.bif.<digest>.<unique>`` snapshot.
+Checked types and declarations can be loaded independently. Withheld runtime
+routines and their types carry explicit ``pendingbody`` entries, so an
+importer needing their inferred effects or implementation yields its worker
+slot and retries after that module completes. Macros, templates, generic
+bodies, inferred return types, methods and iterators are checked eagerly.
+VM entry also requires completed, validated dependencies. The system module
+and strongly connected import groups keep the ordinary compilation path.
+
+Deferred bodies retain their declaration-time lexical scopes. Top-level
+statements, pragmas, compile-time declarations and signatures that can run
+code flush preceding bodies. This preserves declare-before-use, overload
+visibility and effect inference, including routines implicitly made
+compile-time by a ``NimNode`` signature.
+
+After checking bodies, the producer compares the published interface with its
+final projection. New hooks, generic offers or compile-time replay state
+invalidate consumers of that snapshot and their dependents. Affected jobs
+rerun with completed dependencies; speculative diagnostics are discarded.
+Final artifacts and dependency cookies require validated inputs. Snapshot
+files and readiness markers are removed when the pool closes. Only file names
+and result records cross actors, so ordinary ARC remains sufficient.
+
+``-d:icProfile`` includes ``ICHEADER`` notifications, ``headers`` and
+``bodyWaits`` counts in ``ICBUILD``, and ``waitFor``/``waitReason`` in ``ICJOB``.
+Reasons distinguish implementation, VM, final publication and changed-interface
+dependencies. A retry currently creates a fresh compiler context. This is a
+material cost for programs with frequent compile-time execution; the flag is
+experimental, not a promised speedup.
+Compilers built with ``--panics:on`` retain completed-module scheduling because
+that build mode cannot unwind the pending-body handoff through lazy AST accessors.
+
+On Kosmo (FreeBSD, Ryzen 7 8745HS, 16 workers, 1 GiB dependency cache per
+worker), two frontend-only builds with fresh Nimcache directories took
+55.55/55.01 seconds without the split and 66.64/65.05 seconds with it.
+The means are 55.28 versus 65.84 seconds: the split is 19.1% slower on this
+workload. Mean aggregate CPU time rose from 234.66 to 309.44 seconds, and
+the largest observed RSS rose from 9.34 to 10.99 GiB. The split published
+570/574 early interfaces and yielded 165/168 times for dependencies.
+Additional serialization and repeated semantic work outweighed the overlap.
+The next performance step is retaining suspended work and making effect/body
+dependencies more precise, rather than enabling this mode by default.
+A complete clean Kosmo build with the split took 145.86 seconds and peaked at
+11.97 GiB RSS; its executable passed ``--help``. A warm rebuild took 4.63 seconds,
+then the settled no-op took 0.49 seconds with all 7,809 primary artifact
+timestamps unchanged. The IC suite passed all 78 tests, and two clean compiler
+self-builds with the split produced identical binaries.
+
 Dependency scanning uses a growing queue of per-file actors in the same pool.
 Each runs ``nifler parse --deps`` once, retaining both the parsed ``.p.nif`` and
 its dependency list. The coordinator reads each completed list and immediately
@@ -329,10 +387,10 @@ seconds, about 7.6% below the preceding 59.46-second trial. There were 28–29
 shorter rounds instead of 17; the benefit comes from scheduling discoveries
 earlier, not from minimizing the number of rounds. The same 1,004 semantic
 artifacts were produced, with only benchmark cache paths differing. Routine
-bodies still run sequentially within each module, and importers still need
-their dependencies' completed semantic artifacts. Early interface publication
-and parallel body tasks remain the larger design in ``parallel_compiler.md``;
-the existing ``--deferBodies`` prototype does not yet provide those guarantees.
+bodies still run sequentially within each module. These measurements use the
+default scheduling mode, where importers need completed semantic artifacts.
+The opt-in ``icSplitBodies`` handoff described above overlaps module work;
+individual routine scheduling remains part of ``parallel_compiler.md``.
 
 Two complete builds with early discovery took 132.46 and 129.53 seconds
 (130.99 mean), compared with the preceding 135.61-second mean, a 3.4% reduction.

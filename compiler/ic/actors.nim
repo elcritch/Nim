@@ -6,11 +6,12 @@
 {.push warning[Uninit]: off, warning[ProveInit]: off.}
 
 import std/[os, osproc, times, tables, sets, deques, locks, streams, monotimes, json,
-            heapqueue]
+            heapqueue, strutils]
 import sigils
 import sigils/threads
 import "../../dist/nimony/src/lib" / [nifcore, nifcoreparse]
 import jobtypes
+import semhandoff
 import mergecache
 export jobtypes
 when defined(icBNodeProf): import ../icprof
@@ -156,12 +157,16 @@ proc backendWeight(job: IcJob): int64 =
 type
   IcWorkerPool* = ref object
     pool: SigilThreadPoolPtr
+    headerSnapshots: HashSet[string]
+    unstableHeaders: HashSet[string]
+    semanticArtifacts: HashSet[string]
   ModuleAgent = ref object of AgentActor
     arguments: seq[string]
     command: string
     id: int
     execute: IcExecutor
     profile: bool
+    earlyHeaders: bool
     submitted: MonoTime
   Request = ref object of Agent
   Completion = object
@@ -172,13 +177,19 @@ type
     thread: int
   Coordinator = ref object of Agent
     completed: Deque[Completion]
+    headers: Deque[int]
 
 proc requested(self: Request) {.signal.}
 proc finished(self: ModuleAgent; value: Completion) {.signal.}
+proc headersReady(self: ModuleAgent; id: int) {.signal.}
 
 proc process(self: ModuleAgent) {.slot.} =
   let started = if self.profile: getMonoTime() else: default(MonoTime)
   var outcome = default(IcJobResult)
+  if self.earlyHeaders:
+    onIcHeaderReady = proc(artifact: string) {.gcsafe.} =
+      emit self.headersReady(self.id)
+  defer: onIcHeaderReady = nil
   try:
     outcome = self.execute(self.arguments)
   except CatchableError as e:
@@ -193,6 +204,9 @@ proc process(self: ModuleAgent) {.slot.} =
 
 proc record(self: Coordinator; value: Completion) {.slot.} =
   self.completed.addLast value
+
+proc recordHeader(self: Coordinator; id: int) {.slot.} =
+  self.headers.addLast id
 
 proc newIcWorkerPool*(workers = countProcessors()): IcWorkerPool =
   ## One compiler invocation can run several discovery rounds and backend
@@ -221,12 +235,18 @@ proc close*(workers: IcWorkerPool) =
   deinitLock(pool[].queueLock)
   deinitLock(pool[].signaledLock)
   deallocShared(pool)
+  for snapshot in workers.headerSnapshots: removeFile(snapshot)
+  workers.headerSnapshots.clear()
+  for artifact in workers.semanticArtifacts:
+    removeFile(pendingMarker(artifact))
+    removeFile(headerValidation(artifact))
+  workers.semanticArtifacts.clear()
 
 proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
                 workers = countProcessors(); report: IcReporter = nil;
                 session: IcWorkerPool = nil; profile = false;
                 onComplete: IcJobObserver = nil;
-                yieldOnDiscovery = false): int =
+                yieldOnDiscovery = false; earlyInterfaces = false): int =
   ## With `yieldOnDiscovery`, a successful job with missing outputs ends this
   ## round after running jobs finish. The caller must expand the dependency
   ## graph and resubmit unfinished work; this does not cancel any running job.
@@ -282,22 +302,64 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
       var requests = newSeq[Request](jobs.len)
       var proxies = newSeq[AgentProxy[ModuleAgent]](jobs.len)
       var blocked = newSeq[bool](jobs.len)
+      var released = newSeq[bool](jobs.len)
+      var done = newSeq[bool](jobs.len)
+      var waiting = newSeq[seq[int]](jobs.len)
+      var outcomes = newSeq[IcJobResult](jobs.len)
+      var producers = initTable[string, int]()
+      for id, job in jobs:
+        for output in job.outputs:
+          if output.endsWith(".s.bif"):
+            producers[output] = id
+            if earlyInterfaces:
+              removeFile(pendingMarker(output))
+              owner.semanticArtifacts.incl output
       var active = 0
       var remaining = jobs.len
       var executed, skipped, deferred, blockedJobs, peakActive: int
       var busyNs: int64
       var discoveryPending = false
+      var headers, bodyWaits: int
+
+      proc release(id: int) =
+        if not released[id]:
+          released[id] = true
+          for next in dependents[id]:
+            dec pending[next]
+            if pending[next] == 0: enqueue(next)
 
       proc complete(id: int; failed: bool) =
+        done[id] = true
         dec remaining
         for next in dependents[id]:
           blocked[next] = blocked[next] or failed
-          dec pending[next]
-          if pending[next] == 0: enqueue(next)
+        release(id)
+        for next in waiting[id]:
+          blocked[next] = blocked[next] or failed
+          enqueue(next)
+        waiting[id].setLen 0
+
+      proc removePending(id: int) =
+        if earlyInterfaces:
+          for output in jobs[id].outputs:
+            if output.endsWith(".s.bif"): removeFile(pendingMarker(output))
 
       while remaining > 0:
         while ready.len > 0 and active < pool[].workerCount and not discoveryPending:
           let id = ready.pop().id
+          if earlyInterfaces and jobs[id].outputs.len > 0:
+            # A warm rule must compare the dependency's FINAL cookie. Its
+            # previous cookie is still on disk while a new header is available.
+            var built = true
+            for output in jobs[id].outputs:
+              if not fileExists(output): built = false; break
+            if built:
+              var wait = -1
+              for dep in jobs[id].dependencies:
+                if not done[dep]: wait = dep; break
+              if wait >= 0:
+                waiting[wait].add id
+                continue
           if blocked[id]:
             inc blockedJobs
             complete(id, true)
@@ -305,26 +367,46 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
             inc skipped
             complete(id, false)
           else:
+            var publishEarly = earlyInterfaces
+            if earlyInterfaces:
+              for output in jobs[id].outputs:
+                if output.endsWith(".s.bif"):
+                  writeFile(pendingMarker(output), "")
+                  if output in owner.unstableHeaders: publishEarly = false
             var actor = ModuleAgent(arguments: jobs[id].arguments,
               command: jobs[id].command, id: id, execute: execute, profile: profile,
+              earlyHeaders: publishEarly,
               submitted: (if profile: getMonoTime() else: default(MonoTime)))
             proxies[id] = actor.moveToThread(pool)
             requests[id] = Request()
             connectThreaded(requests[id], requested, proxies[id], process)
             connectThreaded(proxies[id], finished, coordinator, Coordinator.record())
+            if earlyInterfaces:
+              connectThreaded(proxies[id], headersReady, coordinator, Coordinator.recordHeader())
             inc active
             inc executed
             peakActive = max(peakActive, active)
             emit requests[id].requested()
         if active > 0:
-          while coordinator.completed.len == 0: discard home.poll()
+          while coordinator.completed.len == 0 and coordinator.headers.len == 0:
+            discard home.poll()
+          while coordinator.headers.len > 0:
+            let id = coordinator.headers.popFirst()
+            if not released[id]:
+              inc headers
+              release(id)
+              if profile and report != nil:
+                report("ICHEADER " & $(%*{"id": id,
+                  "elapsedNs": (getMonoTime() - started).inNanoseconds}))
           while coordinator.completed.len > 0:
             let completion = coordinator.completed.popFirst()
             dec active
-            if onComplete != nil:
-              onComplete(jobs[completion.id], completion.outcome.exitCode)
-            if completion.outcome.output.len > 0 and report != nil:
-              report(completion.outcome.output)
+            if earlyInterfaces:
+              for output in jobs[completion.id].outputs:
+                if output.endsWith(".s.bif"):
+                  if completion.outcome.headerSnapshot.startsWith(headerArtifact(output) & "."):
+                    owner.headerSnapshots.incl completion.outcome.headerSnapshot
+                  if completion.outcome.changedHeader: owner.unstableHeaders.incl output
             when defined(icBNodeProf):
               if completion.outcome.profile.len > 0:
                 writeIcProfile(completion.outcome.profile)
@@ -337,7 +419,31 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
                 "output": (if job.outputs.len > 0: job.outputs[0] else: ""),
                 "startNs": (completion.started - started).inNanoseconds,
                 "queueNs": completion.queueNs,
-                "durationNs": duration, "exitCode": completion.outcome.exitCode}))
+                "durationNs": duration, "exitCode": completion.outcome.exitCode,
+                "waitFor": completion.outcome.waitFor,
+                "waitReason": completion.outcome.waitReason}))
+            if earlyInterfaces and completion.outcome.waitFor.len > 0:
+              let target = producers.getOrDefault(completion.outcome.waitFor, -1)
+              if target < 0 or target == completion.id:
+                invalid("unresolved body dependency " & completion.outcome.waitFor)
+              inc bodyWaits
+              if onComplete != nil: onComplete(jobs[completion.id], 0)
+              for output in jobs[completion.id].outputs:
+                if output.endsWith(".s.bif"): removeFile(output)
+              if done[target]:
+                blocked[completion.id] = blocked[completion.id] or outcomes[target].exitCode != 0
+                enqueue(completion.id)
+              else:
+                waiting[target].add completion.id
+              reset(requests[completion.id])
+              reset(proxies[completion.id])
+              continue
+            outcomes[completion.id] = completion.outcome
+            removePending(completion.id)
+            if onComplete != nil:
+              onComplete(jobs[completion.id], completion.outcome.exitCode)
+            if not earlyInterfaces and completion.outcome.output.len > 0 and report != nil:
+              report(completion.outcome.output)
             let failed = completion.outcome.exitCode != 0
             if failed: result = completion.outcome.exitCode
             # A semantic job stops successfully when it discovers an import
@@ -366,13 +472,67 @@ proc runIcJobs*(jobs: seq[IcJob]; execute: IcExecutor;
         # can postpone discovery for seconds. Unstarted jobs remain untouched
         # and are reconsidered against the expanded graph in the next round.
         if discoveryPending and active == 0: break
+        if active == 0 and ready.len == 0 and remaining > 0:
+          # A macro may expose a new import cycle after headers were released.
+          # Fresh sidecars from the yielded jobs let the driver collapse its
+          # SCC and compile it as one module group in the next discovery round.
+          if earlyInterfaces:
+            discoveryPending = true
+            break
+          invalid("semantic body dependency cycle")
+      var invalidHeaders = false
+      if earlyInterfaces:
+        var invalidJobs = newSeq[bool](jobs.len)
+        var headerConsumers = newSeq[seq[int]](jobs.len)
+        for id, outcome in outcomes:
+          for header in outcome.usedHeaders:
+            let producer = producers.getOrDefault(header.artifact, -1)
+            if producer >= 0: headerConsumers[producer].add id
+            if producer < 0 or not done[producer] or not fileExists(header.artifact) or
+                outcomes[producer].exitCode != 0 or outcomes[producer].changedHeader or
+                outcomes[producer].headerSnapshot != header.snapshot:
+              invalidJobs[id] = true
+          # Any speculative error is replayed with final dependencies, so an
+          # unfinished generic offer or compile-time state cannot cause a false
+          # diagnostic. No speculative artifact survives that replay.
+          if outcome.exitCode != 0 and outcome.usedHeaders.len > 0:
+            invalidJobs[id] = true
+        # A consumer of a rejected artifact must be replayed too, even if its
+        # own job used the completed artifact rather than the early snapshot.
+        var invalidQueue = initDeque[int]()
+        for id in 0..<jobs.len:
+          if invalidJobs[id]: invalidQueue.addLast id
+        invalidHeaders = invalidQueue.len > 0
+        while invalidQueue.len > 0:
+          let id = invalidQueue.popFirst()
+          for children in [dependents[id], headerConsumers[id]]:
+            for child in children:
+              if not invalidJobs[child]:
+                invalidJobs[child] = true
+                invalidQueue.addLast child
+        for id in 0..<jobs.len: removePending(id)
+        if invalidHeaders:
+          for id, job in jobs:
+            if invalidJobs[id]:
+              for output in job.outputs:
+                if output.endsWith(".s.bif"): removeFile(output)
+        if report != nil:
+          for id, outcome in outcomes:
+            if not invalidJobs[id] and outcome.output.len > 0: report(outcome.output)
       if profile and report != nil:
         report("ICBUILD " & $(%*{"workers": pool[].workerCount,
           "executed": executed, "skipped": skipped, "peakActive": peakActive,
           "deferred": deferred, "blocked": blockedJobs,
           "pending": remaining,
+          "headers": headers, "bodyWaits": bodyWaits, "invalidHeaders": invalidHeaders,
           "busyNs": busyNs, "wallNs": (getMonoTime() - started).inNanoseconds}))
       # Drop proxies while their scheduler is alive; all results have arrived.
+      if invalidHeaders and not discoveryPending:
+        var finalJobs = jobs
+        for job in finalJobs.mitems:
+          if job.command == "nim_m": job.arguments.insert("-d:icNoEarlyInterfaces", 2)
+        return runIcJobs(finalJobs, execute, workers, report, session = owner,
+          profile = profile, onComplete = onComplete, yieldOnDiscovery = yieldOnDiscovery)
   finally:
     if session == nil: owner.close()
 

@@ -12,6 +12,7 @@
 
 import semmacrosanity
 import ic/sharedcounters
+import ic/semhandoff
 import
   std/[strutils, tables, intsets, parseutils],
   msgs, vmdef, vmgen, nimsets, types,
@@ -535,6 +536,7 @@ proc takeCharAddress(c: PCtx, src: PNode, index: BiggestInt, pc: int): TFullReg 
 
 
 proc rawExecute(c: PCtx, start: int, tos: PStackFrame): TFullReg =
+  requireCompleteHeaders()
   result = TFullReg(kind: rkNone)
   var pc = start
   var tos = tos

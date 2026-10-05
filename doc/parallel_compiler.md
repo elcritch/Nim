@@ -4,6 +4,15 @@ Status: PLAN (2026-09-01). Written against branch `araq-ic-fixes3` @ `b2ecde1f2`
 Companion to `doc/ic.md` (the IC design this sits on top of). Line numbers below
 are from that commit; the measurements are from a 32-core machine.
 
+Implementation update (2026-10-04): `-d:icSplitBodies` now allows an IC module
+actor to publish an immutable checked interface before draining its remaining
+routine bodies. Importers can start on other Sigils workers, with explicit
+implementation/effect and VM dependencies, version validation and affected-job
+replay. Mutable compiler graphs remain thread-owned under ordinary ARC.
+Bodies within one module still run sequentially; the per-routine scheduler and
+shared `PContext` described below remain a plan. See `doc/ic.md` for the flag,
+current restrictions and measurements.
+
 ## 0. Goal, and the constraints that shape it
 
 The goal (Araq, 2026-09-01):
@@ -661,7 +670,7 @@ What landed, and the two things it settled:
   reproducible from a committed build rather than a scratch patch.
 
 **Stage 1 — deferred bodies, one worker. LANDED behind `--deferBodies:on`
-(2026-09-04), not yet green.** `semProcAux` enqueues; the queue is drained
+(2026-09-04).** `semProcAux` enqueues; the queue is drained
 *inline in key order* at module close, before `closePContext`. The
 `visibleUpTo` filter (§2.4) goes in here and must keep every declare-before-use
 test failing as before. Instances, hooks and inferred lambdas keep running
@@ -670,14 +679,17 @@ every order dependency of §4.10 with zero threads: the diff against today's
 compiler on `koch bootic` + the external packages is the review artifact.
 Expected: nearly empty.
 
-Landed so far: the `BodyTask` record of §2.2, the enqueue/drain, and the
-on-demand path. `--deferBodies:on` is off by default and the default build is
-byte-identical, so this is a reviewable A/B rather than a change of behaviour.
-`visibleUpTo` is NOT in yet — a deferred body currently sees the whole
-top-level scope, which is §4.10.3's rule applied to every unit rather than only
-to instantiation, and is one source of the diff below.
+The 2026-10-04 implementation preserves declaration-time visibility with scope
+table snapshots, including module-qualified lookup, imports and overloads.
+Inferred signatures and eager compile-time routines finish preceding units
+before inspecting their effects. The declare-before-use, async and implicit
+`NimNode` compile-time regressions now pass. Completed tasks release their
+scope snapshots, and drains start at the first unfinished task.
+`--deferBodies:on` remains off by default; `icSplitBodies` enables it only for
+eligible module actors.
 
-Status: `koch boot -d:release --deferBodies:on` reaches its fixed point, and a
+Historical measurements from the initial prototype follow.
+`koch boot -d:release --deferBodies:on` reached its fixed point, and a
 compiler *built* that way emits C byte-identical to a normally built one over
 all 217 modules — so the order change does not change what the compiler
 computes, only what it names things. `tests/compiler` and `tests/template`
@@ -715,10 +727,11 @@ Three order dependencies found, each fixed here:
    ends one. Modules are long runs of routine definitions, so little is lost,
    and this is the restriction §4.6 allows in place of VM handoff.
 
-Open, and the reason this is not the default: `tests/async` still fails with
+At that point, `tests/async` still failed with
 `'runOnce' is not GC-safe as it calls 'processCallbacksAndTimers'`, and with it
 `tests/ic/tmeta_async`. Finding (2) fixed the demand path but not this, so the
-remaining cause is elsewhere in the same file — the next thing to chase.
+remaining cause was elsewhere in the same file. The conservative eager-header
+boundaries added for interface handoff address that case.
 
 **Stage 2 — canonical identity.** Unit arenas for `IdGenerator`, `disambTable`
 and `templInstCounter`; unit-relative names for body-local nominal types and

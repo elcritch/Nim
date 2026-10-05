@@ -12,7 +12,7 @@
 import std / [assertions, tables, sets]
 from std / strutils import startsWith, endsWith, contains
 from std / os import fileExists, dirExists, walkFiles, existsEnv,
-  commandLineParams, getCurrentProcessId
+  commandLineParams, getCurrentProcessId, extractFilename, parentDir
 from std / exitprocs import addExitProc
 from std / syncio import readFile, stderr, writeLine
 from std / algorithm import sort
@@ -37,6 +37,8 @@ import typekeys
 import icnifcore
 import ic / [enum2nif]
 import icprof
+import ic/semhandoff
+import std/tempfiles
 
 const SysModuleSuffix* = "@sys"
 const BackendLocalMarker* = "@bk"
@@ -262,6 +264,9 @@ type
     deps: IcBuilder  # include&import deps
     infos: LineInfoWriter
     currentModule: int32
+    headerOnly: bool
+    pendingRoutines: HashSet[ItemId]
+    pendingTypes: HashSet[ItemId]
     decodedFileIndices: HashSet[FileIndex]
     locals: HashSet[ItemId]  # track proc-local symbols
     inProc: int
@@ -538,6 +543,9 @@ proc writeSym(w: var Writer; dest: var IcBuilder; sym: PSym)
 
 func restoresWrittenState(config: ConfigRef): bool {.inline.} =
   config.ideActive or optGenBif in config.globalOptions
+
+func restoresWrittenState(w: Writer): bool {.inline.} =
+  w.headerOnly or restoresWrittenState(w.infos.config)
 
 proc writeLoc(w: var Writer; dest: var IcBuilder; loc: TLoc) =
   dest.addIdent toNifTag(loc.k)
@@ -924,6 +932,14 @@ proc nifTypeName(w: var Writer; typ: PType): string =
     result = typeToNifSym(typ, w.infos.config)
 
 proc writeTypeDef(w: var Writer; dest: var IcBuilder; typ: PType) =
+  if typ.itemId in w.pendingTypes:
+    dest.addParLe tdefTag, NoLineInfo
+    dest.addSymDef pool.syms.getOrIncl(nifTypeName(w, typ)), NoLineInfo
+    dest.addDotToken
+    dest.addParLe pool.tags.getOrIncl("pendingbody"), NoLineInfo
+    dest.addParRi()
+    dest.addParRi()
+    return
   dest.buildTree tdefTag:
     dest.addSymDef pool.syms.getOrIncl(nifTypeName(w, typ)), NoLineInfo
     dest.addDotToken # always private for the index generator
@@ -1052,7 +1068,7 @@ proc writeType(w: var Writer; dest: var IcBuilder; typ: PType) =
     # nowhere), leaving dangling references (`symbol has no offset` for a
     # `pointer` type whose id had drifted away).
     typ.state = Sealed
-    if restoresWrittenState(w.infos.config): w.writtenTypes.add typ
+    if restoresWrittenState(w): w.writtenTypes.add typ
     if isCanonType(w, typ): w.emittedCanonTypes[nifTypeName(w, typ)] = typ.itemId.item
     writeTypeDef(w, dest, typ)
   else:
@@ -1107,6 +1123,13 @@ proc writeSymDef(w: var Writer; dest: var IcBuilder; sym: PSym) =
     dest.addIdent "x"
   else:
     dest.addDotToken
+  if sym.itemId in w.pendingRoutines:
+    # An indexed sentinel, never an empty routine implementation. Attempting
+    # to inspect it suspends the importer until the real semantic artifact.
+    dest.addParLe pool.tags.getOrIncl("pendingbody"), NoLineInfo
+    dest.addParRi()
+    dest.addParRi()
+    return
   # field `disamb` made part of the name, so do not store it here
   dest.buildTree sym.kindImpl.toNifTag:
     case sym.kindImpl
@@ -1121,7 +1144,7 @@ proc writeSymDef(w: var Writer; dest: var IcBuilder; sym: PSym) =
     dest.addDotToken
   else:
     dest.addIdent toNifTag(sym.magicImpl)
-  writeFlags(dest, sym.flagsImpl)
+  writeFlags(dest, if w.headerOnly: sym.flagsImpl - {sfUsed} else: sym.flagsImpl)
   writeFlags(dest, sym.optionsImpl)
   dest.addIntLit sym.offsetImpl
 
@@ -1222,7 +1245,7 @@ proc writeSym(w: var Writer; dest: var IcBuilder; sym: PSym) =
       dest.addSymUse pool.syms.getOrIncl(w.toNifSymName(sym)), NoLineInfo
   elif shouldWriteSymDef(w, sym):
     sym.state = Sealed
-    if restoresWrittenState(w.infos.config): w.writtenSyms.add sym
+    if restoresWrittenState(w): w.writtenSyms.add sym
     writeSymDef(w, dest, sym)
   else:
     # NIF has direct support for symbol references so we don't need to use a tag here,
@@ -1257,7 +1280,7 @@ proc writeSymNode(w: var Writer; dest: var IcBuilder; n: PNode; sym: PSym) =
     else: shouldWriteSymDef(w, sym)
   if wantDef:
     if not sym.itemId.isBackendMinted and not isField: sym.state = Sealed
-    if restoresWrittenState(w.infos.config): w.writtenSyms.add sym
+    if restoresWrittenState(w): w.writtenSyms.add sym
     if nodeTyp != n.sym.typImpl:
       dest.buildTree hiddenTypeTag, trLineInfo(w, n.info):
         writeType(w, dest, nodeTyp)
@@ -1847,6 +1870,7 @@ proc writeOp(w: var Writer; content: var IcBuilder; op: LogEntry) =
 type
   CookieCtx = object
     selfSuffix: string
+    ignoreUnusedId: bool
     tdRanges: Table[uint32, int]   # td sym -> start of its first (td ...) tree
     memo: Table[uint32, string]    # td sym -> structural digest
     expanding: HashSet[uint32]     # cycle guard for recursive td expansion
@@ -1949,6 +1973,12 @@ proc hashRegion(s: var Sha1State; c: var CookieCtx; flat: seq[CookieTok];
       i = skipTo
       continue
     let t = flat[i]
+    if c.ignoreUnusedId and t.kind == ckParLe and t.tag == "unusedid":
+      # Allocation after interface publication can increase the seed without
+      # changing any published declaration. Keep the real seed on the wire.
+      s.update "(unusedid)"
+      i = nextTree(flat, i)
+      continue
     if t.kind == ckParLe and t.tag == bindingIdTagName:
       # A type's `bindingId` is a module-wide mint COUNTER: creating one extra
       # type renumbers every type minted after it, so hashing it made the
@@ -2227,8 +2257,27 @@ proc writeNifModule*(config: ConfigRef; thisModule: int32; n: PNode;
                      expansions: seq[(PSym, TLineInfo)] = @[];
                      moduleFlags: int32 = 0;
                      extraExports: seq[ItemId] = @[];
-                     publicInterface: seq[PSym] = @[]; hiddenInterface: seq[PSym] = @[]) =
-  var w = Writer(infos: newLineInfoWriter(config), currentModule: thisModule)
+                     publicInterface: seq[PSym] = @[]; hiddenInterface: seq[PSym] = @[];
+                     pendingRoutines: seq[PSym] = @[];
+                     headerOnly = false; compareHeader = false): string {.discardable.} =
+  result = ""
+  var savedTypeIds = default(Table[ItemId, int32])
+  var savedClaims = default(Table[ItemId, string])
+  var savedOwners = default(Table[string, ItemId])
+  if headerOnly:
+    swap(canonTypeIds, savedTypeIds)
+    swap(canonClaims, savedClaims)
+    swap(canonSigOwners, savedOwners)
+  defer:
+    if headerOnly:
+      swap(canonTypeIds, savedTypeIds)
+      swap(canonClaims, savedClaims)
+      swap(canonSigOwners, savedOwners)
+  var w = Writer(infos: newLineInfoWriter(config), currentModule: thisModule,
+                 headerOnly: headerOnly)
+  for sym in pendingRoutines:
+    w.pendingRoutines.incl sym.itemId
+    if sym.typImpl != nil: w.pendingTypes.incl sym.typImpl.itemId
   for id in extraExports: w.extraExports.incl id
   w.deps = newIcBuilder(64)
   var content = newIcBuilder(300)
@@ -2368,7 +2417,8 @@ proc writeNifModule*(config: ConfigRef; thisModule: int32; n: PNode;
   content.addParRi()
 
   let m = modname(w.currentModule, w.infos.config)
-  let bifPath = completeGeneratedFilePath(config, AbsoluteFile(m).changeFileExt(".s.bif")).string
+  let bifPath = completeGeneratedFilePath(config,
+    AbsoluteFile(m).changeFileExt(if headerOnly: ".h.bif" else: ".s.bif")).string
 
   var dest = newIcBuilder(600)
   createStmtList(dest, rootInfo)
@@ -2393,7 +2443,7 @@ proc writeNifModule*(config: ConfigRef; thisModule: int32; n: PNode;
       let s = op.sym
       if s.state != Sealed:
         s.state = Sealed
-        if restoresWrittenState(config): w.writtenSyms.add s
+        if restoresWrittenState(w): w.writtenSyms.add s
         writeSymDef w, dest, s
 
   dest.addParRi()
@@ -2401,7 +2451,7 @@ proc writeNifModule*(config: ConfigRef; thisModule: int32; n: PNode;
   # Nimsuggest and normal code generation reuse these symbols/types as live,
   # mutable targets. Sealing is only needed for intra-emit dedup; once the NIF
   # is built, un-seal them. The guard stays in force for a real `nim m` build.
-  if restoresWrittenState(config):
+  if restoresWrittenState(w):
     for s in w.writtenSyms:
       if s.state == Sealed: s.state = Complete
     for t in w.writtenTypes:
@@ -2424,8 +2474,28 @@ proc writeNifModule*(config: ConfigRef; thisModule: int32; n: PNode;
   # text `.s.nif` twin — writing two files per module only slows the build; debug
   # a `.bif` via `tools/bif2nif`). Re-homed into a private fresh pool
   # so the file holds only THIS module's literals.
-  storeBifStable(dest, bifPath, "." & extractModuleSuffix(bifPath))
-  if not isDefined(config, "icNoIfaceGate"):
+  if not headerOnly:
+    storeBifStable(dest, bifPath, "." & extractModuleSuffix(bifPath))
+  if headerOnly:
+    # Compare the same projection after the bodies finish. New compile-time
+    # replay, generic offers or changes to already-published declarations
+    # invalidate consumers; pending routine bodies themselves are excluded.
+    var flat = flattenForCookie(dest)
+    var context = CookieCtx(selfSuffix: m, ignoreUnusedId: true)
+    var hash = newSha1State()
+    hashRegion(hash, context, flat, 0, flat.len)
+    result = $SecureHash(hash.finalize())
+    if not compareHeader:
+      # The semantic digest intentionally ignores allocation watermarks and
+      # normalizes some IDs. Equal digests need not mean identical bytes, so
+      # every publication gets a fresh path, including retries of one module.
+      # Readers may retain mapped snapshots until their worker job finishes.
+      let (file, snapshot) = createTempFile(extractFilename(bifPath) & "." & result & ".",
+        "", bifPath.parentDir)
+      file.close()
+      publishedIcHeader = snapshot
+      storeBif(dest, snapshot, "." & m)
+  elif not isDefined(config, "icNoIfaceGate"):
     var flat = flattenForCookie(dest)
     let ifaceHex = writeIfaceCookie(config, thisModule, flat)
     writeImplCookie(config, thisModule, flat, ifaceHex)
@@ -2848,7 +2918,7 @@ proc moduleId(c: var DecodeContext; suffix: string; flags: set[LoadFlag] = {}): 
     var modFile = (getNimcacheDir(conf) / RelativeFile(suffix & ".t.bif")).string
     let lowered = useLowered and fileExists(modFile)
     if not lowered:
-      modFile = (getNimcacheDir(conf) / RelativeFile(suffix & ".s.bif")).string
+      modFile = semanticInput((getNimcacheDir(conf) / RelativeFile(suffix & ".s.bif")).string)
     if not fileExists(modFile):
       raiseAssert "NIF file not found for module suffix '" & suffix & "': " & modFile &
         ". This can happen when loading a module from NIF that references another module " &
@@ -3200,6 +3270,14 @@ proc loadTypeFromCursor(c: var DecodeContext; n: var Cursor; t: PType; localSyms
   if not tagIs(n, typeDefTagName):
     raiseAssert "(td) expected"
 
+  var marker = n
+  inc marker
+  skip marker # name
+  skip marker # visibility
+  if marker.kind == TagLit and tagIs(marker, "pendingbody"):
+    let suffix = parseSymName(symName(n.firstSon)).module
+    awaitIcBody((getNimcacheDir(c.infos.config) / RelativeFile(suffix & ".s.bif")).string)
+
   var typesModule = parseSymName(symName(n.firstSon)).module
   if typesModule.endsWith(BackendLocalMarker):
     # A backend-minted (`@bk`) type's name carries the marker in its module part;
@@ -3291,6 +3369,13 @@ proc loadSymFromCursor(c: var DecodeContext; s: PSym; n: var Cursor; thisModule:
                        localSyms: var Table[string, PSym]) =
   ## Loads a symbol definition. The cursor must be positioned AT the opening
   ## `(sd` TagLit; `into` consumes the whole sdef including its closing `)`.
+  var marker = n
+  inc marker
+  skip marker
+  skip marker
+  if marker.kind == TagLit and tagIs(marker, "pendingbody"):
+    awaitIcBody((getNimcacheDir(c.infos.config) /
+      RelativeFile(thisModule & ".s.bif")).string)
   n.into:
     expect n, SymbolDef
     # ignore the symbol's name, we have already used it to create this PSym instance!
@@ -3406,6 +3491,14 @@ proc loadSym*(c: var DecodeContext; s: PSym) =
   let entry = c.syms[nifname][1]
   let module = c.mods[symsModule]
   var n = cursorFromIndexEntry(c, symsModule, entry)
+
+  var marker = n
+  inc marker
+  skip marker # name
+  skip marker # visibility
+  if marker.kind == TagLit and tagIs(marker, "pendingbody"):
+    awaitIcBody((getNimcacheDir(c.infos.config) /
+      RelativeFile(module.suffix & ".s.bif")).string)
 
   expect n, TagLit
   if not tagIs(n, symDefTagName):
@@ -4081,7 +4174,7 @@ proc loadedModuleTypes*(c: var DecodeContext; module: FileIndex): seq[PType] =
     let t = createTypeStub(c, nm)
     if t != nil: result.add t
 
-proc toNifFilename*(conf: ConfigRef; f: FileIndex): string =
+proc toNifFilename*(conf: ConfigRef; f: FileIndex; useHeader = true): string =
   let suffix = moduleSuffix(conf, f)
   # The `cg`/`emit` backend stages load the lowered whole-module NIF (transformed
   # bodies + lifted sigs baked in); the `lower` stage and the frontend (`cmdM`)
@@ -4093,6 +4186,7 @@ proc toNifFilename*(conf: ConfigRef; f: FileIndex): string =
     if fileExists(t):
       return t
   result = toGeneratedFile(conf, AbsoluteFile(suffix), ".s.bif").string
+  if useHeader: result = semanticInput(result)
 
 proc resolveSym(c: var DecodeContext; symAsStr: string; alsoConsiderPrivate: bool): PSym =
   result = c.syms.getOrDefault(symAsStr)[0]

@@ -119,8 +119,8 @@ type
     ## live in a scope opened by `semProcAux` and its `result` in a `PProcCon`;
     ## deferring the body means detaching both from `PContext`'s stacks rather
     ## than closing them, and re-attaching them at drain. The scope object
-    ## survives because this record holds it, and its `parent` chain still ends
-    ## at the module's top-level scope, which does not move.
+    ## survives because this record holds it. Copied scope tables preserve
+    ## declaration-time visibility while retaining shared symbol identities.
     key*: uint64                ## §2.3: `(module, ordinal)`, ordinal = the
                                 ## declaration's position in the header pass.
                                 ## Dispatch order is key order, which is what
@@ -133,6 +133,9 @@ type
     resultType*: PType
     isInlineIterator*: bool
     scope*: PScope
+    topLevelScope*, moduleScope*: PScope
+    imports*: seq[ImportedModule]
+    patterns*: seq[PSym]
     procCon*: PProcCon
     optionStack*: seq[POptionEntry]
     options*: TOptions
@@ -252,6 +255,7 @@ type
       # in source order — so stage 1 drains it front to back and needs no queue.
       # `concurrency.TaskQueue` is what stage 4 replaces this with, once there
       # is more than one worker to order.
+    nextBodyTask*: int          # first task not yet completed
     bodyTaskIndex*: Table[ItemId, int]
       # routine -> its entry in `bodyTasks`, for the on-demand path: a `const`
       # or `static:` in the header pass can need a body that has not run yet
@@ -260,6 +264,12 @@ type
     prevDemandRoutineBody*: proc (prc: PSym) {.closure.}
       # the enclosing module's hook, restored by `closePContext`: an import is
       # compiled from inside the importer's pass, so these nest.
+    onHeadersReady*: proc(c: PContext; n: PNode) {.nimcall.}
+      ## IC may publish an immutable interface before draining this context's
+      ## bodies. The context and all mutable ASTs remain on their owner thread.
+    headerTree*: PNode
+    headerDigest*: string
+    headerPending*: seq[PSym]
 
   TBorrowState* = enum
     bsNone, bsReturnNotMatch, bsNoDistinct, bsGeneric, bsNotSupported, bsMatch
