@@ -1,4 +1,4 @@
-name: MSVC atomic operations
+name: MSVC atomic operations and embedded strings
 
 on:
   push:
@@ -17,10 +17,34 @@ jobs:
       - uses: jiro4989/setup-nim-action@v2
         with:
           nim-version: '2.2.10'
+      - name: Confirm the large-string regression fails on the official compiler
+        shell: pwsh
+        run: |
+          nim c --cc:vcc --mm:arc --lib:lib --out:large-string-baseline.exe tests/ccgbugs/tmsvclargestring.nim *> baseline.log
+          if ($LASTEXITCODE -eq 0 -or -not (Select-String -Quiet C2026 baseline.log)) {
+            Get-Content baseline.log
+            throw 'Expected the official compiler to hit the MSVC C string limit.'
+          }
+          exit 0
+      - name: Build the corrected compiler
+        shell: pwsh
+        run: |
+          $distribution = Split-Path (Split-Path (Get-Command nim).Source)
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item -Recurse "$distribution/dist/checksums" dist/checksums
+          nim c --cc:vcc -d:release --mm:orc --lib:lib --out:bin/nim.exe compiler/nim.nim
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test the patched standard library with MSVC
         shell: pwsh
         run: |
-          nim c -r --cc:vcc --threads:on --mm:arc --lib:lib --out:atomic-tests.exe tests/stdlib/concurrency/tatomics.nim
+          ./bin/nim.exe c -r --cc:vcc --threads:on --mm:arc --lib:lib --out:atomic-tests.exe tests/stdlib/concurrency/tatomics.nim
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          nim c -r --cc:vcc --threads:on --mm:arc --lib:lib --out:atomic-size-tests.exe tests/stdlib/concurrency/tatomics_size.nim
+          ./bin/nim.exe c -r --cc:vcc --threads:on --mm:arc --lib:lib --out:atomic-size-tests.exe tests/stdlib/concurrency/tatomics_size.nim
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify large embedded binary strings with ARC and ORC
+        shell: pwsh
+        run: |
+          foreach ($manager in 'arc', 'orc') {
+            ./bin/nim.exe c -r --cc:vcc --mm:$manager --lib:lib --out:large-string-tests.exe tests/ccgbugs/tmsvclargestring.nim
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

@@ -55,11 +55,25 @@ proc genStringLiteralV1(m: BModule; n: PNode; result: var Rope) =
 
 # ------ Version 2: destructor based strings and seqs -----------------------
 
+proc stringDataInitializer(m: BModule; s: string): Rope =
+  if m.config.cCompiler == ccVcc and s.len > 16_000:
+    # MSVC limits individual C strings to 16,380 bytes. Numeric initializers
+    # also work for assets larger than the concatenated-string limit.
+    result = rope("{")
+    for i, c in s:
+      if i mod 32 == 0: result.add "\n"
+      result.add "(NIM_CHAR)"
+      result.add rope(ord(c))
+      result.add ","
+    result.add "0}"
+  else:
+    result = makeCString(s)
+
 proc genStringLiteralDataOnlyV2(m: BModule, s: string; result: Rope; isConst: bool) =
   m.s[cfsStrData].addf("static $4 struct {$n" &
        "  NI cap; NIM_CHAR data[$2+1];$n" &
        "} $1 = { $2 | NIM_STRLIT_FLAG, $3 };$n",
-       [result, rope(s.len), makeCString(s),
+       [result, rope(s.len), stringDataInitializer(m, s),
        rope(if isConst: "const" else: "")])
 
 proc genStringLiteralV2(m: BModule; n: PNode; isConst: bool; result: var Rope) =
