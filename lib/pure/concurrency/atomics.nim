@@ -188,6 +188,9 @@ else:
 
   when defined(vcc):
 
+    const nimHasCorrectMsvcAtomics* = true
+      ## The MSVC backend provides width-correct exchange and atomic arithmetic.
+
     # TODO: Trivial types should be volatile and use VC's special volatile
     # semantics for store and loads.
 
