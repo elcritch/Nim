@@ -1,0 +1,26 @@
+name: MSVC atomic operations
+
+on:
+  push:
+    branches: [fix/msvc-atomics-v2.2.10]
+  workflow_dispatch:
+
+jobs:
+  atomics:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.10'
+      - name: Test the patched standard library with MSVC
+        shell: pwsh
+        run: |
+          nim c -r --cc:vcc --threads:on --mm:arc --lib:lib --out:atomic-tests.exe tests/stdlib/concurrency/tatomics.nim
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          nim c -r --cc:vcc --threads:on --mm:arc --lib:lib --out:atomic-size-tests.exe tests/stdlib/concurrency/tatomics_size.nim
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

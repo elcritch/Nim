@@ -635,3 +635,67 @@ block: # bug #18844
       var y: Zoomer
       doAssert x.memes.load == 0
       doAssert y.dopamine.memes.load == 0
+
+
+block narrowExchangePreservesAdjacentStorage:
+  proc checkExchange[T](initial, replacement: T) =
+    type Cell = object
+      value: Atomic[T]
+      canary: array[8, byte]
+    var cell: Cell
+    for b in cell.canary.mitems:
+      b = 0xa5
+    cell.value.store(initial)
+    doAssert cell.value.exchange(replacement) == initial
+    doAssert cell.value.load == replacement
+    for b in cell.canary:
+      doAssert b == 0xa5
+  checkExchange(false, true)
+  checkExchange(7'i8, -3'i8)
+  checkExchange(7'i16, -3'i16)
+  checkExchange(7'i32, -3'i32)
+  checkExchange(7'i64, -3'i64)
+  checkExchange(7'u8, 255'u8)
+  checkExchange(7'u16, high(uint16))
+  checkExchange(7'u32, high(uint32))
+  checkExchange(7'u64, high(uint64))
+
+block compareExchangeUsesObjectRepresentation:
+  let nanBits = 0x7fc01234'u32
+  var location: Atomic[float32]
+  location.store(cast[float32](nanBits))
+  var expected = cast[float32](nanBits)
+  doAssert location.compareExchange(expected, 1.0'f32)
+  doAssert location.load == 1.0'f32
+  location.store(0.0'f32)
+  expected = cast[float32](0x80000000'u32)
+  doAssert not location.compareExchange(expected, 2.0'f32)
+  doAssert cast[uint32](expected) == 0'u32
+  doAssert location.load == 0.0'f32
+
+block fetchArithmeticReturnsPreviousValueAndWraps:
+  proc checkSigned[T: SomeSignedInt]() =
+    var location: Atomic[T]
+    location.store(high(T))
+    doAssert location.fetchAdd(T(1)) == high(T)
+    doAssert location.load == low(T)
+    doAssert location.fetchSub(T(1)) == low(T)
+    doAssert location.load == high(T)
+    location.store(T(0))
+    doAssert location.fetchSub(low(T)) == T(0)
+    doAssert location.load == low(T)
+  proc checkUnsigned[T: SomeUnsignedInt]() =
+    var location: Atomic[T]
+    location.store(high(T))
+    doAssert location.fetchAdd(T(1)) == high(T)
+    doAssert location.load == T(0)
+    doAssert location.fetchSub(T(1)) == T(0)
+    doAssert location.load == high(T)
+  checkSigned[int8]()
+  checkSigned[int16]()
+  checkSigned[int32]()
+  checkSigned[int64]()
+  checkUnsigned[uint8]()
+  checkUnsigned[uint16]()
+  checkUnsigned[uint32]()
+  checkUnsigned[uint64]()
