@@ -1,0 +1,98 @@
+name: Validate MSVC atomic operations
+
+on:
+  push:
+    branches: [ci/msvc-atomic-operations-validation]
+  workflow_dispatch:
+
+jobs:
+  atomics:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.10'
+      - name: Report the official compiler and native toolchain
+        shell: pwsh
+        run: |
+          nim --version
+          cl.exe 2>&1 | Select-Object -First 4
+          exit 0
+      - name: Reproduce each defect with the upstream atomics implementation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force build/msvc-probes | Out-Null
+          $probes = [ordered]@{
+            exchange = @'
+          import std/atomics
+          type Guarded = object
+            value: Atomic[int8]
+            guard: array[8, byte]
+          var data: Guarded
+          for guard in data.guard.mitems:
+            guard = 0xA5
+          data.value.store(1)
+          doAssert data.value.exchange(-2) == 1
+          for guard in data.guard:
+            doAssert guard == 0xA5
+          '@
+            compareExchange = @'
+          import std/atomics
+          var value: Atomic[int32]
+          value.store(7)
+          var expected = 3'i32
+          doAssert not value.compareExchange(expected, 9)
+          doAssert expected == 7
+          '@
+            fetchAdd = @'
+          import std/atomics
+          var value: Atomic[int]
+          value.store(7)
+          doAssert value.fetchAdd(1) == 7
+          '@
+            fetchSub = @'
+          import std/atomics
+          var value: Atomic[int]
+          value.store(7)
+          doAssert value.fetchSub(1) == 7
+          '@
+          }
+          $atomics = 'lib/pure/concurrency/atomics.nim'
+          $fixed = Get-Content $atomics -Raw
+          $baseline = git show 14991af742d0833503741fd9a0918133d1bcf8a4:lib/pure/concurrency/atomics.nim
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          try {
+            [System.IO.File]::WriteAllLines((Join-Path $PWD $atomics), [string[]]$baseline)
+            foreach ($probe in $probes.GetEnumerator()) {
+              $path = "build/msvc-probes/$($probe.Key)"
+              Set-Content "$path.nim" $probe.Value
+              nim c -r --cc:vcc --vcc.exe:cl.exe --vcc.linkerexe:cl.exe --lib:lib "--out:$path.exe" "$path.nim" *> "$path.log"
+              $code = $LASTEXITCODE
+              Get-Content "$path.log" | Select-Object -Last 12
+              if ($code -eq 0 -or -not (Select-String -Quiet AssertionDefect "$path.log")) {
+                throw "Expected an assertion failure for the upstream $($probe.Key) defect."
+              }
+            }
+          }
+          finally {
+            [System.IO.File]::WriteAllText((Join-Path $PWD $atomics), $fixed)
+          }
+      - name: Run the atomics suite and contention regression with MSVC
+        shell: pwsh
+        run: |
+          foreach ($target in 'c', 'cpp') {
+            foreach ($manager in 'refc', 'orc') {
+              nim $target -r --cc:vcc --vcc.exe:cl.exe --vcc.linkerexe:cl.exe --lib:lib "--mm:$manager" "--out:build/atomics-$target-$manager.exe" tests/stdlib/concurrency/tatomics_msvc.nim
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }
+          nim c -r --cc:vcc --vcc.exe:cl.exe --vcc.linkerexe:cl.exe --lib:lib --out:build/atomics-size.exe tests/stdlib/concurrency/tatomics_size.nim
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
