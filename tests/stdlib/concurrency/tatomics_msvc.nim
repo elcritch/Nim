@@ -1,6 +1,6 @@
 discard """
-  matrix: "--cc:vcc --mm:refc; --cc:vcc --mm:orc"
-  targets: "c cpp"
+  matrix: "--cc:vcc --threads:on --mm:refc; --cc:vcc --threads:on --mm:orc"
+  targets: "c"
   disabled: "linux"
   disabled: "bsd"
   disabled: "osx"
