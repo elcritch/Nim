@@ -85,9 +85,14 @@ jobs:
           finally {
             [System.IO.File]::WriteAllText((Join-Path $PWD $atomics), $fixed)
           }
+          exit 0
       - name: Run the atomics suite and contention regression with MSVC
         shell: pwsh
         run: |
+          foreach ($probe in Get-ChildItem build/msvc-probes/*.nim) {
+            nim c -r --cc:vcc --vcc.exe:cl.exe --vcc.linkerexe:cl.exe --lib:lib "--out:$($probe.DirectoryName)/fixed-$($probe.BaseName).exe" $probe.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
           foreach ($target in 'c', 'cpp') {
             foreach ($manager in 'refc', 'orc') {
               nim $target -r --cc:vcc --vcc.exe:cl.exe --vcc.linkerexe:cl.exe --lib:lib "--mm:$manager" "--out:build/atomics-$target-$manager.exe" tests/stdlib/concurrency/tatomics_msvc.nim
