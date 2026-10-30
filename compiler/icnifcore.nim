@@ -26,6 +26,10 @@ import std / [syncio, algorithm]
 from std / os import removeFile, moveFile
 import options, pathutils, typekeys
 import "../dist/nimony/src/lib" / [nifcore, nifcoreparse, nifreader, bif]
+when defined(icLmdb):
+  import iclmdb
+when defined(icLmdbBlocks):
+  import icbifblocks
 
 # One shared literals pool + tag pool for the whole process — the nifcore
 # analogue of the old global `nifstreams.pool`. A single shared pool keeps
@@ -114,7 +118,14 @@ proc freshModuleCopy(b: var IcBuilder): TokenBuf =
 proc storeBif*(b: var IcBuilder; path: string; dottedSuffix: string) =
   ## Persist the buffer as a compact, self-contained binary NIF (`.bif`).
   var fresh = freshModuleCopy(b)
-  bif.store(fresh, path, dottedSuffix)
+  when defined(icLmdb):
+    if isModuleBif(path):
+      when defined(icLmdbBlocks): storeBlocks(fresh, path, dottedSuffix, false)
+      else: putBif(path, bif.storeToString(fresh, dottedSuffix), false)
+    else:
+      bif.store(fresh, path, dottedSuffix)
+  else:
+    bif.store(fresh, path, dottedSuffix)
 
 proc storeBifStable*(b: var IcBuilder; path: string; dottedSuffix: string) =
   ## Content-stable `bif` write — the binary analogue of `writeFileStable`'s
@@ -124,6 +135,11 @@ proc storeBifStable*(b: var IcBuilder; path: string; dottedSuffix: string) =
   ## gates incremental builds. (bif encoding is deterministic for a given buffer
   ## under fresh pools, so equal content ⇒ equal bytes.)
   var fresh = freshModuleCopy(b)
+  when defined(icLmdb):
+    if isModuleBif(path):
+      when defined(icLmdbBlocks): storeBlocks(fresh, path, dottedSuffix, true)
+      else: putBif(path, bif.storeToString(fresh, dottedSuffix), true)
+      return
   let tmp = path & ".tmp"
   bif.store(fresh, tmp, dottedSuffix)
   let newBytes = readFile(tmp)

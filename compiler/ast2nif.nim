@@ -33,6 +33,8 @@ import "../dist/nimony/src/lib" / [bitabs, lineinfos,
 import "../dist/nimony/src/lib/nifcore" except pool, symName, strVal, poolSym, poolStr, lineInfoFile
 from "../dist/nimony/src/lib" / bif import BifModule, IndexVis, ivHidden, IndexEntry
 import icbif
+when defined(icLmdbBlocks):
+  import icbifblocks
 import typekeys
 import icnifcore
 import ic / [enum2nif]
@@ -2519,6 +2521,10 @@ type
     semBuf: TokenBuf       # the `.s.bif` (semchecked) buffer — TYPE-def fallback
     semIndex: NifIndex
     semTried: bool         # `semBuf`/`semIndex` load attempted (idempotent)
+    when defined(icLmdbBlocks):
+      blocks, semBlocks: BlockManifest
+      widths, semWidths: Table[int, int]
+      fullLoaded: bool
 
   PendingBody = object
     ## A deferred routine body (bodyPos son). `cursor` points AT the body node in
@@ -2676,11 +2682,41 @@ proc loadedState(c: DecodeContext): ItemState {.inline.} =
   ## must stay `Sealed` so accidental mutations are caught.
   if c.infos.config.cmd == cmdNifC or c.infos.config.ideActive: Complete else: Sealed
 
+when defined(icLmdbBlocks):
+  proc widthsFor(index: NifIndex; blocks: BlockManifest): Table[int, int] =
+    result = initTable[int, int]()
+    for i, entry in index.entries:
+      result[int(entry.pos)] = int(blocks.widths[i])
+
+  proc ensureFull(m: NifModule) =
+    if not m.fullLoaded:
+      m.buf = icbif.fullTokens(m.blocks, m.buf.pool, m.buf.tags)
+      m.fullLoaded = true
+
+  proc blockCursor(m: NifModule; offset: int; sem = false): Cursor =
+    let blocks = if sem: m.semBlocks else: m.blocks
+    let width =
+      if sem:
+        if m.semWidths.len == 0: m.semWidths = widthsFor(m.semIndex, blocks)
+        m.semWidths.getOrDefault(offset)
+      else:
+        if m.widths.len == 0: m.widths = widthsFor(m.index, blocks)
+        m.widths.getOrDefault(offset)
+    if width <= 0: raiseAssert "missing LMDB BIF declaration width"
+    let pool = if sem: m.semBuf.pool else: m.buf.pool
+    let tags = if sem: m.semBuf.tags else: m.buf.tags
+    var buf = createTokenBuf(width, pool, tags)
+    blocks.copyTokens(offset, width, buf.growRawUninit(width))
+    result = buf.beginRead()
+
 proc cursorFromIndexEntry(c: var DecodeContext; module: FileIndex; entry: NifIndexEntry): Cursor =
   ## Step 2a: O(1) cursor into the module's resident `buf` at the def's token
   ## position. No I/O, no per-symbol materialization — and, because each call
   ## returns an INDEPENDENT cursor, none of the old stream-cursor clobber hazards
   ## (the `jumpTo(saved)` save/restore dance) apply anymore.
+  when defined(icLmdbBlocks):
+    let m = c.mods[module]
+    if not m.fullLoaded: return blockCursor(m, entry.offset)
   result = cursorAt(c.mods[module].buf, entry.offset)
 
 type
@@ -2812,7 +2848,7 @@ proc hasIndexEntry(m: NifModule; name: string): bool {.inline.} =
 
 proc indexFromBif(m: var BifModule; suffix: string): NifIndex =
   result = indexFromBif(m)
-  when defined(icIndexCheck):
+  when defined(icIndexCheck) and not defined(icLmdbBlocks):
     let want = rescanPosIndex(m.buf, suffix)
     doAssert result.entries.len == want.len,
       "index size differs for " & suffix & ": carried " & $result.entries.len &
@@ -2873,7 +2909,12 @@ proc moduleId(c: var DecodeContext; suffix: string; flags: set[LoadFlag] = {}): 
         ". This can happen when loading a module from NIF that references another module " &
         "whose NIF file hasn't been written yet."
     icProfStart(tBifLoad)
-    var m = icbif.load(modFile)
+    when defined(icLmdbBlocks):
+      var partial = icbif.loadPartial(modFile)
+      let blocks = partial.blocks
+      var m = move partial.module
+    else:
+      var m = icbif.load(modFile)
     prof pBifLoads
     icProfStop(tBifLoad)
     icProfStart(tPosIndex)
@@ -2882,10 +2923,12 @@ proc moduleId(c: var DecodeContext; suffix: string; flags: set[LoadFlag] = {}): 
     # Seed the backend id counters ABOVE every id the file already uses, so a
     # freshly-minted backend sym/type (closure env, RTTI hook, temp) can never
     # share a `toId` with a loaded one. See `readUnusedId` / `(unusedid)`.
-    let seed = readUnusedId(m.buf)
+    let seed = when defined(icLmdbBlocks): blocks.seed else: readUnusedId(m.buf)
     c.mods[result] = NifModule(buf: ensureMove m.buf, index: index, suffix: suffix,
                                symCounter: seed, typeCounter: seed,
                                loweredPrimary: lowered)
+    when defined(icLmdbBlocks):
+      c.mods[result].blocks = blocks
 
 proc getOffset(c: var DecodeContext; module: FileIndex; nifName: string): NifIndexEntry =
   result = c.mods[module].indexEntry(nifName)
@@ -2901,7 +2944,12 @@ proc ensureSemBuf(c: var DecodeContext; module: FileIndex) =
   m.semTried = true
   let semFile = semanticFile(c.infos.config, m.suffix, ".s.bif").string
   if not fileExists(semFile): return
-  var sm = icbif.load(semFile)
+  when defined(icLmdbBlocks):
+    var partial = icbif.loadPartial(semFile)
+    var sm = move partial.module
+    m.semBlocks = partial.blocks
+  else:
+    var sm = icbif.load(semFile)
   prof pBifLoads
   prof pSemBufLoads
   m.semIndex = indexFromBif(sm, m.suffix)
@@ -2924,12 +2972,17 @@ proc typeCursor(c: var DecodeContext; module: FileIndex; nifName: string): Curso
   let m = c.mods[module]
   let e = m.indexEntry(nifName)
   if e.offset != 0:
+    when defined(icLmdbBlocks):
+      if not m.fullLoaded: return blockCursor(m, e.offset)
     return cursorAt(m.buf, e.offset)
   if m.loweredPrimary:
     ensureSemBuf(c, module)
     let se = m.semIndexEntry(nifName)
     if se.offset != 0:
-      return cursorAt(m.semBuf, se.offset)
+      when defined(icLmdbBlocks):
+        return blockCursor(m, se.offset, true)
+      else:
+        return cursorAt(m.semBuf, se.offset)
   raiseAssert "symbol has no offset: " & nifName
 
 proc loadNode(c: var DecodeContext; n: var Cursor; thisModule: string;
@@ -3964,6 +4017,7 @@ proc extractBasename(nifName: string): string =
 
 proc interfaceCursor(c: var DecodeContext; module: FileIndex; hidden: bool): Cursor =
   let name = if hidden: "hiddeninterface" else: "interface"
+  when defined(icLmdbBlocks): ensureFull(c.mods[module])
   var cur = c.mods[module].buf.beginRead()
   cur.loopInto:
     if cur.kind == TagLit and tagIs(cur, name):
@@ -4228,7 +4282,7 @@ proc scanIncludeGraph*(config: ConfigRef): seq[tuple[includer: string; includes:
   # The primary module artifacts are `<suffix>.s.bif` (the sidecars are
   # `.iface.nif`/`.impl.nif`/`.edges.nif`/`.s.deps.nif`, which this glob excludes).
   for f in semanticFiles(config):
-    var m = bif.load(f)
+    var m = when defined(icLmdb): icbif.load(f) else: bif.load(f)
     var includer = ""
     var includes: seq[string] = @[]
     var c = m.buf.beginRead()
@@ -4265,7 +4319,7 @@ proc nifModuleHasIncludes*(config: ConfigRef; fileIdx: FileIndex): bool =
   ## owner/line-info on reload).
   let f = toNifFilename(config, fileIdx)
   if not fileExists(f): return false
-  var m = bif.load(f)
+  var m = when defined(icLmdb): icbif.load(f) else: bif.load(f)
   result = false
   var c = m.buf.beginRead()
   if c.kind == TagLit and tagIs(c, toNifTag(nkStmtList)):
@@ -4599,6 +4653,7 @@ proc loadedReplayActions*(module: FileIndex): seq[PNode] =
   result = @[]
   if loaderCtx == nil or not loaderCtx.mods.hasKey(module): return
   let m = loaderCtx.mods[module]
+  when defined(icLmdbBlocks): ensureFull(m)
   var cur = beginRead(m.buf)
   if cur.kind != TagLit or not tagIs(cur, toNifTag(nkStmtList)): return
   inc cur  # enter (stmts
@@ -4624,6 +4679,7 @@ proc loadNifModule*(c: var DecodeContext; suffix: ModuleSuffix; interf, interfHi
   icProfStart(tModuleId)
   let module = moduleId(c, string(suffix), flags)
   icProfStop(tModuleId)
+  when defined(icLmdbBlocks): ensureFull(c.mods[module])
 
   # Load the module AST (or just replay actions if loadFullAst is false).
   # Step 2 phase 2: read the

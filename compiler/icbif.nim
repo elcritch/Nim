@@ -41,6 +41,8 @@ import std / [assertions, hashes, tables, varints]
 import "../dist/nimony/src/lib" / [bitabs, lineinfos, vfs]
 import "../dist/nimony/src/lib/nifcore" except symName, strVal, poolSym, poolStr, lineInfoFile
 from "../dist/nimony/src/lib" / bif import BifModule, IndexEntry, IndexVis
+when defined(icLmdb):
+  import iclmdb
 
 type
   LazyNames = object
@@ -246,43 +248,76 @@ proc rNames[Id, T](r: var Reader; t: var BiTable[Id, T]; n: int; empty: T): Lazy
     r.pos += len
     discard t.addOrdered(empty)
 
+proc loadBytes(blob: tuple[data: pointer, size: int]; filename: string): BifModule =
+  var r = Reader(base: cast[ptr UncheckedArray[char]](blob.data), pos: 0, size: blob.size)
+  assert r.size >= Magic.len, "bif: file too small"
+  for i in 0 ..< Magic.len:
+    if r.base[i] != Magic[i]:
+      quit "bif: bad magic / incompatible format: " & filename
+  assert uint64(r.size) <= uint64(high(uint32)), "bif: file too large: " & filename
+  r.pos = Magic.len
+  discard rU64(r)                       # indexOffset; a full load reaches it linearly
+  let tokenCount = int rVarint(r)
+  let nTags      = int rVarint(r)
+  let nStrings   = int rVarint(r)
+  let nSyms      = int rVarint(r)
+  let nFiles     = int rVarint(r)
+  # the pad that keeps the borrowed token block `NifToken`-aligned
+  let a = sizeof(NifToken)
+  r.pos += (a - (r.pos and (a - 1))) and (a - 1)
+  let tokenBytes = tokenCount * sizeof(NifToken)
+  assert r.pos + tokenBytes <= r.size, "bif: truncated token block"
+  result = BifModule(buf: adoptForeignTokens(addr r.base[r.pos], tokenCount))
+  r.pos += tokenBytes
+  for _ in 1 .. nTags: discard result.buf.tags.tags.addOrdered(rStr(r))
+  let lazy = LazyPool()
+  lazy.strings = rNames(r, result.buf.pool.strings, nStrings, "")
+  lazy.syms = rNames(r, result.buf.pool.symbols, nSyms, NifSymbol())
+  lazy.filenames = rNames(r, result.buf.pool.filenames, nFiles, "")
+  lazyPools[result.buf.pool] = lazy
+  let nIndex = int rVarint(r)
+  result.index = newSeq[IndexEntry](nIndex)
+  for i in 0 ..< nIndex:
+    let sym = SymId rVarint(r)
+    let pos = int32(rVarint(r))
+    let v = int rVarint(r)
+    result.index[i] = IndexEntry(sym: sym, pos: pos, vis: IndexVis(v))
+
+when defined(icLmdbBlocks):
+  import icbifblocks
+
+  proc loadPartial*(filename: string): tuple[module: BifModule, blocks: BlockManifest] =
+    result = (default(BifModule), nil)
+    let blocks = loadManifest(filename)
+    result.blocks = blocks
+    result.module = loadBytes((blocks.metadata, blocks.metadataSize), filename)
+    if result.module.index.len != blocks.widths.len:
+      raise newException(IOError, "LMDB BIF index width count mismatch")
+
+  proc fullTokens*(blocks: BlockManifest; pool: Pool; tags: TagPool): TokenBuf =
+    result = createTokenBuf(max(blocks.tokenCount, 1), pool, tags)
+    if blocks.tokenCount > 0:
+      let dest = result.growRawUninit(blocks.tokenCount)
+      blocks.copyTokens(0, blocks.tokenCount, dest)
+
 proc load*(filename: string): BifModule =
-  ## `bif.load`, with the string, symbol and filename pools left in the
-  ## mapping. Tags are few and always read, and stay eager.
-  when defined(icEagerPools):
+  ## Load a complete BIF for callers that scan the module.
+  when defined(icEagerPools) and not defined(icLmdb):
     result = bif.load(filename)
+  elif defined(icLmdbBlocks):
+    if isModuleBif(filename):
+      var partial = loadPartial(filename)
+      var m = move partial.module
+      m.buf = fullTokens(partial.blocks, m.buf.pool, m.buf.tags)
+      result = move m
+    else:
+      let blob = vfsOpenMmap(filename)
+      result = loadBytes((blob.data, blob.size), filename)
+  elif defined(icLmdb):
+    if isModuleBif(filename): result = loadBytes(borrowBif(filename), filename)
+    else:
+      let blob = vfsOpenMmap(filename)
+      result = loadBytes((blob.data, blob.size), filename)
   else:
-    let blob = vfsOpenMmap(filename)      # left mapped for the buffer's lifetime
-    var r = Reader(base: cast[ptr UncheckedArray[char]](blob.data), pos: 0, size: blob.size)
-    assert r.size >= Magic.len, "bif: file too small"
-    for i in 0 ..< Magic.len:
-      if r.base[i] != Magic[i]:
-        quit "bif: bad magic / incompatible format: " & filename
-    assert uint64(r.size) <= uint64(high(uint32)), "bif: file too large: " & filename
-    r.pos = Magic.len
-    discard rU64(r)                       # indexOffset; a full load reaches it linearly
-    let tokenCount = int rVarint(r)
-    let nTags      = int rVarint(r)
-    let nStrings   = int rVarint(r)
-    let nSyms      = int rVarint(r)
-    let nFiles     = int rVarint(r)
-    # the pad that keeps the borrowed token block `NifToken`-aligned
-    let a = sizeof(NifToken)
-    r.pos += (a - (r.pos and (a - 1))) and (a - 1)
-    let tokenBytes = tokenCount * sizeof(NifToken)
-    assert r.pos + tokenBytes <= r.size, "bif: truncated token block"
-    result = BifModule(buf: adoptForeignTokens(addr r.base[r.pos], tokenCount))
-    r.pos += tokenBytes
-    for _ in 1 .. nTags: discard result.buf.tags.tags.addOrdered(rStr(r))
-    let lazy = LazyPool()
-    lazy.strings = rNames(r, result.buf.pool.strings, nStrings, "")
-    lazy.syms = rNames(r, result.buf.pool.symbols, nSyms, NifSymbol())
-    lazy.filenames = rNames(r, result.buf.pool.filenames, nFiles, "")
-    lazyPools[result.buf.pool] = lazy
-    let nIndex = int rVarint(r)
-    result.index = newSeq[IndexEntry](nIndex)
-    for i in 0 ..< nIndex:
-      let sym = SymId rVarint(r)
-      let pos = int32(rVarint(r))
-      let v = int rVarint(r)
-      result.index[i] = IndexEntry(sym: sym, pos: pos, vis: IndexVis(v))
+    let blob = vfsOpenMmap(filename)
+    result = loadBytes((blob.data, blob.size), filename)

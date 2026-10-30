@@ -29,7 +29,10 @@ const
 
   nimEnableCovariance* = defined(nimEnableCovariance)
 
-  icFormatVersion* = "52"
+  icFormatVersion* =
+    when defined(icLmdbBlocks): "52-lmdb-blocks1"
+    elif defined(icLmdb): "52-lmdb1"
+    else: "52"
     ## v51: the lowered `.t.bif` carries its module's `(offer)` names.
     ## v49: shared parsing, configuration semantics, and per-entry-point backend caches.
     ## v48: track implementation dependencies for reused generic type instances.
