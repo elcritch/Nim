@@ -2,6 +2,7 @@
 """Run with a compiler built with -d:nimIcConfigTrace as the sole argument."""
 import ast
 import base64
+import hashlib
 import json
 import pathlib
 import subprocess
@@ -178,10 +179,11 @@ else:
     trackmain = root / "trackmain.nim"
     trackmain.write_text("import trackdep\nconst computed = snapshotValue()\n"
                          "var value: Data\ndiscard value.len + computed\n")
-    def track(cache, value=5):
+    def track(cache, value=5, audit=False):
         return subprocess.run([str(nim), "track", "--hints:off", "--skipUserCfg",
                                "--skipParentCfg", "--nimcache:" + str(cache),
                                "-d:icJobs=1", "-d:icTrackedFlag", f"-d:icTrackedValue={value}",
+                               *(["-d:icConfigBundleAudit"] if audit else []),
                                str(trackmain)], text=True, capture_output=True, check=True)
 
     p = track(root / "trackcache")
@@ -218,6 +220,7 @@ else:
         return next(doc for doc in docs if doc["project"] == str(project))
 
     snapshot = dependency_snapshot(root / "trackcache", trackmain)
+    assert not (root / "trackcache" / "ic-config-audit-v1").exists()
     assert snapshot["version"] == 1 and snapshot["scope"] == "process"
     assert not snapshot["complete"] and str(trackmain) in snapshot["group"]
     source = str(root / "trackdep.nim")
@@ -242,6 +245,39 @@ else:
     variants = [doc for doc in manifests if doc["project"] == str(root / "trackdep.nim")]
     assert len(variants) == 2 and all(not doc["complete"] for doc in variants)
 
+    auditcache = root / "auditcache"
+    auditrun = track(auditcache, audit=True)
+    assert "IC bundle audit: published " in auditrun.stderr
+    publications = list((auditcache / "ic-config-audit-v1").glob("bundle-*/READY"))
+    assert publications
+    found_main = False
+    for ready in publications:
+        bundle = ready.parent
+        manifest_bytes = (bundle / "manifest.json").read_bytes()
+        assert ready.read_text().strip() == hashlib.sha256(manifest_bytes).hexdigest()
+        doc = json.loads(manifest_bytes)
+        assert not doc["complete"] and doc["version"] == 1
+        assert doc["compilerSha256"] == hashlib.sha256(nim.read_bytes()).hexdigest()
+        assert len(doc["artifacts"]) == len(doc["members"]) * 5
+        for artifact in doc["artifacts"]:
+            assert hashlib.sha256((bundle / artifact["name"]).read_bytes()).hexdigest() == artifact["sha256"]
+        if any(m["source"] == str(trackmain) for m in doc["members"]):
+            found_main = True
+            assert not doc["configTrace"]["complete"]
+            assert not doc["dependencyTrace"]["complete"]
+    assert found_main
+
+    # If a compiler mode does not produce the required cookie sidecars, the
+    # audit skips those groups and the ordinary frontend still succeeds.
+    nogatecache = root / "nogatecache"
+    nogate = subprocess.run([str(nim), "track", "--hints:off", "--skipUserCfg", "--skipParentCfg",
+                             "--nimcache:" + str(nogatecache), "-d:icJobs=1",
+                             "-d:icTrackedFlag", "-d:icTrackedValue=5", "-d:icNoIfaceGate",
+                             "-d:icConfigBundleAudit", str(trackmain)],
+                            text=True, capture_output=True, check=True)
+    assert "IC bundle audit: published 0 incomplete groups; skipped " in nogate.stderr
+    assert not list((nogatecache / "ic-config-audit-v1").glob("bundle-*/READY"))
+
     hazardmain = root / "hazardmain.nim"
     hazardmain.write_text('import std/os\nwhen compileOption("threads"): discard\n'
                           'const buildDate = CompileDate\nconst buildTime = CompileTime\n'
@@ -263,9 +299,11 @@ else:
     executable = root / ("icmain.exe" if sys.platform == "win32" else "icmain")
     subprocess.run([str(nim), "ic", "--hints:off", "--skipUserCfg", "--skipParentCfg",
                     "--nimcache:" + str(iccache), "--out:" + str(executable),
-                    "-d:icJobs=1", str(icmain)], text=True, capture_output=True, check=True)
+                    "-d:icJobs=1", "-d:icConfigBundleAudit", str(icmain)],
+                   text=True, capture_output=True, check=True)
     assert subprocess.check_output([str(executable)], text=True).strip() == "11"
     assert not dependency_snapshot(iccache, icmain)["complete"]
+    assert list((iccache / "ic-config-audit-v1").glob("bundle-*/READY"))
 
     # A body-only edit changes the implementation cookie and is visible at
     # the consumer's BIF load even if the interface cookie stays unchanged.

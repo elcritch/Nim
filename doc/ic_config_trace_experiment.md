@@ -101,14 +101,42 @@ file bytes, requires unique module suffixes and correctly named artifacts, and
 rejects missing, changed, duplicate or malformed evidence. Its tests use
 synthetic completeness claims and a two-member group.
 
-This checker does not discover inputs or produce bundle manifests. A caller
+This checker does not discover inputs or produce trusted bundle manifests. A caller
 must establish what the compiler and base keys cover, independently discover
 current sources and imports, prove configuration and dependency coverage, and
 ensure the recorded hashes describe the files actually consumed. Hashing and
-then later reading a mutable file is not atomic. There is no immutable variant
-store, atomic bundle publication, or integration with the driver and nifmake;
-therefore even a `bcMatch` is not an authorization to reuse a bundle. No
-production trace currently supplies the required complete evidence.
+then later reading a mutable file is not atomic. There is no trusted immutable
+variant store or integration with nifmake; therefore even a `bcMatch` is not
+an authorization to reuse a bundle. No production trace currently supplies the
+required complete evidence.
+
+### Diagnostic bundle publication
+
+With a compiler built using `-d:nimIcConfigTrace`, passing
+`-d:icConfigBundleAudit` to `nim ic` or `nim track` publishes diagnostic group
+copies after a successful frontend discovery fixpoint. Under the selected
+nimcache, `ic-config-audit-v1/bundle-*` contains copies of each group's five
+artifacts per member, a JSON manifest and a `READY` marker. The manifest records
+the existing full configuration signature's SHA-256, the compiler executable's
+SHA-256, the IC format version, project and members, scanner-reported sources
+and includes with hashes, and the children's config and dependency traces.
+Artifact copies are checked against the bytes read from the originals. A
+unique directory is populated before the marker is atomically moved into place;
+readers ignore directories without it and can check the marker and file hashes.
+The publisher does not hard-link active cache artifacts, so later compiler
+writes do not mutate the copies. Each audit run creates new copies, including
+on a no-op build; this option has substantial storage and hashing costs.
+The flag is an ordinary Nim define and is visible to compiled code, so compare
+configurations with the same audit flag when measuring semantic differences.
+
+Every published manifest is deliberately `complete: false`. The scanner's
+input set, trace attribution, compiler and configuration identities, and
+dependency samples have not been proven sufficient or captured atomically with
+semantic compilation. The files are ordinary mutable filesystem files; the
+publication convention and integrity check do not make later reads atomic or
+enforce immutability against writers. These bundles are for inspection only:
+the driver never selects, materializes, or uses them for cache decisions.
+Incomplete or interrupted publications are not cache entries.
 
 A small `nim ic` A → B → A probe with a `strdefine` produced the expected
 executable output on each switch. It exercises the existing separate caches;

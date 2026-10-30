@@ -63,6 +63,7 @@ proc checkConfigAndDependencies*(conf: ConfigRef; manifest: JsonNode;
     recordedComplete, currentComplete: bool): ConfigDependencyCheck =
   ## Both fields must match, but even a double match checks only these two
   ## aspects of reuse. Production trace manifests are always incomplete.
+  result = ConfigDependencyCheck(config: cocInvalid, dependencies: dcInvalid)
   result.config = checkConfigObservations(conf, manifest)
   result.dependencies = checkDependencies(recorded, current,
                                            recordedComplete, currentComplete)

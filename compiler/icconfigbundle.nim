@@ -5,6 +5,9 @@ import std/[json, os, sets, tables]
 import ../dist/checksums/src/checksums/sha2
 import options, icconfigmanifest, icconfigdeps
 
+when defined(nimPreviewSlimSystem):
+  import std/syncio
+
 type
   BundleIdentity* = object
     compilerHash*: string    # SHA-256 of compiler and format identity, supplied by caller
@@ -51,7 +54,7 @@ proc fingerprintFile*(path: string): string =
   let f = open(path, fmRead)
   defer: f.close()
   var state = initSha_256()
-  var buffer: array[8192, char]
+  var buffer = default(array[8192, char])
   while true:
     let size = f.readBuffer(addr buffer[0], buffer.len)
     if size <= 0: break

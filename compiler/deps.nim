@@ -23,6 +23,10 @@ import icnifcore
 from ic/replayer import BackendActionsExt, BodyDepsExt
 from commands import compileOptionValue
 
+when defined(nimIcConfigTrace):
+  import ../dist/checksums/src/checksums/sha2
+  import icbundleaudit, icconfigbundle
+
 type
   FilePair = object
     nimFile: string
@@ -1940,6 +1944,45 @@ proc allSemmed(c: DepContext): bool =
     if not node.deferred and not fileExists(c.semmedFile(node.files[0])):
       return false
 
+when defined(nimIcConfigTrace):
+  proc publishBundleAudits(c: DepContext; cacheDir, signature, projectFile: string) =
+    ## Diagnostic only: the scanner's sources and the children's trace files
+    ## are not complete or synchronized with compilation. Never reuse these.
+    let store = cacheDir / "ic-config-audit-v1"
+    var published = 0
+    var skipped = 0
+    try:
+      let compilerHash = fingerprintFile(getAppFilename())
+      let configHash = $Sha_256.secureHash(signature)
+      for component in computeSCCs(c):
+        var group = component
+        group.sort()
+        var members: seq[AuditMember] = @[]
+        var sources: seq[string] = @[]
+        for index in group:
+          let pair = c.nodes[index].files[0]
+          var member = AuditMember(source: pair.nimFile, suffix: pair.modname)
+          for kind in BundleArtifactKind:
+            member.artifacts[kind] = semanticFile(c.config, pair.modname,
+                                                   artifactExtension(kind)).string
+          members.add member
+          for file in c.nodes[index].files: sources.add file.nimFile
+        let suffix = c.nodes[group[0]].files[0].modname
+        try:
+          discard publishAuditBundle(store, projectFile, compilerHash, configHash,
+            icFormatVersion, members, sources,
+            semanticFile(c.config, suffix, ".configtrace.json").string,
+            semanticFile(c.config, suffix, ".deptrace.json").string)
+          inc published
+        except CatchableError as error:
+          if skipped < 3:
+            stderr.writeLine("IC bundle audit: skipped group: ", error.msg)
+          inc skipped
+    except CatchableError:
+      stderr.writeLine("IC bundle audit: could not fingerprint compiler or configuration")
+      return
+    stderr.writeLine("IC bundle audit: published ", published, " incomplete groups; skipped ", skipped)
+
 proc commandIc*(conf: ConfigRef; frontendOnly = false) =
   ## Main entry point for `nim ic`. With `frontendOnly` (used by `nim track` for
   ## IDE queries) it runs only Phase 1 — the incremental nifler + `nim m`
@@ -2180,6 +2223,9 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false) =
     # by nifmake's input mtimes, independent of frontend discovery.
     # An IDE query (`frontendOnly`) stops after Phase 1: the `.s.bif` it scans
     # are all produced by the frontend; codegen + link would be wasted work.
+    when defined(nimIcConfigTrace):
+      if frontendOk and isDefined(conf, "icConfigBundleAudit"):
+        publishBundleAudits(c, cacheDir, signature, projectFile)
     if frontendOk and not frontendOnly:
       let backendFile = generateBackendBuildFile(c, forwardedArgs)
       rawMessage(conf, hintSuccess, "generated: " & backendFile)

@@ -136,6 +136,20 @@ hashes; corrupting the copied interface cookie caused an artifact mismatch.
 Those assumptions deliberately omit the module's real dependencies, so this
 tests file validation only and does not establish that the module is reusable.
 
+## Diagnostic bundle publication probe
+
+Fresh `nim track` runs with `-d:icConfigBundleAudit` were made in an isolated
+cache, once with the baseline settings and once with the unrelated
+`icConfigTraceUnusedProbe` define. Each published 221 incomplete group copies
+and skipped none. All groups had both config and dependency trace files; all
+221 corresponding groups had matching hashes for every copied semantic BIF and
+sidecar. The two sets of copied artifacts totalled 183,170,786 bytes. The
+diagnostic reader verified the marker, metadata and copied-artifact hashes for
+all 442 publications. This is evidence that the publisher captured duplicate
+bytes, not a reuse result: neither run selected a published bundle, the input
+observations remain incomplete, and files in the diagnostic store remain mutable. The drawing test
+was not run.
+
 ## Trace limitations
 
 The baseline emitted 221 process manifests, all marked incomplete. They include
