@@ -1,3 +1,6 @@
+when defined(nimIcConfigTrace):
+  import std/syncio
+
 #
 #
 #           The Nim Compiler
@@ -2357,7 +2360,11 @@ proc semDefined(c: PContext, n: PNode): PNode =
   checkSonsLen(n, 2, c.config)
   # we replace this node by a 'true' or 'false' node:
   result = newIntNode(nkIntLit, 0)
-  result.intVal = ord isDefined(c.config, considerQuotedIdentOrDot(c, n[1], n).s)
+  let defineName = considerQuotedIdentOrDot(c, n[1], n).s
+  result.intVal = ord isDefined(c.config, defineName)
+  when defined(nimIcConfigTrace):
+    stderr.writeLine("IC_CONFIG_DEFINED\t", c.module.name.s, "\t", defineName,
+                     "\t", $result.intVal)
   result.info = n.info
   result.typ = getSysType(c.graph, n.info, tyBool)
 

@@ -1,3 +1,6 @@
+when defined(nimIcConfigTrace):
+  import std/syncio
+
 #
 #
 #           The Nim Compiler
@@ -522,6 +525,11 @@ proc foldDefine(m, s: PSym, n: PNode; idgen: IdGenerator; g: ModuleGraph): PNode
           # should be processed in pragmas.nim already
           if it[1].kind in {nkStrLit, nkRStrLit, nkTripleStrLit}:
             name = it[1].strVal
+  when defined(nimIcConfigTrace):
+    let present = isDefined(g.config, name)
+    let value = if present: g.config.symbols[name].escape else: ""
+    stderr.writeLine("IC_CONFIG_VALUE\t", m.name.s, "\t", name, "\t",
+                     $present, "\t", value)
   if isDefined(g.config, name):
     let str = g.config.symbols[name]
     case s.magic
