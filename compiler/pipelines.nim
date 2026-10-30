@@ -18,6 +18,9 @@ when not defined(leanCompiler):
   import jsgen, docgen2
 
 import std/[syncio, objectdollar, assertions, tables, strutils, strtabs, sets, intsets]
+when defined(icSemanticSignatures):
+  from std/os import getEnv
+  from std/algorithm import sort
 import renderer
 import ic/replayer
 
@@ -273,6 +276,11 @@ proc finishPipelineModule(graph: ModuleGraph; module: PSym; idgen: IdGenerator;
               inst.kidsLen > 0 and inst[0] != nil and
               inst[0].kind == tyGenericBody and inst[0].sym != nil:
             typeOffers.add (inst[0].sym, inst)
+      when defined(icSemanticSignatures):
+        genericOffers.sort(proc(a, b: typeof(genericOffers[0])): int =
+          cmp(a.inst.itemId.item, b.inst.itemId.item))
+        typeOffers.sort(proc(a, b: typeof(typeOffers[0])): int =
+          cmp(a.inst.itemId.item, b.inst.itemId.item))
       # The module's REAL resolved direct imports (incl. macro/template-generated
       # ones with no surviving syntactic node). Passed to writeNifModule so the
       # NIF `deps` section is complete (the backend closure walk needs it), and
@@ -304,7 +312,11 @@ proc finishPipelineModule(graph: ModuleGraph; module: PSym; idgen: IdGenerator;
       var semDepPaths: seq[string] = @[]
       for f in resolvedImportDeps:
         semDepPaths.add toFullPath(graph.config, f)
-      writeSemDeps(graph.config, module.position.int32, semDepPaths)
+      when defined(icSemanticSignatures):
+        if getEnv("NIM_IC_SEMANTIC_RECOVER") != "1":
+          writeSemDeps(graph.config, module.position.int32, semDepPaths)
+      else:
+        writeSemDeps(graph.config, module.position.int32, semDepPaths)
 
 proc withoutCyclicPragma(n: PNode; cyclic: var bool): PNode =
   ## The module path of an import, without its pragmas. Like

@@ -339,7 +339,7 @@ proc backendBatch(conf: ConfigRef; mainSuffix: string):
                     (members.len == 1 and members[0] == mainSuffix))
 
 proc setNestedClosureBodies(g: ModuleGraph; idgen: IdGenerator; n: PNode;
-                            owner: PSym; seen: var IntSet) =
+                            owner: PSym; seen: var IntSet; markLoaded = false) =
   ## A closure routine nested in `owner` (the `:anonymous` proc lambda-lifting
   ## minted, plus any deeper nesting) gets its captured-var→env rewrite produced
   ## as part of the OWNER's `transformBody`. The nested proc is a module-indexed
@@ -380,10 +380,11 @@ proc setNestedClosureBodies(g: ModuleGraph; idgen: IdGenerator; n: PNode;
           # disamb), so injecting ccClosure nested procs here is safe.
           if sfInjectDestructors in s.flags:
             s.transformedBody = injectDestructorCalls(g, idgen, s, s.transformedBody)
-          setNestedClosureBodies(g, idgen, s.transformedBody, s, seen)
+          if markLoaded: s.nifBodyLoadedImpl = true
+          setNestedClosureBodies(g, idgen, s.transformedBody, s, seen, markLoaded)
   else:
     for i in 0 ..< n.safeLen:
-      setNestedClosureBodies(g, idgen, n[i], owner, seen)
+      setNestedClosureBodies(g, idgen, n[i], owner, seen, markLoaded)
 
 proc reownFromTwin(n: PNode; twin, s: PSym) =
   ## Re-own to `s` every entity the frontend attributed to `s`'s forward-decl
@@ -403,7 +404,7 @@ proc reownFromTwin(n: PNode; twin, s: PSym) =
     reownFromTwin(n[i], twin, s)
 
 proc lowerOneModule(g: ModuleGraph; target: PrecompiledModule;
-                    seenNested: var IntSet)
+                    seenNested: var IntSet; persist = true)
 
 proc writeBodyDeps(g: ModuleGraph; targets: openArray[PrecompiledModule];
                    mods: IntSet; outfile: string) =
@@ -477,7 +478,7 @@ proc generateLowerStage(g: ModuleGraph; mainFileIdx: FileIndex) =
           ".t.bif" & BodyDepsExt)
 
 proc lowerOneModule(g: ModuleGraph; target: PrecompiledModule;
-                    seenNested: var IntSet) =
+                    seenNested: var IntSet; persist = true) =
   ## Lower the routines `target` OWNS and write its `.t.bif`. One batch member.
   if target.module == nil:
     rawMessage(g.config, errGenerated,
@@ -546,10 +547,11 @@ proc lowerOneModule(g: ModuleGraph; target: PrecompiledModule;
       # (see genProcLvl3's `wasLoaded` gate) so this stays the single injection.
       if sfInjectDestructors in s.flags:
         s.transformedBody = injectDestructorCalls(g, tb.idgen, s, s.transformedBody)
+      if not persist: s.nifBodyLoadedImpl = true
       # Cache the lifted+injected body on nested ccClosure routines too, so a
       # module-indexed nested closure serializes its lifted (capture-rewritten,
       # destructor-injected) body.
-      setNestedClosureBodies(g, tb.idgen, s.transformedBody, s, seenNested)
+      setNestedClosureBodies(g, tb.idgen, s.transformedBody, s, seenNested, not persist)
   # Collect the hooks this stage lifted, and transform each hook ROUTINE's body
   # too (it is itself lowered into NIFC). The hooks' `(sd)` + transformed body go
   # into the `.t.nif`; `cg` re-attaches them so `injectDestructorCalls` resolves
@@ -572,18 +574,20 @@ proc lowerOneModule(g: ModuleGraph; target: PrecompiledModule;
       e.sym.transformedBody = transformBody(g, tb.idgen, e.sym, {})
       if sfInjectDestructors in e.sym.flags:
         e.sym.transformedBody = injectDestructorCalls(g, tb.idgen, e.sym, e.sym.transformedBody)
+      if not persist: e.sym.nifBodyLoadedImpl = true
     inc i
   # Re-serialize the whole module to its suffix-based `.t.nif` (the path
   # `toNifFilename` resolves for the cg/emit stages). `writeLoweredModule` seals
   # routines itself.
   icProfStop(tLowerHooks)
-  let suffix = cachedModuleSuffix(g.config, FileIndex modPos)
-  let wholeArtifact = toGeneratedFile(g.config, AbsoluteFile(suffix), ".t.bif").string
-  timed tLowerWrite:
-    writeLoweredModule(ast.program, g.config, target, hooks, wholeArtifact)
-  if isDefined(g.config, "icDceCheck"):
-    stderr.writeLine "[icLower] " & extractFilename(wholeArtifact) & " " &
-      $hooks.len & " hooks"
+  if persist:
+    let suffix = cachedModuleSuffix(g.config, FileIndex modPos)
+    let wholeArtifact = toGeneratedFile(g.config, AbsoluteFile(suffix), ".t.bif").string
+    timed tLowerWrite:
+      writeLoweredModule(ast.program, g.config, target, hooks, wholeArtifact)
+    if isDefined(g.config, "icDceCheck"):
+      stderr.writeLine "[icLower] " & extractFilename(wholeArtifact) & " " &
+        $hooks.len & " hooks"
 
 proc visitDep(suffix: string;
               suffixToMod: Table[string, PrecompiledModule];
@@ -666,6 +670,18 @@ proc generateCgStage(g: ModuleGraph; mainFileIdx: FileIndex) =
   # asked first — which is precisely what the set exists to prevent.
   for target in targets:
     bl.icEmitted.incl target.module.position
+
+  when defined(icSignatureOnly):
+    # Recreate closure environments in the same pass as their owner, instead
+    # of re-lowering a captured nested proc independently during codegen.
+    var seenNested = initIntSet()
+    for target in targets:
+      let modPos = target.module.position
+      for s in moduleSymbolStubs(ast.program, FileIndex modPos):
+        if ownsRuntimeRoutine(s, modPos):
+          s.transformedBodyImpl = nil
+          s.nifBodyLoadedImpl = false
+      lowerOneModule(g, target, seenNested, persist = false)
 
   # Generate EVERY member before finishing ANY of them. `finishModule` closes a
   # TU (`finalCodegenActions` puts it in `modulesClosed`), and a later member's

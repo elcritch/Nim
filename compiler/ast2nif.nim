@@ -12,9 +12,13 @@
 import std / [assertions, tables, sets]
 from std / strutils import startsWith, endsWith, contains
 from std / os import fileExists, dirExists, walkFiles, existsEnv,
-  commandLineParams, getCurrentProcessId
+  commandLineParams, getCurrentProcessId, getEnv, `/`, parentDir, extractFilename,
+  createDir, moveFile, envPairs, getAppFilename
+when defined(icSemanticSignatures):
+  import std/[osproc, json, strtabs]
+  import ic/sharedcounters
 from std / exitprocs import addExitProc
-from std / syncio import readFile, stderr, writeLine
+from std / syncio import readFile, stderr, writeLine, File, open, close, fmAppend, writeFile
 from std / algorithm import sort
 import "../dist/checksums/src/checksums" / sha1
 import astdef, idents, msgs, options
@@ -277,6 +281,7 @@ type
                          # alone deduped the second to a dangling `SymUse` (`symbol has no offset`).
     emittedBackendSyms: HashSet[int32]   # backend-local sym items already def'd this module
     lowering: bool  # serializing the `lower` stage's whole-module `.t.nif`
+    fullSemantic: bool
     when defined(icSignatureOnly):
       omitRoutineAst: PNode
     emittedFieldSyms: HashSet[ItemId]    # lowering: derived env-field syms already def'd
@@ -539,7 +544,7 @@ proc writeType(w: var Writer; dest: var IcBuilder; typ: PType)
 proc writeSym(w: var Writer; dest: var IcBuilder; sym: PSym)
 
 func restoresWrittenState(config: ConfigRef): bool {.inline.} =
-  config.ideActive or optGenBif in config.globalOptions
+  config.ideActive or optGenBif in config.globalOptions or defined(icSemanticSignatures)
 
 proc writeLoc(w: var Writer; dest: var IcBuilder; loc: TLoc) =
   dest.addIdent toNifTag(loc.k)
@@ -1091,49 +1096,22 @@ proc docOfSym(sym: PSym): string =
       return nodeCommentReader(body[0])
   return ""
 
-when defined(icSignatureOnly):
-  proc isSimpleRuntimeBody(n: PNode): bool =
-    ## Start with straight-line bodies that cannot contain nested routines,
-    ## calls, templates, or cross-module references.
-    if n == nil: return false
-    if nfLazyBody in n.flags and forceLazyBodyHook != nil:
-      forceLazyBodyHook(n)
-    case n.kind
-    of nkSym:
-      return n.sym != nil and n.sym.kindImpl in {skParam, skResult}
-    of nkLiterals, nkNilLit, nkEmpty:
-      return true
-    of nkCall, nkCommand, nkInfix, nkPrefix, nkPostfix, nkHiddenCallConv:
-      if n.len == 0 or n[0].kind != nkSym or n[0].sym == nil or
-          n[0].sym.magicImpl notin {mAddI, mSubI, mMulI, mDivI, mModI,
-            mAddU, mSubU, mMulU, mDivU, mModU, mAddF64, mSubF64, mMulF64,
-            mDivF64, mEqI, mLeI, mLtI, mEqF64, mLeF64, mLtF64, mLeU, mLtU,
-            mUnaryMinusI, mUnaryMinusI64, mUnaryPlusI, mUnaryPlusF64,
-            mUnaryMinusF64, mNot, mBitnotI, mShrI, mShlI, mAshrI, mBitandI,
-            mBitorI, mBitxorI}:
-        return false
-      for i in 1 ..< n.len:
-        if not isSimpleRuntimeBody(n[i]): return false
-      return true
-    of nkStmtList, nkReturnStmt, nkAsgn, nkFastAsgn, nkHiddenStdConv,
-       nkHiddenSubConv, nkConv:
-      for child in n:
-        if not isSimpleRuntimeBody(child): return false
-      return true
-    else:
-      return false
+when defined(icSemanticSignatures) and not defined(icSignatureOnly):
+  {.error: "icSemanticSignatures requires icSignatureOnly".}
 
+when defined(icSignatureOnly):
   proc omitLoweredBody(w: Writer; sym: PSym): bool =
-    if not w.lowering or sym.kindImpl != skProc or sym.typImpl == nil or
-       sym.typImpl.callConvImpl != ccNimCall or sym.itemId.module != w.currentModule or
-       sym.itemId.isBackendMinted or sym.transformedBodyImpl == nil or
-       {sfFromGeneric, sfCompileTime, sfCompilerProc, sfExportc,
-        sfImportc, sfForward, sfBorrow} * sym.flagsImpl != {}:
+    ## Source-owned non-generic procs/functions can be restored from the
+    ## semantic companion. Generated backend hooks have no source slot.
+    if (not w.lowering and (not defined(icSemanticSignatures) or w.fullSemantic)) or
+       sym.kindImpl notin {skProc, skFunc} or sym.typImpl == nil or
+       sym.itemId.module != w.currentModule or sym.itemId.isBackendMinted or
+       sfFromGeneric in sym.flagsImpl:
       return false
     let a = sym.astImpl
     result = a != nil and a.safeLen > bodyPos and a.safeLen > genericParamsPos and
              a[genericParamsPos].kind == nkEmpty and a[bodyPos] != nil and
-             a[bodyPos].kind != nkEmpty and isSimpleRuntimeBody(a[bodyPos])
+             a[bodyPos].kind != nkEmpty
 
 proc writeSymDef(w: var Writer; dest: var IcBuilder; sym: PSym) =
   # A non-field sym reached from inside a reclist (e.g. a field type's `sym`, a
@@ -1221,7 +1199,10 @@ proc writeSymDef(w: var Writer; dest: var IcBuilder; sym: PSym) =
     let tb = sym.transformedBodyImpl
     when defined(icSignatureOnly):
       if omitBody:
-        dest.openTag "icsigbody"
+        if w.lowering:
+          dest.openTag "icsigbody"
+        else:
+          dest.openTag "icsemsigbody"
         dest.closeTag()
       elif tb != nil and tb.kind notin {nkStmtList, nkEmpty}:
         dest.addParLe pool.tags.getOrIncl(toNifTag(nkStmtList)), NoLineInfo
@@ -1231,20 +1212,16 @@ proc writeSymDef(w: var Writer; dest: var IcBuilder; sym: PSym) =
         dest.addParRi
       else:
         writeNode(w, dest, tb)
-    elif tb != nil and tb.kind notin {nkStmtList, nkEmpty}:
-      # Always an `nkStmtList` on the wire, so the READER can defer it: the
-      # `nfLazyBody` placeholder has to be a kind whose arity a childless node
-      # can honour, and `nkStmtList` is the one that is (see `loadNode`'s
-      # `routineDefs` branch). A one-line body — `x = s` after transformation
-      # — is wrapped; for the generator `(stmts body)` and `body` are the same
-      # statement, and this slot has no other reader.
-      dest.addParLe pool.tags.getOrIncl(toNifTag(nkStmtList)), NoLineInfo
-      dest.addDotToken            # no node flags (what `writeFlags({})` emits)
-      dest.addDotToken            # no node type
-      writeNode(w, dest, tb)
-      dest.addParRi
     else:
-      writeNode(w, dest, tb)
+      if tb != nil and tb.kind notin {nkStmtList, nkEmpty}:
+        # Wrap a one-line transformed body so the reader can defer it.
+        dest.addParLe pool.tags.getOrIncl(toNifTag(nkStmtList)), NoLineInfo
+        dest.addDotToken
+        dest.addDotToken
+        writeNode(w, dest, tb)
+        dest.addParRi
+      else:
+        writeNode(w, dest, tb)
   else:
     dest.addDotToken
   dest.addParRi
@@ -2298,6 +2275,95 @@ proc writeInterface(w: var Writer; dest: var IcBuilder; syms: openArray[PSym];
       dest.addSymUse w.toNifSymName(sym)
   dest.addParRi()
 
+when defined(icSemanticSignatures):
+  proc semanticDigest(dest: var IcBuilder): string =
+    var s = newSha1State()
+    for t in flattenForCookie(dest):
+      if t.kind in {ckSym, ckSymDef}:
+        s.update(if t.kind == ckSymDef: " :" else: " ")
+        s.update t.name
+      else:
+        updateAtom s, t
+    result = $SecureHash(s.finalize())
+
+  proc semanticRecoveryPath(path: string): string =
+    let root = getEnv("NIM_IC_SEMANTIC_TMP")
+    if root.len == 0:
+      raiseAssert "icSemanticSignatures requires a nim ic recovery directory"
+    result = root / $secureHash(path) / extractFilename(path)
+
+  proc semanticRecoveryOutput(path: string): string =
+    if getEnv("NIM_IC_SEMANTIC_RECOVER") != "1":
+      return semanticRecoveryPath(path)
+    result = getEnv("NIM_IC_SEMANTIC_TARGET")
+    if path != getEnv("NIM_IC_SEMANTIC_REQUEST"):
+      result.add ".group." & $secureHash(path)
+
+  proc validRecovered(path, candidate: string): bool =
+    if not fileExists(path) or not fileExists(candidate) or
+       not fileExists(candidate & ".digest"): return false
+    var slim = icbif.load(path)
+    var cur = slim.buf.beginRead()
+    inc cur
+    while cur.hasMore and (cur.kind != TagLit or
+        tagName(cur.tags, cursorTagId(cur)) != "unusedid"):
+      skip cur
+    if not cur.hasMore: return false
+    inc cur
+    skip cur
+    result = cur.kind == StrLit and strVal(cur) == readFile(candidate & ".digest")
+
+  proc recoverSemantic(path: string): string =
+    result = semanticRecoveryPath(path)
+    if fileExists(result): return
+    let commandFile = path & ".command.json"
+    if not fileExists(commandFile):
+      raiseAssert "missing semantic recovery command: " & commandFile
+    let commandText = readFile(commandFile)
+    let key = $secureHash(commandText)
+    let stack = getEnv("NIM_IC_SEMANTIC_STACK")
+    if stack.contains("|" & key & "|"):
+      raiseAssert "cyclic semantic recovery for " & path
+    createDir(parentDir(result))
+    let locks = getEnv("NIM_IC_SEMANTIC_TMP") / "locks"
+    createDir(locks)
+    var lock: File = nil
+    if not open(lock, locks / key, fmAppend):
+      raiseAssert "cannot lock semantic recovery for " & path
+    lockExclusive(lock)
+    defer:
+      unlock(lock)
+      close(lock)
+    if fileExists(result): return
+    var args: seq[string] = @[]
+    for arg in parseJson(commandText): args.add arg.getStr
+    var env = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): env[k] = v
+    env["NIM_IC_SEMANTIC_RECOVER"] = "1"
+    env["NIM_IC_SEMANTIC_STACK"] = stack & "|" & key & "|"
+    let pending = result & ".pending"
+    env["NIM_IC_SEMANTIC_TARGET"] = pending
+    env["NIM_IC_SEMANTIC_REQUEST"] = path
+    let p = startProcess(getAppFilename(), args = args, env = env,
+                         options = {poParentStreams})
+    let exitCode = waitForExit(p)
+    close(p)
+    if exitCode != 0 or not fileExists(pending):
+      raiseAssert "could not recover semantic body data for " & path
+    if not validRecovered(path, pending):
+      raiseAssert "recovered semantic data changed for " & path &
+        "; rebuild the affected module"
+    moveFile(pending & ".digest", result & ".digest")
+    moveFile(pending, result)
+    for sourceFile in walkFiles(pending & ".group.*.source"):
+      let otherPath = readFile(sourceFile)
+      let candidate = sourceFile[0 ..< sourceFile.len - ".source".len]
+      let otherResult = semanticRecoveryPath(otherPath)
+      if not fileExists(otherResult) and validRecovered(otherPath, candidate):
+        createDir(parentDir(otherResult))
+        moveFile(candidate & ".digest", otherResult & ".digest")
+        moveFile(candidate, otherResult)
+
 proc writeNifModule*(config: ConfigRef; thisModule: int32; n: PNode;
                      opsLog: seq[LogEntry];
                      replayActions: seq[PNode] = @[];
@@ -2311,8 +2377,15 @@ proc writeNifModule*(config: ConfigRef; thisModule: int32; n: PNode;
                      expansions: seq[(PSym, TLineInfo)] = @[];
                      moduleFlags: int32 = 0;
                      extraExports: seq[ItemId] = @[];
-                     publicInterface: seq[PSym] = @[]; hiddenInterface: seq[PSym] = @[]) =
+                     publicInterface: seq[PSym] = @[]; hiddenInterface: seq[PSym] = @[];
+                     fullSemantic = false) =
+  when defined(icSemanticSignatures):
+    if not fullSemantic:
+      writeNifModule(config, thisModule, n, opsLog, replayActions, implDeps,
+        genericOffers, typeOffers, resolvedImportDeps, firstUnusedId, expansions,
+        moduleFlags, extraExports, publicInterface, hiddenInterface, true)
   var w = Writer(infos: newLineInfoWriter(config), currentModule: thisModule)
+  w.fullSemantic = fullSemantic
   for id in extraExports: w.extraExports.incl id
   w.deps = newIcBuilder(64)
   var content = newIcBuilder(300)
@@ -2459,6 +2532,9 @@ proc writeNifModule*(config: ConfigRef; thisModule: int32; n: PNode;
   # First child: the backend id seed (see `(unusedid)` / readUnusedId).
   dest.addParLe unusedIdTag, NoLineInfo
   dest.addIntLit firstUnusedId.int64
+  when defined(icSemanticSignatures):
+    if not fullSemantic:
+      dest.addStrLit readFile(semanticRecoveryOutput(bifPath) & ".digest")
   dest.addParRi()
   # The module symbol's backend-relevant flags (see `(modflags)`).
   dest.addParLe modFlagsTag, NoLineInfo
@@ -2508,8 +2584,22 @@ proc writeNifModule*(config: ConfigRef; thisModule: int32; n: PNode;
   # text `.s.nif` twin — writing two files per module only slows the build; debug
   # a `.bif` via `tools/bif2nif`). Re-homed into a private fresh pool
   # so the file holds only THIS module's literals.
-  storeBifStable(dest, bifPath, "." & extractModuleSuffix(bifPath))
-  if not isDefined(config, "icNoIfaceGate"):
+  when defined(icSemanticSignatures):
+    if fullSemantic:
+      let recoveryPath = semanticRecoveryOutput(bifPath)
+      createDir(parentDir(recoveryPath))
+      storeBifStable(dest, recoveryPath, "." & extractModuleSuffix(bifPath))
+      writeFile(recoveryPath & ".digest", semanticDigest(dest))
+      if getEnv("NIM_IC_SEMANTIC_RECOVER") == "1":
+        writeFile(recoveryPath & ".source", bifPath)
+    elif getEnv("NIM_IC_SEMANTIC_RECOVER") != "1":
+      storeBifStable(dest, bifPath, "." & extractModuleSuffix(bifPath))
+      writeFile(bifPath & ".command.json", $(%commandLineParams()))
+  else:
+    storeBifStable(dest, bifPath, "." & extractModuleSuffix(bifPath))
+  if not isDefined(config, "icNoIfaceGate") and
+      (not defined(icSemanticSignatures) or
+       (fullSemantic and getEnv("NIM_IC_SEMANTIC_RECOVER") != "1")):
     var flat = flattenForCookie(dest)
     let ifaceHex = writeIfaceCookie(config, thisModule, flat)
     writeImplCookie(config, thisModule, flat, ifaceHex)
@@ -2751,6 +2841,9 @@ proc cursorFromIndexEntry(c: var DecodeContext; module: FileIndex; entry: NifInd
   ## position. No I/O, no per-symbol materialization — and, because each call
   ## returns an INDEPENDENT cursor, none of the old stream-cursor clobber hazards
   ## (the `jumpTo(saved)` save/restore dance) apply anymore.
+  when defined(icSignatureOnly):
+    if entry.offset < 0:
+      return cursorAt(c.mods[module].semBuf, -entry.offset)
   result = cursorAt(c.mods[module].buf, entry.offset)
 
 type
@@ -2933,7 +3026,8 @@ proc moduleId(c: var DecodeContext; suffix: string; flags: set[LoadFlag] = {}): 
     # index is taken from the one the file carries (`indexFromBif`).
     let conf = c.infos.config
     let useLowered = conf.cmd == cmdNifC and
-                     (conf.icBackendStage == "cg" or conf.icBackendStage == "emit")
+                     (conf.icBackendStage == "cg" or conf.icBackendStage == "emit") and
+                     (not defined(icSignatureOnly) or conf.icBackendStage != "cg")
     var modFile = (getNimcacheDir(conf) / RelativeFile(suffix & ".t.bif")).string
     let lowered = useLowered and fileExists(modFile)
     if not lowered:
@@ -2942,6 +3036,8 @@ proc moduleId(c: var DecodeContext; suffix: string; flags: set[LoadFlag] = {}): 
       raiseAssert "NIF file not found for module suffix '" & suffix & "': " & modFile &
         ". This can happen when loading a module from NIF that references another module " &
         "whose NIF file hasn't been written yet."
+    when defined(icSemanticSignatures):
+      if not lowered: modFile = recoverSemantic(modFile)
     icProfStart(tBifLoad)
     var m = icbif.load(modFile)
     prof pBifLoads
@@ -2969,8 +3065,9 @@ proc ensureSemBuf(c: var DecodeContext; module: FileIndex) =
   let m = c.mods[module]
   if m.semTried: return
   m.semTried = true
-  let semFile = semanticFile(c.infos.config, m.suffix, ".s.bif").string
+  var semFile = semanticFile(c.infos.config, m.suffix, ".s.bif").string
   if not fileExists(semFile): return
+  when defined(icSemanticSignatures): semFile = recoverSemantic(semFile)
   var sm = icbif.load(semFile)
   prof pBifLoads
   prof pSemBufLoads
@@ -3006,7 +3103,7 @@ proc loadNode(c: var DecodeContext; n: var Cursor; thisModule: string;
               localSyms: var Table[string, PSym]; fieldOwner: PType = nil): PNode
 
 proc loadSymFromCursor(c: var DecodeContext; s: PSym; n: var Cursor; thisModule: string;
-                       localSyms: var Table[string, PSym])
+                       localSyms: var Table[string, PSym]; semanticSource = false)
 
 proc reconstructSysType(c: var DecodeContext; name: string; k: int; itemVal: int32): PType =
   ## Rebuild a module-less magic singleton (see `SysModuleSuffix`) from its kind
@@ -3099,7 +3196,7 @@ proc createTypeStub(c: var DecodeContext; name: string): PType =
     raiseAssert "symbol has no offset: " & name
 
 proc extractLocalSymsFromTree(c: var DecodeContext; n: var Cursor; thisModule: string;
-                              localSyms: var Table[string, PSym]) =
+                              localSyms: var Table[string, PSym]; semanticSource = false) =
   ## Scan a tree for local symbol definitions (sdef tags) and add them to localSyms.
   ## For local symbols, fully load them immediately since they have no index offsets.
   ## After this proc returns, n is positioned AFTER the tree.
@@ -3138,9 +3235,25 @@ proc extractLocalSymsFromTree(c: var DecodeContext; n: var Cursor; thisModule: s
       loadSymFromCursor(c, sym, n, thisModule, localSyms)
       sym.state = c.loadedState  # mark as fully loaded
       return
+    when defined(icSignatureOnly):
+      if semanticSource and sn.module == thisModule and sn.module.len > 0 and
+          not c.syms.hasKey(symName):
+        let module = moduleId(c, sn.module)
+        if not c.mods[module].hasIndexEntry(symName):
+          # The lowered BIF no longer contains this definition because it was
+          # inside an omitted body. Preserve its identity in the shared cache
+          # before reading references to it from the restored semantic AST.
+          let (_, id) = c.mintSymId(sn.module)
+          let (_, stubName) = stubKindAndName(c.cache, sn.name)
+          let sym = PSym(itemId: id, kindImpl: skStub, name: stubName,
+                         disamb: sn.count.int32, state: Complete)
+          c.syms[symName] = (sym, NifIndexEntry())
+          loadSymFromCursor(c, sym, n, thisModule, localSyms, semanticSource = true)
+          sym.state = c.loadedState
+          return
   # Otherwise descend into every child, scanning each for nested local sdefs.
   n.loopInto:
-    extractLocalSymsFromTree(c, n, thisModule, localSyms)
+    extractLocalSymsFromTree(c, n, thisModule, localSyms, semanticSource)
 
 proc loadTypeFromCursor(c: var DecodeContext; n: var Cursor; t: PType; localSyms: var Table[string, PSym])
 
@@ -3209,7 +3322,14 @@ proc loadSymStub(c: var DecodeContext; symAsStr: string; thisModule: string;
     # `…<thisModuleSuffix>@bk`: `mintSymId` homes it to that module with a
     # backendItemId so it stays disjoint from the loader's real id space.
     let (module, id) = c.mintSymId(sn.module)
-    let offs = c.mods[module].indexEntry(symAsStr)
+    var offs = c.mods[module].indexEntry(symAsStr)
+    when defined(icSignatureOnly):
+      if offs.offset == 0 and c.mods[module].loweredPrimary:
+        ensureSemBuf(c, module)
+        offs = c.mods[module].semIndexEntry(symAsStr)
+        if offs.offset != 0:
+          # Negative offsets designate symbols restored from the semantic BIF.
+          offs.offset = -offs.offset
     if offs.offset == 0:
       # Only module/package self-syms are never written as `(sd)` entries, so a
       # missing index offset means this is such a sym — typically the OWNER of an
@@ -3383,7 +3503,7 @@ when defined(icSignatureOnly):
     if e.offset == 0: raiseAssert "missing semantic body for " & s.name.s
     var n = cursorAt(m.semBuf, e.offset)
     var scan = n
-    extractLocalSymsFromTree(c, scan, thisModule, localSyms)
+    extractLocalSymsFromTree(c, scan, thisModule, localSyms, semanticSource = true)
     n.into:
       # symbol, visibility, kind, magic, flags, options, offset, position,
       # annex, type, owner; the next field is the routine AST.
@@ -3392,7 +3512,7 @@ when defined(icSignatureOnly):
       while n.hasMore: skip n
 
 proc loadSymFromCursor(c: var DecodeContext; s: PSym; n: var Cursor; thisModule: string;
-                       localSyms: var Table[string, PSym]) =
+                       localSyms: var Table[string, PSym]; semanticSource = false) =
   ## Loads a symbol definition. The cursor must be positioned AT the opening
   ## `(sd` TagLit; `into` consumes the whole sdef including its closing `)`.
   n.into:
@@ -3473,7 +3593,11 @@ proc loadSymFromCursor(c: var DecodeContext; s: PSym; n: var Cursor; thisModule:
     #  * frontend `cmdM` never loads it (a dependent needs no foreign lowered body,
     #    and reconstructing one must not perturb effect/exception inference).
     let conf = c.infos.config
-    let loadSlot = s.kindImpl in routineKinds and conf.cmd == cmdNifC and
+    when defined(icSemanticSignatures):
+      if s.kindImpl in routineKinds and n.kind == TagLit and tagIs(n, "icsemsigbody"):
+        raiseAssert "missing recovered semantic body for " & globalName(s, conf)
+    let loadSlot = not semanticSource and s.kindImpl in routineKinds and conf.cmd == cmdNifC and
+      (not defined(icSignatureOnly) or conf.icBackendStage != "cg") and
       (conf.icBackendStage == "cg" or conf.icBackendStage == "emit" or
        (conf.icBackendStage == "lower" and icReuseSemLowering(conf)))
     if loadSlot:
@@ -3515,7 +3639,8 @@ proc loadSym*(c: var DecodeContext; s: PSym) =
   recordLoad(c, s.itemId.module.FileIndex, isType = false)
   let symsModule = s.itemId.module.FileIndex
   let nifname = globalName(s, c.infos.config)
-  var n = cursorFromIndexEntry(c, symsModule, c.syms[nifname][1])
+  let entry = c.syms[nifname][1]
+  var n = cursorFromIndexEntry(c, symsModule, entry)
 
   expect n, TagLit
   if not tagIs(n, symDefTagName):
@@ -3539,7 +3664,11 @@ proc loadSym*(c: var DecodeContext; s: PSym) =
   # parameter resolved to a second symbol and was reported as an illegal
   # capture (`config` in `makeFieldReadersTable`'s `readField`).
   var scanCursor = n
-  extractLocalSymsFromTree(c, scanCursor, c.mods[symsModule].suffix, localSyms)
+  when defined(icSignatureOnly):
+    extractLocalSymsFromTree(c, scanCursor, c.mods[symsModule].suffix, localSyms,
+                             semanticSource = entry.offset < 0)
+  else:
+    extractLocalSymsFromTree(c, scanCursor, c.mods[symsModule].suffix, localSyms)
 
   # Now parse the symbol definition with all local symbols pre-registered
   s.infoImpl = c.infos.oldLineInfo(n.info, cursorPool(n))
@@ -3548,7 +3677,11 @@ proc loadSym*(c: var DecodeContext; s: PSym) =
   # suggest's `extractDocComment` (findDocComment on `s.ast`) finds it.
   let docId = rawLineInfo(n).comment   # nifcore StrId of the `#..#` doc comment
   let docPool = cursorPool(n)          # the buffer's own strings pool (shared or bif-fresh)
-  loadSymFromCursor(c, s, n, c.mods[symsModule].suffix, localSyms)
+  when defined(icSignatureOnly):
+    loadSymFromCursor(c, s, n, c.mods[symsModule].suffix, localSyms,
+                      semanticSource = entry.offset < 0)
+  else:
+    loadSymFromCursor(c, s, n, c.mods[symsModule].suffix, localSyms)
   if uint32(docId) != 0'u32 and s.astImpl != nil and nodeCommentWriter != nil:
     nodeCommentWriter(s.astImpl, docPool.strings[docId])
 

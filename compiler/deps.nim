@@ -1947,6 +1947,15 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false) =
   ## backend (`nim nifc` -> C -> link), which a goto-def / find-usages scan does
   ## not need.
   when not defined(nimKochBootstrap):
+    when defined(icSemanticSignatures):
+      let tempDir = getTempDir() / ("nim-ic-semantic-" & $getCurrentProcessId())
+      createDir(tempDir)
+      let oldTempDir = getEnv("NIM_IC_SEMANTIC_TMP")
+      putEnv("NIM_IC_SEMANTIC_TMP", tempDir)
+      defer:
+        if oldTempDir.len == 0: delEnv("NIM_IC_SEMANTIC_TMP")
+        else: putEnv("NIM_IC_SEMANTIC_TMP", oldTempDir)
+        removeDir(tempDir)
     let nifler = findNifler()
     if nifler.len == 0:
       rawMessage(conf, errGenerated, "nifler tool not found. Install nimony or add nifler to PATH.")

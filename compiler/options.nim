@@ -29,7 +29,8 @@ const
 
   nimEnableCovariance* = defined(nimEnableCovariance)
 
-  icFormatVersion* = when defined(icSignatureOnly): "52-signature1" else: "52"
+  icFormatVersion* = when defined(icSemanticSignatures): "52-semantic-signature3"
+                     elif defined(icSignatureOnly): "52-signature3" else: "52"
     ## v51: the lowered `.t.bif` carries its module's `(offer)` names.
     ## v49: shared parsing, configuration semantics, and per-entry-point backend caches.
     ## v48: track implementation dependencies for reused generic type instances.
