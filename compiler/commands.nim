@@ -977,6 +977,12 @@ proc processSwitch*(switch, arg: string, pass: TCmdLinePass, info: TLineInfo;
     # real entry point so that `isMainModule` and `when isMainModule:` resolve
     # correctly even though every module is compiled with `sfMainModule` set.
     conf.isMainModule = switchOn(arg)
+  of "icreuseplan":
+    when defined(nimIcConfigReuse):
+      expectArg(conf, switch, arg, pass, info)
+      conf.icReusePlan = arg
+    else:
+      localError(conf, info, "compiler was built without -d:nimIcConfigReuse")
   of "icgroup":
     # `nim m` only: register a module that belongs to the current strongly-
     # connected import group, so it is compiled from source (not loaded from a

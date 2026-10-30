@@ -1,5 +1,16 @@
 # Plan: configuration-aware semantic BIF reuse
 
+## Implementation status
+
+The [restricted opt-in reuse path](ic_config_reuse.md) now implements the first
+conservative define-difference milestone for `nim ic` and `nim track`. It uses
+its own eligibility contract and immutable variant store; diagnostic traces
+remain incomplete. Macros, host callbacks, negative compile probes and other
+unsupported observations fall back to ordinary compilation. Define footprints
+are cached with BIF contexts, and dependency context IDs carry transitive input
+changes without revalidating the whole closure on every hit. Broader coverage
+and cross-project sharing remain future stages.
+
 ## Goal
 
 Allow `nim ic` and `nim track` to reuse a module's semantic BIF when two builds differ in defines that cannot affect that module's compilation. For example, a define used only by Merenda should not by itself force recompilation of every FigDraw module. Reuse depends on configuration queries, imports, compile-time execution, and other inputs; it is not determined merely by which define names appear in a module's source.

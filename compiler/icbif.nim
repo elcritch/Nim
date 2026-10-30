@@ -42,6 +42,10 @@ import "../dist/nimony/src/lib" / [bitabs, lineinfos, vfs]
 import "../dist/nimony/src/lib/nifcore" except symName, strVal, poolSym, poolStr, lineInfoFile
 from "../dist/nimony/src/lib" / bif import BifModule, IndexEntry, IndexVis
 
+when defined(nimIcConfigReuse):
+  import ../dist/checksums/src/checksums/sha2
+  import icfilehashes
+
 type
   LazyNames = object
     ## One pool's names, still in the mapped file: per id the offset of the
@@ -246,13 +250,32 @@ proc rNames[Id, T](r: var Reader; t: var BiTable[Id, T]; n: int; empty: T): Lazy
     r.pos += len
     discard t.addOrdered(empty)
 
-proc load*(filename: string): BifModule =
+proc load*(filename: string; contentHash: ptr string = nil; digestStore = ""): BifModule =
   ## `bif.load`, with the string, symbol and filename pools left in the
   ## mapping. Tags are few and always read, and stay eager.
   when defined(icEagerPools):
     result = bif.load(filename)
+    when defined(nimIcConfigReuse):
+      # No observation of the eager loader's exact mapping: refuse publication.
+      if contentHash != nil: contentHash[] = ""
   else:
+    when defined(nimIcConfigReuse):
+      let before = if contentHash != nil: fileStamp(filename) else: ""
     let blob = vfsOpenMmap(filename)      # left mapped for the buffer's lifetime
+    when defined(nimIcConfigReuse):
+      if contentHash != nil:
+        # Associate the cached digest with the exact mapped inode. Atomic
+        # semantic writes and the driver's lock keep borrowed mappings stable.
+        let stable = fileStamp(filename) == before
+        contentHash[] = if stable: readCachedDigest(digestStore, filename, before) else: ""
+        if contentHash[].len == 0:
+          var state = initSha_256()
+          if blob.size > 0:
+            state.update(toOpenArray(cast[ptr UncheckedArray[char]](blob.data), 0, blob.size - 1))
+          contentHash[] = $state.digest()
+          if stable and fileStamp(filename) == before:
+            cacheDigest(digestStore, filename, before, contentHash[])
+
     var r = Reader(base: cast[ptr UncheckedArray[char]](blob.data), pos: 0, size: blob.size)
     assert r.size >= Magic.len, "bif: file too small"
     for i in 0 ..< Magic.len:

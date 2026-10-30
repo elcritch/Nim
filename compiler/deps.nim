@@ -27,6 +27,13 @@ when defined(nimIcConfigTrace):
   import ../dist/checksums/src/checksums/sha2
   import icbundleaudit, icconfigbundle
 
+when defined(nimIcConfigReuse):
+  import std/[json, tempfiles]
+  import icconfigreuse
+  from icfilehashes import fingerprintFileCached
+  from icconfig import writeIcConfig
+  from icconfigbundle import fingerprintFile, BundleArtifactKind, artifactExtension
+
 type
   FilePair = object
     nimFile: string
@@ -63,6 +70,8 @@ type
     implicitNodeIds: seq[int] # node IDs of `--import`ed modules (conf.implicitImports);
                               # every ordinary module implicitly imports these, so each
                               # gets a dependency edge on them, exactly like system.nim
+    when defined(nimIcConfigReuse):
+      reuseStore, reuseBase, reuseCompiler, reuseCompilerStamp: string
     scanningMain: bool # currently scanning the project main module's deps;
                        # makes `when isMainModule` conditions evaluate true
                        # only there (every other module is imported)
@@ -1138,11 +1147,11 @@ proc computeForwardedArgs(c: DepContext): seq[string] =
   # verbatim, minus the ones that MUST differ per child (the output/cache paths,
   # the command itself, and IC's own per-rule switches, which each rule sets).
   const notForwarded = [
-    "nimcache", "out", "o", "outdir", "usenimcache", "run", "r",
+    "nimcache", "out", "o", "outdir", "usenimcache", "run", "r", "path", "p",
     "incremental", "ic", "symbolfiles", "genbif",
     "icproject", "icpreparsedconfig", "icconfigout", "icgroup",
     "icsemdir", "icmainsemdir", "icmainmodule",
-    "icbackendstage", "icbackendmodule", "ismainmodule",
+    "icbackendstage", "icbackendmodule", "ismainmodule", "icreuseplan",
     "help", "h", "fullhelp", "version", "v", "advanced"]
   var positionalArgs = 0
   for a in commandLineParams():
@@ -1204,6 +1213,80 @@ proc configSignature(c: DepContext; forwardedArgs: seq[string]): string =
 proc configSignatureFile(c: DepContext): string =
   c.argsFile
 
+when defined(nimIcConfigReuse):
+  proc reuseBaseSignature(c: DepContext; forwarded: seq[string]): string =
+    # Preserve ordered non-define switches, effective config-file switches and
+    # every serialized setting. Only ordinary define/undef switches move into
+    # the per-process observation gate. specialDefine's names remain pinned.
+    var args = newJArray()
+    for arg in forwarded:
+      if not ordinaryDefineArg(arg) and not arg.startsWith("--icPreparsedConfig:"):
+        args.add %arg
+    var switches = newJArray()
+    for sw in c.config.icConfigSwitches:
+      if not ordinaryDefineArg("--" & sw.switch & ":" & sw.arg):
+        switches.add %*[sw.switch, sw.arg]
+    var paths, lazy, nimble, cpp: seq[string] = @[]
+    for p in c.config.searchPaths: paths.add p.string
+    for p in c.config.lazyPaths: lazy.add p.string
+    for p in c.config.nimblePaths: nimble.add p.string
+    for item in c.config.cppDefines: cpp.add item
+    cpp.sort()
+    result = fingerprintBytes($(%*{"version": 1, "args": args, "switches": switches,
+      "paths": paths, "lazy": lazy, "nimble": nimble, "cpp": cpp,
+      "options": $c.config.options, "globalOptions": $c.config.globalOptions,
+      "features": $c.config.features, "targetOS": $c.config.target.targetOS,
+      "targetCPU": $c.config.target.targetCPU, "backend": $c.config.backend,
+      "gc": $c.config.selectedGC, "exceptions": $c.config.exc}))
+
+  proc writeReusePlan(c: DepContext; members: seq[int]; packages: JsonNode): string =
+    if c.reuseStore.len == 0: return ""
+    var group = newJArray()
+    var sourcePaths = initHashSet[string]()
+    var memberIds = initHashSet[int]()
+    for m in members:
+      memberIds.incl m
+      let pair = c.nodes[m].files[0]
+      group.add %*{"source": pair.nimFile, "suffix": pair.modname}
+      for file in c.nodes[m].files: sourcePaths.incl file.nimFile
+    var sources: seq[string] = @[]
+    for path in sourcePaths: sources.add path
+    sources.sort()
+    var direct = initHashSet[int]()
+    for m in members:
+      for dep in c.nodes[m].deps:
+        if not c.nodes[dep].deferred and dep notin memberIds: direct.incl dep
+    var pending = members
+    var reachable = initHashSet[int]()
+    while pending.len > 0:
+      let id = pending.pop()
+      for dep in c.nodes[id].deps:
+        if not c.nodes[dep].deferred and dep notin memberIds and
+            not reachable.containsOrIncl(dep): pending.add dep
+    var ordered: seq[string] = @[]
+    for dep in reachable:
+      let pair = c.nodes[dep].files[0]
+      ordered.add $(%*{"source": pair.nimFile, "suffix": pair.modname, "direct": dep in direct})
+    ordered.sort()
+    var dependencies = newJArray()
+    var packagePaths = sources
+    packagePaths.add c.config.projectFull.string
+    for dep in ordered:
+      let record = parseJson(dep)
+      dependencies.add record
+      packagePaths.add record["source"].getStr
+    var packageContext = newJObject()
+    for path in packagePaths: packageContext[path] = packages[path]
+    var plan = %*{"store": c.reuseStore, "digests": c.reuseStore.parentDir / "ic-config-digests-v1", "compiler": c.reuseCompiler,
+      "compilerStamp": c.reuseCompilerStamp, "base": c.reuseBase, "project": c.nodes[members[0]].files[0].nimFile,
+      "entry": c.config.projectFull.string, "members": group,
+      "sources": sources, "dependencies": dependencies, "packages": packageContext}
+    plan["key"] = %fingerprintBytes($plan)
+    result = c.argsFile.parentDir / "reuse-plans" / (c.nodes[members[0]].files[0].modname & ".json")
+    createDir(result.parentDir)
+    let bytes = $plan & "\n"
+    if not fileExists(result) or readFile(result) != bytes: writeFile(result, bytes)
+
 proc generateFrontendBuildFile(c: DepContext; forwardedArgs: seq[string]): string =
   ## Frontend build file: the nifler (parse) and `nim m` (sem) rules only. The
   ## driver runs this to a discovery fixpoint; it produces every module's semmed
@@ -1245,8 +1328,10 @@ proc generateFrontendBuildFile(c: DepContext; forwardedArgs: seq[string]): strin
   b.addStrLit "--nimcache:" & nimcache
   for a in semanticArgs(c.config): b.addStrLit a
   # Add search paths
-  for p in c.config.searchPaths:
-    b.addStrLit "--path:" & p.string
+  # addPath inserts at the front and ignores duplicates. Replay in reverse
+  # order so children use the driver's resolved lookup precedence.
+  for i in countdown(c.config.searchPaths.high, 0):
+    b.addStrLit "--path:" & c.config.searchPaths[i].string
   for a in forwardedArgs:
     b.addStrLit a
   b.addTree "args"
@@ -1279,6 +1364,15 @@ proc generateFrontendBuildFile(c: DepContext; forwardedArgs: seq[string]): strin
         b.addStrLit c.parsedDepsFile(pair)
         b.endTree()
         b.endTree()
+
+  when defined(nimIcConfigReuse):
+    var packages: JsonNode = nil
+    if c.reuseStore.len > 0:
+      var paths = @[c.config.projectFull.string]
+      for node in c.nodes:
+        if not node.deferred:
+          for file in node.files: paths.add file.nimFile
+      packages = packageSnapshot(paths)
 
   # Build rules for semantic checking (nim m).
   #
@@ -1318,6 +1412,9 @@ proc generateFrontendBuildFile(c: DepContext; forwardedArgs: seq[string]): strin
     if isGroup:
       for m in members:
         b.addStrLit "--icGroup:" & c.nodes[m].files[0].nimFile
+    when defined(nimIcConfigReuse):
+      let reusePlan = writeReusePlan(c, members, packages)
+      if reusePlan.len > 0: b.addStrLit "--icReusePlan:" & reusePlan
     b.endTree()
     # Input 0 (the project file passed to `nim m`): the representative's .nim.
     b.withTree "input":
@@ -1326,6 +1423,9 @@ proc generateFrontendBuildFile(c: DepContext; forwardedArgs: seq[string]): strin
     b.addTree "input"
     b.addStrLit argsFile
     b.endTree()
+    when defined(nimIcConfigReuse):
+      if reusePlan.len > 0:
+        b.withTree "input": b.addStrLit reusePlan
     # All parsed files of every member (nifler outputs this group consumes).
     for m in members:
       for f in c.nodes[m].files:
@@ -1372,6 +1472,12 @@ proc generateFrontendBuildFile(c: DepContext; forwardedArgs: seq[string]): strin
         if sccOf[depIdx] == sccOf[m]: continue  # intra-component edge
         let depName = c.nodes[depIdx].files[0].modname
         directDeps.incl depName
+        when defined(nimIcConfigReuse):
+          if reusePlan.len > 0:
+            # Context IDs carry transitive semantic inputs, including bodies.
+            # Refresh a consumer's context whenever its producer changes.
+            b.withTree "input":
+              b.addStrLit semanticFile(c.config, depName, ".reuse-inputs.json").string
         let depFile =
           if not ifaceGate: c.semmedFile(c.nodes[depIdx].files[0])
           elif depName in needsImpl: c.implFile(depName)
@@ -1394,6 +1500,10 @@ proc generateFrontendBuildFile(c: DepContext; forwardedArgs: seq[string]): strin
         b.endTree()
     # Output: one semmed NIF (plus its cookie/edge sidecars) per member.
     for m in members:
+      when defined(nimIcConfigReuse):
+        if reusePlan.len > 0:
+          b.withTree "output":
+            b.addStrLit semanticFile(c.config, c.nodes[m].files[0].modname, ".reuse-inputs.json").string
       b.addTree "output"
       b.addStrLit c.semmedFile(c.nodes[m].files[0])
       b.endTree()
@@ -1626,8 +1736,10 @@ proc generateBackendBuildFile(c: DepContext; forwardedArgs: seq[string]): string
   b.addStrLit "nifc"
   b.addStrLit "--nimcache:" & nimcache
   for a in semanticArgs(c.config): b.addStrLit a
-  for p in c.config.searchPaths:
-    b.addStrLit "--path:" & p.string
+  # addPath inserts at the front and ignores duplicates. Replay in reverse
+  # order so children use the driver's resolved lookup precedence.
+  for i in countdown(c.config.searchPaths.high, 0):
+    b.addStrLit "--path:" & c.config.searchPaths[i].string
   for a in forwardedArgs:
     b.addStrLit a
   b.addTree "args"
@@ -2009,6 +2121,14 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false) =
     # Create nimcache directory; start from a clean one when its format
     # stamp is absent or outdated (see `icFormatVersion`)
     let cacheDir = getNimcacheDir(conf).string
+    when defined(nimIcConfigReuse):
+      # Serialize drivers built with this feature even when runtime reuse is
+      # off; that allows on/off builds to share the existing active cache.
+      when defined(posix):
+        let reuseLock = lockReuseCache(cacheDir)
+        defer: reuseLock.close()
+      elif isDefined(conf, "icConfigReuse"):
+        rawMessage(conf, hintSuccess, "IC config reuse: fallback (POSIX file locks unavailable)")
     createDir(cacheDir)
     let versionFile = cacheDir & "/ic.version"
     let stamp = if fileExists(versionFile): readFile(versionFile) else: ""
@@ -2027,7 +2147,28 @@ proc commandIc*(conf: ConfigRef; frontendOnly = false) =
       systemNodeId: -1
     )
 
+    when defined(nimIcConfigReuse):
+      if isDefined(conf, "icConfigReuse"):
+        # Freeze the already-resolved configuration, rather than letting a
+        # concurrent config producer replace what children will replay.
+        let (snapshot, temporary) = createTempFile("ic-reuse-config-", ".nif", cacheDir)
+        snapshot.close()
+        try:
+          writeIcConfig(conf, temporary)
+          let immutable = cacheDir / ("reuse-config-" & fingerprintFile(temporary) & ".nif")
+          if not fileExists(immutable): moveFile(temporary, immutable)
+          conf.icPreparsedConfig = immutable
+        finally:
+          if fileExists(temporary): removeFile(temporary)
     let forwardedArgs = computeForwardedArgs(c)
+    when defined(nimIcConfigReuse):
+      if defined(posix) and isDefined(conf, "icConfigReuse"):
+        c.reuseStore = cacheDir / "ic-config-variants-v1"
+        c.reuseCompilerStamp = compilerFileStamp(getAppFilename())
+        c.reuseCompiler = fingerprintFileCached(getAppFilename(), cacheDir / "ic-config-digests-v1") & ":" & icFormatVersion
+        if compilerFileStamp(getAppFilename()) != c.reuseCompilerStamp:
+          c.reuseStore = "" # executable changed while fingerprinting: compile normally
+        c.reuseBase = reuseBaseSignature(c, forwardedArgs)
     let signature = configSignature(c, forwardedArgs)
     # Like Nimony, share source scans and imported semantics, while keeping each
     # program's backend outputs separate. Only the driver knows the config key;

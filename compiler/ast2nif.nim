@@ -2141,7 +2141,7 @@ proc writeIfaceCookie(config: ConfigRef; thisModule: int32; flat: seq[CookieTok]
     s.update "|"
     s.update dep
     s.update ":"
-    when defined(nimIcConfigTrace):
+    when defined(nimIcConfigTrace) or defined(nimIcConfigReuse):
       var cookie = ""
       var present = false
       try:
@@ -2884,8 +2884,14 @@ proc moduleId(c: var DecodeContext; suffix: string; flags: set[LoadFlag] = {}): 
         ". This can happen when loading a module from NIF that references another module " &
         "whose NIF file hasn't been written yet."
     icProfStart(tBifLoad)
-    var m = icbif.load(modFile)
-    when defined(nimIcConfigTrace):
+    when defined(nimIcConfigReuse):
+      var inputHash = ""
+      let observe = conf.cmd == cmdM and conf.icReusePlan.len > 0 and not lowered
+      var m = icbif.load(modFile, if observe: addr inputHash else: nil, conf.icReuseDigests)
+      if observe: conf.icReuseLoads.add (suffix, inputHash)
+    else:
+      var m = icbif.load(modFile)
+    when defined(nimIcConfigTrace) or defined(nimIcConfigReuse):
       if conf.cmd == cmdM and not lowered:
         # Sample the companion cookies at the load site. These reads are not
         # atomic with the BIF load and cannot prove the cookies describe it.

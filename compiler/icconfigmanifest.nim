@@ -34,7 +34,7 @@ proc checkConfigObservations*(conf: ConfigRef; manifest: JsonNode): ConfigObserv
   ## All manifests currently emitted by the trace are incomplete and are
   ## rejected. This routine is intentionally not wired into cache selection.
   try:
-    if manifest.kind != JObject or manifest["version"].kind != JInt or
+    if manifest == nil or manifest.kind != JObject or manifest["version"].kind != JInt or
         manifest["complete"].kind != JBool or
         manifest["scope"].kind != JString or manifest["scope"].getStr != "process" or
         manifest["project"].kind != JString or manifest["group"].kind != JArray or

@@ -1,4 +1,4 @@
-when defined(nimIcConfigTrace):
+when defined(nimIcConfigTrace) or defined(nimIcConfigReuse):
   import std/[syncio, os]
 
 #
@@ -24,14 +24,15 @@ import std/[strutils, math, strtabs]
 when defined(nimPreviewSlimSystem):
   import std/[assertions]
 
-when defined(nimIcConfigTrace):
+when defined(nimIcConfigTrace) or defined(nimIcConfigReuse):
   proc traceFoldUntracked(g: ModuleGraph; n: PNode; reason: string;
                           context = "<unknown>") =
     let source = toFullPath(g.config, n.info.fileIndex)
     g.config.icConfigTraceEvents.add ("untracked", context, source, $n.info.line, reason, "")
-    stderr.writeLine("IC_CONFIG_UNTRACKED_V1\t", getCurrentProcessId(), "\t",
-      context.escape, "\t", source.escape, "\t", n.info.line, "\t",
-      reason.escape, "\t\"\"\t0")
+    when defined(nimIcConfigTrace):
+      stderr.writeLine("IC_CONFIG_UNTRACKED_V1\t", getCurrentProcessId(), "\t",
+        context.escape, "\t", source.escape, "\t", n.info.line, "\t",
+        reason.escape, "\t\"\"\t0")
 
 proc errorType*(g: ModuleGraph): PType =
   ## creates a type representing an error state
@@ -320,10 +321,10 @@ proc evalOp(m: TMagic, n, a, b, c: PNode; idgen: IdGenerator; g: ModuleGraph): P
     result = copyTree(a)
     result.typ = n.typ
   of mCompileOption:
-    when defined(nimIcConfigTrace): traceFoldUntracked(g, n, "compileOption")
+    when defined(nimIcConfigTrace) or defined(nimIcConfigReuse): traceFoldUntracked(g, n, "compileOption")
     result = newIntNodeT(toInt128(ord(commands.testCompileOption(g.config, a.getStr, n.info))), n, idgen, g)
   of mCompileOptionArg:
-    when defined(nimIcConfigTrace): traceFoldUntracked(g, n, "compileOptionArg")
+    when defined(nimIcConfigTrace) or defined(nimIcConfigReuse): traceFoldUntracked(g, n, "compileOptionArg")
     result = newIntNodeT(toInt128(ord(
       testCompileOptionArg(g.config, getStr(a), getStr(b), n.info))), n, idgen, g)
   of mEqProc:
@@ -537,15 +538,16 @@ proc foldDefine(m, s: PSym, n: PNode; idgen: IdGenerator; g: ModuleGraph): PNode
           if it[1].kind in {nkStrLit, nkRStrLit, nkTripleStrLit}:
             name = it[1].strVal
   let present = isDefined(g.config, name)
-  when defined(nimIcConfigTrace):
+  when defined(nimIcConfigTrace) or defined(nimIcConfigReuse):
     let value = if present: g.config.symbols[name].escape else: ""
     let context = toFullPath(g.config, m.info.fileIndex)
     let source = toFullPath(g.config, n.info.fileIndex)
     g.config.icConfigTraceEvents.add ("value", context, source, $n.info.line, name,
                                      $s.magic & "\t" & $present & "\t" & value)
-    stderr.writeLine("IC_CONFIG_VALUE_V2\t", getCurrentProcessId(), "\t",
-      context.escape, "\t", source.escape, "\t", n.info.line, "\t",
-      name.escape, "\t", $s.magic, "\t", $present, "\t", value)
+    when defined(nimIcConfigTrace):
+      stderr.writeLine("IC_CONFIG_VALUE_V2\t", getCurrentProcessId(), "\t",
+        context.escape, "\t", source.escape, "\t", n.info.line, "\t",
+        name.escape, "\t", $s.magic, "\t", $present, "\t", value)
   if present:
     let str = g.config.symbols[name]
     case s.magic
@@ -636,12 +638,12 @@ proc getConstExpr(m: PSym, n: PNode; idgen: IdGenerator; g: ModuleGraph): PNode 
                      else: sfMainModule in m.flags
         result = newIntNodeT(toInt128(ord(isMain)), n, idgen, g)
       of mCompileDate:
-        when defined(nimIcConfigTrace):
+        when defined(nimIcConfigTrace) or defined(nimIcConfigReuse):
           let context = if m == nil: "<unknown>" else: toFullPath(g.config, m.info.fileIndex)
           traceFoldUntracked(g, n, "compileDate", context)
         result = newStrNodeT(getDateStr(), n, g)
       of mCompileTime:
-        when defined(nimIcConfigTrace):
+        when defined(nimIcConfigTrace) or defined(nimIcConfigReuse):
           let context = if m == nil: "<unknown>" else: toFullPath(g.config, m.info.fileIndex)
           traceFoldUntracked(g, n, "compileTime", context)
         result = newStrNodeT(getClockStr(), n, g)

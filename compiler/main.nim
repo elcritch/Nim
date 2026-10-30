@@ -33,6 +33,9 @@ import icprof
 from icconfig import produceIcConfig, ensureIcConfig
 from ic/sharedcounters import releaseSharedCounters
 
+when defined(nimIcConfigReuse):
+  import icconfigreuse
+
 when defined(nimIcConfigTrace):
   import std/[algorithm, base64, intsets, sets]
   when not defined(nimPreviewSlimSystem): import std/syncio
@@ -575,7 +578,15 @@ proc mainCommand*(graph: ModuleGraph) =
         except OSError: discard
         try: removeFile(dependencyPath)
         except OSError: discard
-    timed tStage: commandCheck(graph)
+    when defined(nimIcConfigReuse):
+      let reuseAttempt = beginReuse(conf)
+      resetReuseInputs(conf, reuseAttempt)
+      if not restoreReuse(conf, reuseAttempt):
+        timed tStage: commandCheck(graph)
+        if conf.errorCounter == 0: publishReuse(conf, reuseAttempt)
+      if conf.errorCounter == 0: writeReuseInputs(conf, reuseAttempt)
+    else:
+      timed tStage: commandCheck(graph)
     when defined(nimIcConfigTrace):
       if tracePath.len > 0 and conf.errorCounter == 0:
         writeConfigTrace(conf, tracePath)

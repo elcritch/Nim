@@ -18,6 +18,7 @@ proc manifest(events: seq[JsonNode]; complete = true): JsonNode =
      "coverage": coverage, "ineligibleReasons": configIneligibilityReasons(coverage, observations)}
 
 let conf = newConfigRef()
+doAssert checkConfigObservations(conf, nil) == cocInvalid
 setTarget(conf.target, osLinux, cpuAmd64)
 conf.symbols["probeFlag"] = "true"
 conf.symbols["probeValue"] = "hello world"

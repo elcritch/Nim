@@ -36,6 +36,9 @@ from icmodnames import moduleSuffix
 import std/[algorithm, os, sets, osproc, times, streams, syncio, strutils]
 import "../dist/nimony/src/lib" / [nifbuilder, nifcoreparse]
 
+when defined(nimIcConfigReuse):
+  from icconfigreuse import lockReuseCache, fingerprintBytes
+
 const
   IcConfigVersion* = "4"
     ## Artifact format version. Bump on any layout change here so a child built
@@ -271,6 +274,9 @@ proc ensureIcConfig*(conf: ConfigRef) =
   # The spelling without `.nim` may not exist, or may name a compiled binary.
   conf.setFromProjectName(addFileExt(conf.projectFull, NimExt).string)
   let cacheDir = getNimcacheDir(conf).string
+  when defined(nimIcConfigReuse) and defined(posix):
+    let reuseLock = lockReuseCache(cacheDir)
+    defer: reuseLock.close()
   # Start from a clean cache when the on-disk NIF format stamp is absent or stale
   # (see `icFormatVersion`). This must happen HERE, before the config artifact is
   # produced — `commandIc` performs the same check later, but by then the artifact
@@ -286,7 +292,12 @@ proc ensureIcConfig*(conf: ConfigRef) =
   # project-specific .cfg files. Keep their snapshots separate; the build
   # signature still compares effective settings so equivalent configs can
   # share compiled modules.
-  let outPath = cacheDir / ("ic_config_" & moduleSuffix(conf.projectFull.string, []) & ".cfg.nif")
+  var snapshotKey = moduleSuffix(conf.projectFull.string, [])
+  when defined(nimIcConfigReuse):
+    # Config files can branch on command-line defines. A source-mtime-only
+    # snapshot can otherwise silently replay the previous configuration.
+    snapshotKey.add "_" & fingerprintBytes(commandLineParams().join("\0"))
+  let outPath = cacheDir / ("ic_config_" & snapshotKey & ".cfg.nif")
   if not fileExists(outPath) or sourcesChanged(outPath):
     createDir(cacheDir)
     # Re-invoke ourselves as the config producer: reuse this process's command

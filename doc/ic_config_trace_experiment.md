@@ -1,5 +1,10 @@
 # Experimental module config trace
 
+The separate [restricted reuse implementation](ic_config_reuse.md) adds an
+opt-in cache gate under `nimIcConfigReuse`. It does not accept these incomplete
+diagnostic traces as reuse evidence. This document describes the diagnostic
+contract and the earlier experiments.
+
 The separate [local FigDraw dependency analysis](ic_config_figdraw_local_analysis.md)
 covers the `../figdraw` checkout and includes an import-graph-changing define.
 
@@ -105,9 +110,9 @@ This checker does not discover inputs or produce trusted bundle manifests. A cal
 must establish what the compiler and base keys cover, independently discover
 current sources and imports, prove configuration and dependency coverage, and
 ensure the recorded hashes describe the files actually consumed. Hashing and
-then later reading a mutable file is not atomic. There is no trusted immutable
-variant store or integration with nifmake; therefore even a `bcMatch` is not
-an authorization to reuse a bundle. No production trace currently supplies the
+then later reading a mutable file is not atomic. This diagnostic checker has no integration with the restricted variant
+store or nifmake; therefore even a `bcMatch` is not an authorization to reuse
+a bundle. No production trace currently supplies the
 required complete evidence.
 
 ### Diagnostic bundle publication

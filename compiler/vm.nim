@@ -28,7 +28,7 @@ from magicsys import getSysType, getSysSym, sysTypeFromName
 from astalgo import lookupInRecord
 from liftdestructors import isTrivial
 
-when defined(nimIcConfigTrace):
+when defined(nimIcConfigTrace) or defined(nimIcConfigReuse):
   import std/syncio
   from std/os import getCurrentProcessId, getAppFilename
 
@@ -40,9 +40,10 @@ when defined(nimIcConfigTrace):
     let callsiteLine = if c.callsite == nil: 0 else: int(c.callsite.info.line)
     c.config.icConfigTraceEvents.add ("untracked", context, source, $info.line,
                                       reason, callsite & "\t" & $callsiteLine)
-    stderr.writeLine("IC_CONFIG_UNTRACKED_V1\t", getCurrentProcessId(), "\t",
-      context.escape, "\t", source.escape, "\t",
-      info.line, "\t", reason.escape, "\t", callsite.escape, "\t", callsiteLine)
+    when defined(nimIcConfigTrace):
+      stderr.writeLine("IC_CONFIG_UNTRACKED_V1\t", getCurrentProcessId(), "\t",
+        context.escape, "\t", source.escape, "\t",
+        info.line, "\t", reason.escape, "\t", callsite.escape, "\t", callsiteLine)
 
 const
   traceCode = defined(nimVMDebug)
@@ -717,6 +718,8 @@ proc newFrame(c: PCtx; prc: PSym; slots: int; comesFrom: int; next: PStackFrame)
 proc rawExecute(c: PCtx, start: int, tos: PStackFrame): Address =
   ## executes the code at `start`; returns the address of the result value
   ## (in register format), which is valid until the stack is popped.
+  when defined(nimIcConfigReuse):
+    if c.config.cmd == cmdM and c.callsite != nil: c.config.icReuseUnsupportedVm = true
   result = 0
   var pc = start
   var tos = tos
@@ -801,6 +804,11 @@ proc rawExecute(c: PCtx, start: int, tos: PStackFrame): Address =
   while true:
     let instr = c.code[pc]
     let ra = instr.regA
+    when defined(nimIcConfigReuse):
+      # Typed constant arithmetic is supported; AST reflection, node identities
+      # and macro-cache operations do not yet have a reuse contract.
+      if instr.opcode in {opcNLen..opcCallSite, opcRepr}:
+        c.config.icReuseUnsupportedVm = true
 
     when traceCode:
       echo "PC:$pc $opcode $ra $rb $rc" % [
@@ -1480,6 +1488,7 @@ proc rawExecute(c: PCtx, start: int, tos: PStackFrame): Address =
       let v = regToNode(c, rAdr(instr.regB), t, c.debug[pc])
       putStr(ra, renderTree(v, {renderNoComments, renderDocComments, renderNonExportedFields}))
     of opcQuit:
+      when defined(nimIcConfigReuse): c.config.icReuseUnsupportedVm = true
       if c.mode in {emRepl, emStaticExpr, emStaticStmt}:
         message(c.config, c.debug[pc], hintQuitCalled)
         msgQuit(int8(rInt(ra)))
@@ -1501,6 +1510,9 @@ proc rawExecute(c: PCtx, start: int, tos: PStackFrame): Address =
         else: stackTrace(c, tos, pc, "attempt to call an invalid proc address")
       if prc.offset < -1:
         # it's a callback:
+        when defined(nimIcConfigReuse):
+          c.config.icReuseUnsupportedVm = true
+          c.config.icReuseExternalInputs = true
         var shape = callShapeOf(c, prc)
         try:
           c.callbacks[-prc.offset-2](
@@ -1545,6 +1557,9 @@ proc rawExecute(c: PCtx, start: int, tos: PStackFrame): Address =
         pushCall(prc, slotAddr(rb + 2 + info.resultSlots), slotAddr(rb + 2),
                  rInt(rb+1))
     of opcFfiCall:
+      when defined(nimIcConfigReuse):
+        c.config.icReuseUnsupportedVm = true
+        c.config.icReuseExternalInputs = true
       when hasFFI:
         let site = int(wImm())
         let area = slotAddr(instr.regB)
@@ -1552,6 +1567,7 @@ proc rawExecute(c: PCtx, start: int, tos: PStackFrame): Address =
       else:
         globalError(c.config, c.debug[pc], "VM is not allowed to 'importc' without --experimental:compiletimeFFI")
     of opcEcho:
+      when defined(nimIcConfigReuse): c.config.icReuseUnsupportedVm = true
       let count = int(instr.regB)
       var outp = ""
       for i in 0..<count:
@@ -1794,6 +1810,7 @@ proc rawExecute(c: PCtx, start: int, tos: PStackFrame): Address =
       n.flags.incl nfIsRef
       setNode(ra, n)
     of opcNDynBindSym:
+      when defined(nimIcConfigReuse): c.config.icReuseUnsupportedVm = true
       var shape = c.callShapes[int(wImm())]
       c.callbacks[shape.callbackIdx](
         VmArgs(ctxp: cast[pointer](c), args: slotAddr(instr.regB),
@@ -1972,7 +1989,7 @@ proc rawExecute(c: PCtx, start: int, tos: PStackFrame): Address =
         else:
           putStr(ra, $sigHash(shSym, c.config))
     of opcSlurp:
-      when defined(nimIcConfigTrace):
+      when defined(nimIcConfigTrace) or defined(nimIcConfigReuse):
         traceConfigUntracked(c, c.debug[pc], "staticRead")
       putStr(ra, opSlurp(str(instr.regB), c.debug[pc], c.module, c.config))
     of opcGorge:
@@ -1982,13 +1999,14 @@ proc rawExecute(c: PCtx, start: int, tos: PStackFrame): Address =
         putStr(ra, "")
       else:
         when defined(nimcore):
-          when defined(nimIcConfigTrace):
+          when defined(nimIcConfigTrace) or defined(nimIcConfigReuse):
             traceConfigUntracked(c, c.debug[pc], "staticExec")
           putStr(ra, opGorge(str(rb), str(rb+1), str(rb+2), c.debug[pc], c.config)[0])
         else:
           putStr(ra, "")
           globalError(c.config, c.debug[pc], "VM is not built with 'gorge' support")
     of opcNError, opcNWarning, opcNHint:
+      when defined(nimIcConfigReuse): c.config.icReuseUnsupportedVm = true
       let msg = str(ra)
       let b = node(instr.regB)
       let info = if b == nil or b.kind == nkNilLit: c.debug[pc] else: b.info

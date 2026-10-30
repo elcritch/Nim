@@ -17,6 +17,9 @@ import std/strutils
 when defined(nimPreviewSlimSystem):
   import std/[syncio, assertions]
 
+when defined(nimIcConfigReuse):
+  import ../dist/checksums/src/checksums/sha2
+
 export Parser, parseAll, parseTopLevelStmt, checkFirstLineIndentation, closeParser
 
 type
@@ -43,7 +46,15 @@ proc containsShebang(s: string, i: int): bool =
 proc parsePipe(filename: AbsoluteFile, inputStream: PLLStream; cache: IdentCache;
                config: ConfigRef): PNode =
   result = newNode(nkEmpty)
-  var s = llStreamOpen(filename, fmRead)
+  var s: PLLStream = nil
+  when defined(nimIcConfigReuse):
+    if config.cmd == cmdM and config.icReusePlan.len > 0 and inputStream.kind == llsString:
+      # The filter directive must come from the same captured source bytes too.
+      s = llStreamOpen(inputStream.s)
+    else:
+      s = llStreamOpen(filename, fmRead)
+  else:
+    s = llStreamOpen(filename, fmRead)
   if s != nil:
     var line = newStringOfCap(80)
     discard llStreamReadLine(s, line)
@@ -120,6 +131,17 @@ proc openParser*(p: var Parser, fileIdx: FileIndex, inputstream: PLLStream;
                   cache: IdentCache; config: ConfigRef) =
   assert config != nil
   let filename = toFullPathConsiderDirty(config, fileIdx)
+  var inputstream = inputstream
+  when defined(nimIcConfigReuse):
+    if config.cmd == cmdM and config.icReusePlan.len > 0:
+      # Parse and fingerprint the very same bytes. Includes use this entry too.
+      if inputstream.kind == llsStdIn:
+        config.icReuseUnsupportedVm = true
+      else:
+        let bytes = llStreamReadAll(inputstream)
+        llStreamClose(inputstream)
+        config.icReuseSources.add (filename.string, $Sha_256.secureHash(bytes))
+        inputstream = llStreamOpen(bytes)
   var pipe = parsePipe(filename, inputstream, cache, config)
   p.lex.config = config
   let s = if pipe != nil: evalPipe(p, pipe, filename, inputstream)

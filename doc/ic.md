@@ -624,3 +624,10 @@ change for that, and they are worth knowing because they are the shape of every
   first), and it is not a linker name — every ``salute`` member in every class
   mints the same one, so definitions are keyed by their NIF name in the merge
   stage instead.
+
+## Experimental configuration-aware reuse
+
+See [configuration-aware semantic reuse](ic_config_reuse.md) for the opt-in
+`nimIcConfigReuse` compiler build and `-d:icConfigReuse` project flag. Eligible
+semantic groups can be reused across unrelated define changes; unsupported
+compile-time observations retain full-configuration compilation.

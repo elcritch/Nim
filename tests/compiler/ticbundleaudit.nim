@@ -52,6 +52,14 @@ try:
   writeFile(manifestPath, manifestBytes)
   writeFile(first / "READY", fingerprintFile(manifestPath) & "\n")
   doAssert readAuditBundle(first) != nil
+  for field in ["members", "sources", "artifacts"]:
+    var invalid = parseJson(manifestBytes)
+    invalid[field] = %*[42]
+    writeFile(manifestPath, $invalid & "\n")
+    writeFile(first / "READY", fingerprintFile(manifestPath) & "\n")
+    doAssert readAuditBundle(first) == nil
+  writeFile(manifestPath, manifestBytes)
+  writeFile(first / "READY", fingerprintFile(manifestPath) & "\n")
   removeFile(first / "READY")
   doAssert readAuditBundle(first) == nil
   # A failed publication and an interrupted directory must not become readable.

@@ -107,6 +107,7 @@ proc readAuditBundle*(dir: string): JsonNode =
     var members = initHashSet[string]()
     var memberSuffixes = initTable[string, string]()
     for member in document["members"]:
+      if member.kind != JObject: return nil
       let source = member["source"].getStr
       let suffix = member["suffix"].getStr
       if not source.isAbsolute or suffix.len == 0 or '/' in suffix or '\\' in suffix or
@@ -114,6 +115,7 @@ proc readAuditBundle*(dir: string): JsonNode =
       memberSuffixes[source] = suffix
     var sources = initHashSet[string]()
     for source in document["sources"]:
+      if source.kind != JObject: return nil
       let path = source["path"].getStr
       if not path.isAbsolute or not isDigest(source["sha256"].getStr) or
           sources.containsOrIncl(path): return nil
@@ -122,6 +124,7 @@ proc readAuditBundle*(dir: string): JsonNode =
     var files = initHashSet[string]()
     var roles = initHashSet[(string, string)]()
     for artifact in document["artifacts"]:
+      if artifact.kind != JObject: return nil
       let source = artifact["member"].getStr
       let suffix = artifact["suffix"].getStr
       let name = artifact["name"].getStr

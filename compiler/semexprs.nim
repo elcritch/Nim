@@ -1,4 +1,4 @@
-when defined(nimIcConfigTrace):
+when defined(nimIcConfigTrace) or defined(nimIcConfigReuse):
   import std/[syncio, os]
 
 #
@@ -2362,14 +2362,15 @@ proc semDefined(c: PContext, n: PNode): PNode =
   result = newIntNode(nkIntLit, 0)
   let defineName = considerQuotedIdentOrDot(c, n[1], n).s
   result.intVal = ord isDefined(c.config, defineName)
-  when defined(nimIcConfigTrace):
+  when defined(nimIcConfigTrace) or defined(nimIcConfigReuse):
     let context = toFullPath(c.config, c.module.info.fileIndex)
     let source = toFullPath(c.config, n.info.fileIndex)
     c.config.icConfigTraceEvents.add ("defined", context, source, $n.info.line,
                                      defineName, $result.intVal)
-    stderr.writeLine("IC_CONFIG_DEFINED_V2\t", getCurrentProcessId(), "\t",
-      context.escape, "\t", source.escape, "\t", n.info.line, "\t",
-      defineName.escape, "\t", $result.intVal)
+    when defined(nimIcConfigTrace):
+      stderr.writeLine("IC_CONFIG_DEFINED_V2\t", getCurrentProcessId(), "\t",
+        context.escape, "\t", source.escape, "\t", n.info.line, "\t",
+        defineName.escape, "\t", $result.intVal)
   result.info = n.info
   result.typ = getSysType(c.graph, n.info, tyBool)
 
@@ -2621,6 +2622,8 @@ proc tryExpr(c: PContext, n: PNode, flags: TExprFlags = {}): PNode =
     c.graph.config.structuredErrorHook = tempHook
 
 proc semCompiles(c: PContext, n: PNode, flags: TExprFlags): PNode =
+  when defined(nimIcConfigReuse):
+    c.config.icConfigTraceEvents.add ("untracked", "<compiler>", "", "0", "compiles", "")
   # we replace this node by a 'true' or 'false' node:
   if n.len != 2: return semDirectOp(c, n, flags)
 
