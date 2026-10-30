@@ -277,6 +277,8 @@ type
                          # alone deduped the second to a dangling `SymUse` (`symbol has no offset`).
     emittedBackendSyms: HashSet[int32]   # backend-local sym items already def'd this module
     lowering: bool  # serializing the `lower` stage's whole-module `.t.nif`
+    when defined(icSignatureOnly):
+      omitRoutineAst: PNode
     emittedFieldSyms: HashSet[ItemId]    # lowering: derived env-field syms already def'd
     inTypeReclist: int   # >0 while writing a type's OWN reclist: fields must be SELF-CONTAINED
                          # defs (the type can be seek-loaded in isolation), not entry-deduped uses
@@ -1089,6 +1091,50 @@ proc docOfSym(sym: PSym): string =
       return nodeCommentReader(body[0])
   return ""
 
+when defined(icSignatureOnly):
+  proc isSimpleRuntimeBody(n: PNode): bool =
+    ## Start with straight-line bodies that cannot contain nested routines,
+    ## calls, templates, or cross-module references.
+    if n == nil: return false
+    if nfLazyBody in n.flags and forceLazyBodyHook != nil:
+      forceLazyBodyHook(n)
+    case n.kind
+    of nkSym:
+      return n.sym != nil and n.sym.kindImpl in {skParam, skResult}
+    of nkLiterals, nkNilLit, nkEmpty:
+      return true
+    of nkCall, nkCommand, nkInfix, nkPrefix, nkPostfix, nkHiddenCallConv:
+      if n.len == 0 or n[0].kind != nkSym or n[0].sym == nil or
+          n[0].sym.magicImpl notin {mAddI, mSubI, mMulI, mDivI, mModI,
+            mAddU, mSubU, mMulU, mDivU, mModU, mAddF64, mSubF64, mMulF64,
+            mDivF64, mEqI, mLeI, mLtI, mEqF64, mLeF64, mLtF64, mLeU, mLtU,
+            mUnaryMinusI, mUnaryMinusI64, mUnaryPlusI, mUnaryPlusF64,
+            mUnaryMinusF64, mNot, mBitnotI, mShrI, mShlI, mAshrI, mBitandI,
+            mBitorI, mBitxorI}:
+        return false
+      for i in 1 ..< n.len:
+        if not isSimpleRuntimeBody(n[i]): return false
+      return true
+    of nkStmtList, nkReturnStmt, nkAsgn, nkFastAsgn, nkHiddenStdConv,
+       nkHiddenSubConv, nkConv:
+      for child in n:
+        if not isSimpleRuntimeBody(child): return false
+      return true
+    else:
+      return false
+
+  proc omitLoweredBody(w: Writer; sym: PSym): bool =
+    if not w.lowering or sym.kindImpl != skProc or sym.typImpl == nil or
+       sym.typImpl.callConvImpl != ccNimCall or sym.itemId.module != w.currentModule or
+       sym.itemId.isBackendMinted or sym.transformedBodyImpl == nil or
+       {sfFromGeneric, sfCompileTime, sfCompilerProc, sfExportc,
+        sfImportc, sfForward, sfBorrow} * sym.flagsImpl != {}:
+      return false
+    let a = sym.astImpl
+    result = a != nil and a.safeLen > bodyPos and a.safeLen > genericParamsPos and
+             a[genericParamsPos].kind == nkEmpty and a[bodyPos] != nil and
+             a[bodyPos].kind != nkEmpty and isSimpleRuntimeBody(a[bodyPos])
+
 proc writeSymDef(w: var Writer; dest: var IcBuilder; sym: PSym) =
   # A non-field sym reached from inside a reclist (e.g. a field type's `sym`, a
   # type alias whose owner routine body uses the very fields being written) is
@@ -1152,7 +1198,14 @@ proc writeSymDef(w: var Writer; dest: var IcBuilder; sym: PSym) =
   writeSym(w, dest, sym.ownerFieldImpl)
   # Store the AST for routine symbols and constants
   # Constants need their AST for astdef() to return the constant's value
-  writeNode(w, dest, sym.astImpl, forAst = true)
+  when defined(icSignatureOnly):
+    let omitBody = omitLoweredBody(w, sym)
+    let savedOmit = w.omitRoutineAst
+    w.omitRoutineAst = if omitBody: sym.astImpl else: nil
+    writeNode(w, dest, sym.astImpl, forAst = true)
+    w.omitRoutineAst = savedOmit
+  else:
+    writeNode(w, dest, sym.astImpl, forAst = true)
   writeLoc w, dest, sym.locImpl
   writeNode(w, dest, sym.constraintImpl)
   writeSym(w, dest, sym.instantiatedFromImpl)
@@ -1166,7 +1219,19 @@ proc writeSymDef(w: var Writer; dest: var IcBuilder; sym: PSym) =
   # exists in the routine branch of the `TSym` variant.)
   if sym.kindImpl in routineKinds:
     let tb = sym.transformedBodyImpl
-    if tb != nil and tb.kind notin {nkStmtList, nkEmpty}:
+    when defined(icSignatureOnly):
+      if omitBody:
+        dest.openTag "icsigbody"
+        dest.closeTag()
+      elif tb != nil and tb.kind notin {nkStmtList, nkEmpty}:
+        dest.addParLe pool.tags.getOrIncl(toNifTag(nkStmtList)), NoLineInfo
+        dest.addDotToken
+        dest.addDotToken
+        writeNode(w, dest, tb)
+        dest.addParRi
+      else:
+        writeNode(w, dest, tb)
+    elif tb != nil and tb.kind notin {nkStmtList, nkEmpty}:
       # Always an `nkStmtList` on the wire, so the READER can defer it: the
       # `nfLazyBody` placeholder has to be a kind whose arity a childless node
       # can honour, and `nkStmtList` is the one that is (see `loadNode`'s
@@ -1634,6 +1699,11 @@ proc writeNode(w: var Writer; dest: var IcBuilder; n: PNode; forAst = false) =
             skipParams = n[namePos].sym.typImpl != nil
         w.withNode dest, ast:
           for i in 0 ..< ast.len:
+            when defined(icSignatureOnly):
+              if i == bodyPos and ast == w.omitRoutineAst:
+                dest.addParLe pool.tags.getOrIncl(toNifTag(nkEmpty)), NoLineInfo
+                dest.addParRi
+                continue
             if i == paramsPos and skipParams:
               # The dropped params still hold the source positions and the WRITTEN
               # type names (before alias/type resolution); tee them into the `deps`
@@ -3301,6 +3371,26 @@ proc loadAnnex(c: var DecodeContext; n: var Cursor; thisModule: string; localSym
   else:
     raiseAssert "`lib/annex` information expected"
 
+when defined(icSignatureOnly):
+  proc restoreSemanticAst(c: var DecodeContext; s: PSym; thisModule: string;
+                          localSyms: var Table[string, PSym]): PNode =
+    ## The lowered BIF omitted this simple body's AST. Restore it from the
+    ## module's semchecked BIF so codegen can re-lower when required.
+    let module = s.itemId.module.FileIndex
+    ensureSemBuf(c, module)
+    let m = c.mods[module]
+    let e = m.semIndexEntry(globalName(s, c.infos.config))
+    if e.offset == 0: raiseAssert "missing semantic body for " & s.name.s
+    var n = cursorAt(m.semBuf, e.offset)
+    var scan = n
+    extractLocalSymsFromTree(c, scan, thisModule, localSyms)
+    n.into:
+      # symbol, visibility, kind, magic, flags, options, offset, position,
+      # annex, type, owner; the next field is the routine AST.
+      for _ in 0 ..< 11: skip n
+      result = loadNode(c, n, thisModule, localSyms)
+      while n.hasMore: skip n
+
 proc loadSymFromCursor(c: var DecodeContext; s: PSym; n: var Cursor; thisModule: string;
                        localSyms: var Table[string, PSym]) =
   ## Loads a symbol definition. The cursor must be positioned AT the opening
@@ -3387,6 +3477,13 @@ proc loadSymFromCursor(c: var DecodeContext; s: PSym; n: var Cursor; thisModule:
       (conf.icBackendStage == "cg" or conf.icBackendStage == "emit" or
        (conf.icBackendStage == "lower" and icReuseSemLowering(conf)))
     if loadSlot:
+      when defined(icSignatureOnly):
+        if n.kind == TagLit and tagIs(n, "icsigbody"):
+          skip n
+          s.astImpl = restoreSemanticAst(c, s, thisModule, localSyms)
+          s.transformedBodyImpl = nil
+          s.nifBodyLoadedImpl = false
+          return
       if n.kind == TagLit and n.nodeKind == nkStmtList:
         # DEFERRED, exactly like a routine def's `bodyPos` son: a childless
         # `nkStmtList` placeholder that `len` fills in from this cursor. Loaded
