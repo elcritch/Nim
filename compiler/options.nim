@@ -461,6 +461,10 @@ type
       # Process-wide diagnostic observations. These are deliberately incomplete
       # and must never be used to decide whether an artifact can be reused.
       icConfigTraceEvents*: seq[tuple[kind, context, source, line, key, value: string]]
+      # Diagnostic snapshots only. Cookie samples are not atomic with BIF loads.
+      icDepTraceLoads*: seq[tuple[suffix, iface, impl: string,
+                                  ifacePresent, implPresent: bool]]
+      icDepTraceIfaceReads*: seq[tuple[owner, suffix, cookie: string, present: bool]]
     icParsedDir*: AbsoluteDir # shared source/dependency scans, selected by the IC driver
     icSemDir*: AbsoluteDir    # imported-module semantics for the effective configuration
     icMainSemDir*: AbsoluteDir # semantics for this entry point's import-cycle group

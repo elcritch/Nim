@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run with a compiler built with -d:nimIcConfigTrace as the sole argument."""
 import ast
+import base64
 import json
 import pathlib
 import subprocess
@@ -140,13 +141,15 @@ static:
                for r in (line.split("\t") for line in p.stderr.splitlines()))
 
     (root / "trackdep.nim").write_text('''const icTrackedValue {.intdefine.} = 4
+func snapshotValue*(): int = 11
 when defined(icTrackedFlag):
   type Data* = array[icTrackedValue, int]
 else:
   type Data* = array[1, int]
 ''')
     trackmain = root / "trackmain.nim"
-    trackmain.write_text("import trackdep\nvar value: Data\ndiscard value.len\n")
+    trackmain.write_text("import trackdep\nconst computed = snapshotValue()\n"
+                         "var value: Data\ndiscard value.len + computed\n")
     def track(cache, value=5):
         return subprocess.run([str(nim), "track", "--hints:off", "--skipUserCfg",
                                "--skipParentCfg", "--nimcache:" + str(cache),
@@ -176,12 +179,102 @@ else:
                e["key"] == "icNoIfaceGate" for e in first["observations"])
     assert any(e["kind"] == "value" and e["key"] == "icTrackedValue" and '"5"' in e["value"]
                for e in first["observations"])
+
+    def dependency_snapshot(cache, project):
+        docs = [json.loads(path.read_text()) for path in cache.rglob("*.deptrace.json")]
+        return next(doc for doc in docs if doc["project"] == str(project))
+
+    snapshot = dependency_snapshot(root / "trackcache", trackmain)
+    assert snapshot["version"] == 1 and snapshot["scope"] == "process"
+    assert not snapshot["complete"] and str(trackmain) in snapshot["group"]
+    source = str(root / "trackdep.nim")
+    dep = next(item for item in snapshot["imports"]
+               if item["owner"] == str(trackmain) and item["source"] == source)
+    suffix = dep["suffix"]
+    assert any(item["suffix"] == suffix for item in snapshot["needsImpl"])
+    loaded = next(item for item in snapshot["loads"] if item["suffix"] == suffix)
+    assert loaded["ifacePresent"] and loaded["implPresent"]
+    sem = next((root / "trackcache").rglob(suffix + ".iface.bif")).parent
+    assert base64.b64decode(loaded["ifaceBase64"]) == (sem / (suffix + ".iface.bif")).read_bytes()
+    assert base64.b64decode(loaded["implBase64"]) == (sem / (suffix + ".impl.bif")).read_bytes()
+    assert any(item["suffix"] == suffix and item["present"] and
+               base64.b64decode(item["cookieBase64"]) == (sem / (suffix + ".iface.bif")).read_bytes()
+               for item in snapshot["ifaceReads"])
     track(root / "trackcache2")
     assert first == manifest(root / "trackcache2")
+    assert snapshot == dependency_snapshot(root / "trackcache2", trackmain)
     changed = track(root / "trackcache", value=6)
     assert '"icTrackedValue"\tmIntDefine\ttrue\t"6"' in changed.stdout + changed.stderr
     manifests = [json.loads(path.read_text()) for path in (root / "trackcache").rglob("*.configtrace.json")]
     variants = [doc for doc in manifests if doc["project"] == str(root / "trackdep.nim")]
     assert len(variants) == 2 and all(not doc["complete"] for doc in variants)
+
+    icmain = root / "icmain.nim"
+    icmain.write_text('import trackdep\necho snapshotValue()\n')
+    iccache = root / "iccache"
+    executable = root / ("icmain.exe" if sys.platform == "win32" else "icmain")
+    subprocess.run([str(nim), "ic", "--hints:off", "--skipUserCfg", "--skipParentCfg",
+                    "--nimcache:" + str(iccache), "--out:" + str(executable),
+                    "-d:icJobs=1", str(icmain)], text=True, capture_output=True, check=True)
+    assert subprocess.check_output([str(executable)], text=True).strip() == "11"
+    assert not dependency_snapshot(iccache, icmain)["complete"]
+
+    # A body-only edit changes the implementation cookie and is visible at
+    # the consumer's BIF load even if the interface cookie stays unchanged.
+    dep_path = root / "trackdep.nim"
+    dep_path.write_text(dep_path.read_text().replace("int = 11", "int = 12"))
+    track(root / "trackcache3")
+    edited = dependency_snapshot(root / "trackcache3", trackmain)
+    edited_load = next(item for item in edited["loads"] if item["suffix"] == suffix)
+    assert edited_load["ifaceBase64"] == loaded["ifaceBase64"]
+    assert edited_load["implBase64"] != loaded["implBase64"]
+
+    # A template reached through a re-export can consume a body from a module
+    # that is not a direct import of the consumer.
+    relay = root / "relay.nim"
+    relay.write_text('import trackdep\nexport trackdep\n'
+                     'template relayValue*(): untyped = snapshotValue()\n')
+    transitivemain = root / "transitivemain.nim"
+    transitivemain.write_text('import relay\nconst result = relayValue()\ndiscard result\n')
+    transitivecache = root / "transitivecache"
+    subprocess.run([str(nim), "track", "--hints:off", "--skipUserCfg", "--skipParentCfg",
+                    "--nimcache:" + str(transitivecache), "-d:icJobs=1",
+                    str(transitivemain)], text=True, capture_output=True, check=True)
+    transitive = dependency_snapshot(transitivecache, transitivemain)
+    assert any(item["owner"] == str(transitivemain) and item["source"] == str(relay)
+               for item in transitive["imports"])
+    assert not any(item["owner"] == str(transitivemain) and item["source"] == str(dep_path)
+                   for item in transitive["imports"])
+    assert any(item["suffix"] == suffix for item in transitive["needsImpl"])
+    assert any(item["suffix"] == suffix and item["implPresent"]
+               for item in transitive["loads"])
+
+    cyclemain = root / "cyclemain.nim"
+    cycleb = root / "cycleb.nim"
+    cyclemain.write_text('import cycleb {.cyclic.}\nproc fa*(): int = 1\ndiscard fb()\n')
+    cycleb.write_text('import cyclemain {.cyclic.}\nproc fb*(): int = fa() + 10\n')
+    cyclecache = root / "cyclecache"
+    subprocess.run([str(nim), "track", "--hints:off", "--skipUserCfg", "--skipParentCfg",
+                    "--nimcache:" + str(cyclecache), "-d:icJobs=1", str(cyclemain)],
+                   text=True, capture_output=True, check=True)
+    cycle = dependency_snapshot(cyclecache, cyclemain)
+    assert set(cycle["group"]) == {str(cyclemain), str(cycleb)}
+    assert not cycle["complete"]
+    assert any(item["owner"] == str(cyclemain) and item["source"] == str(cycleb)
+               for item in cycle["imports"])
+    assert any(item["owner"] == str(cycleb) and item["source"] == str(cyclemain)
+               for item in cycle["imports"])
+
+    # A child which starts but fails sem must not leave its old snapshot as if
+    # it belonged to that failed compilation.
+    dep_snapshot_path = next(path for path in (root / "trackcache3").rglob("*.deptrace.json")
+                             if json.loads(path.read_text())["project"] == str(dep_path))
+    dep_path.write_text(dep_path.read_text() + "\nstatic: doAssert false\n")
+    failed = subprocess.run([str(nim), "track", "--hints:off", "--skipUserCfg",
+                             "--skipParentCfg", "--nimcache:" + str(root / "trackcache3"),
+                             "-d:icJobs=1", "-d:icTrackedFlag", "-d:icTrackedValue=5",
+                             str(trackmain)], text=True, capture_output=True)
+    assert failed.returncode != 0
+    assert not dep_snapshot_path.exists()
 
 print("config trace probe passed")

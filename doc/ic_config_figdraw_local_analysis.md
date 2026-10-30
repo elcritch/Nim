@@ -94,6 +94,27 @@ the changed setting. The actual `fontutils` trace was rejected as incomplete.
 The probe supplied its dependency-validation status and observation manually;
 it does not prove that the production driver can validate or reuse either unit.
 
+## Dependency snapshot probe
+
+The diagnostic dependency snapshot was exercised on this checkout with fresh
+`nim track` baseline and `ShadowCount=5` configurations in the isolated
+`/tmp/figdraw-depsnap/cache`. Each run produced 221 process snapshots, all
+incomplete, with 14,397 distinct per-process BIF-load samples and 961 recorded
+interface-cookie reads in aggregate. These are process observations, not counts
+of unique modules or independent dependency edges. In the baseline, every
+recorded non-group `NeedsImpl` entry had a matching sampled BIF load; that is
+an observation for this run, not a general coverage guarantee. For both configurations,
+`figbackend` and `figrender` recorded `fignodes` as an import and sampled its
+interface and implementation cookies; both sampled cookies changed between the
+two runs. The process-level `NeedsImpl` set for `figrender` contained
+`fignodes` in the baseline and omitted it with `ShadowCount=5`, consistent
+with the earlier sidecar comparison. The drawing test was not run.
+
+The samples are useful for examining the compilation, but they are not atomic
+with BIF loads and do not establish complete dependency attribution or safe
+cross-configuration reuse. See the trace experiment notes for the schema and
+limitations.
+
 ## Trace limitations
 
 The baseline emitted 221 process manifests, all marked incomplete. They include

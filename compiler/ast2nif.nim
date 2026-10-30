@@ -2141,7 +2141,18 @@ proc writeIfaceCookie(config: ConfigRef; thisModule: int32; flat: seq[CookieTok]
     s.update "|"
     s.update dep
     s.update ":"
-    s.update(try: readFile(depIface) except IOError, OSError: "")
+    when defined(nimIcConfigTrace):
+      var cookie = ""
+      var present = false
+      try:
+        cookie = readFile(depIface)
+        present = true
+      except IOError, OSError: discard
+      if config.cmd == cmdM:
+        config.icDepTraceIfaceReads.add (selfSuffix, dep, cookie, present)
+      s.update cookie
+    else:
+      s.update(try: readFile(depIface) except IOError, OSError: "")
   result = $SecureHash(s.finalize())
   writeCookieFile(config, selfSuffix, "iface", result, ".iface.bif")
 
@@ -2874,6 +2885,23 @@ proc moduleId(c: var DecodeContext; suffix: string; flags: set[LoadFlag] = {}): 
         "whose NIF file hasn't been written yet."
     icProfStart(tBifLoad)
     var m = icbif.load(modFile)
+    when defined(nimIcConfigTrace):
+      if conf.cmd == cmdM and not lowered:
+        # Sample the companion cookies at the load site. These reads are not
+        # atomic with the BIF load and cannot prove the cookies describe it.
+        var iface = ""
+        var impl = ""
+        var ifacePresent = false
+        var implPresent = false
+        try:
+          iface = readFile(semanticFile(conf, suffix, ".iface.bif").string)
+          ifacePresent = true
+        except IOError, OSError: discard
+        try:
+          impl = readFile(semanticFile(conf, suffix, ".impl.bif").string)
+          implPresent = true
+        except IOError, OSError: discard
+        conf.icDepTraceLoads.add (suffix, iface, impl, ifacePresent, implPresent)
     prof pBifLoads
     icProfStop(tBifLoad)
     icProfStart(tPosIndex)

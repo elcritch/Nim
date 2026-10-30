@@ -34,13 +34,68 @@ from icconfig import produceIcConfig, ensureIcConfig
 from ic/sharedcounters import releaseSharedCounters
 
 when defined(nimIcConfigTrace):
-  import std/[algorithm, sets]
+  import std/[algorithm, base64, intsets, sets]
   when not defined(nimPreviewSlimSystem): import std/syncio
   from icmodnames import moduleSuffix
+  from typekeys import cachedModuleSuffix
 
   proc configTracePath(conf: ConfigRef): string =
     let suffix = moduleSuffix(conf.projectFull.string, cast[seq[string]](conf.searchPaths))
     result = semanticFile(conf, suffix, ".configtrace.json").string
+
+  proc dependencyTracePath(conf: ConfigRef): string =
+    let suffix = moduleSuffix(conf.projectFull.string, cast[seq[string]](conf.searchPaths))
+    result = semanticFile(conf, suffix, ".deptrace.json").string
+
+  proc sortedUniqueJson(items: var seq[string]): JsonNode =
+    items.sort()
+    result = newJArray()
+    var previous = ""
+    for item in items:
+      if item != previous: result.add parseJson(item)
+      previous = item
+
+  proc writeDependencyTrace(graph: ModuleGraph; path: string) =
+    ## Process-level evidence only. Sidecar samples are not synchronized with
+    ## the corresponding BIF reads, and graph/edge coverage is not proven.
+    let conf = graph.config
+    var group = @[conf.projectFull.string]
+    for member in conf.icGroup:
+      if member notin group: group.add member
+    group.sort()
+    var loads: seq[string] = @[]
+    var reads: seq[string] = @[]
+    var imports: seq[string] = @[]
+    var implDeps: seq[string] = @[]
+    for event in conf.icDepTraceLoads:
+      loads.add $(%*{"suffix": event.suffix,
+        "ifacePresent": event.ifacePresent, "ifaceBase64": encode(event.iface),
+        "implPresent": event.implPresent, "implBase64": encode(event.impl)})
+    for event in conf.icDepTraceIfaceReads:
+      reads.add $(%*{"owner": event.owner, "suffix": event.suffix,
+        "present": event.present, "cookieBase64": encode(event.cookie)})
+    for owner, deps in graph.importDeps:
+      for dep in deps:
+        imports.add $(%*{"owner": toFullPath(conf, owner),
+                          "source": toFullPath(conf, dep),
+                          "suffix": cachedModuleSuffix(conf, dep)})
+    for id in graph.icImplDeps:
+      let fileIdx = FileIndex(id)
+      implDeps.add $(%*{"source": toFullPath(conf, fileIdx),
+                        "suffix": cachedModuleSuffix(conf, fileIdx)})
+    let snapshot = %*{"version": 1, "complete": false, "scope": "process",
+      "project": conf.projectFull.string, "group": group,
+      "loads": sortedUniqueJson(loads), "ifaceReads": sortedUniqueJson(reads),
+      "imports": sortedUniqueJson(imports), "needsImpl": sortedUniqueJson(implDeps)}
+    let temporary = path & ".tmp." & $getCurrentProcessId()
+    try:
+      createDir(parentDir(path))
+      writeFile(temporary, $snapshot & "\n")
+      moveFile(temporary, path)
+    except IOError, OSError:
+      stderr.writeLine("IC dependency trace: could not write diagnostic snapshot: ", path)
+      try: removeFile(temporary)
+      except OSError: discard
 
   proc writeConfigTrace(conf: ConfigRef; path: string) =
     ## Diagnostic only: a process can compile several modules, and coverage is
@@ -511,13 +566,17 @@ proc mainCommand*(graph: ModuleGraph) =
     # (exec, runtime init, config replay) rather than its whole runtime.
     when defined(nimIcConfigTrace):
       let tracePath = if conf.icProject.len > 0: configTracePath(conf) else: ""
+      let dependencyPath = if conf.icProject.len > 0: dependencyTracePath(conf) else: ""
       if tracePath.len > 0:
         try: removeFile(tracePath)
+        except OSError: discard
+        try: removeFile(dependencyPath)
         except OSError: discard
     timed tStage: commandCheck(graph)
     when defined(nimIcConfigTrace):
       if tracePath.len > 0 and conf.errorCounter == 0:
         writeConfigTrace(conf, tracePath)
+        writeDependencyTrace(graph, dependencyPath)
     releaseSharedCounters()
   of cmdNifC:
     setUseIc(true)

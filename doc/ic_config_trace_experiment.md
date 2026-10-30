@@ -33,6 +33,30 @@ not have source attribution. The file is diagnostic and is not an artifact
 bundle or a cache-reuse authorization. Failed children do not publish a new
 file; older files can still exist if a rule fails before the child starts.
 
+With the same opt-in compiler flag, each successful driver-launched `nim m`
+process also writes `<module-suffix>.deptrace.json`. It identifies the project
+and compilation group, and contains the process's recorded resolved imports
+and union of `NeedsImpl` observations. At each semantic BIF load it samples
+the companion interface and implementation cookies; separately, it records
+the exact interface-cookie bytes actually read while chaining interface
+cookies during serialization. Cookie bytes are base64-encoded, with explicit
+presence flags, and observations are sorted and deduplicated. The snapshot is
+removed when the child starts and published after successful compilation using
+a per-process temporary file. As with the config trace, a stale file can remain
+if a build fails before the child starts.
+
+The cookie samples are separate filesystem reads, not atomic with the BIF
+load: concurrent writers can change an artifact between reads. The interface
+reads reflect serialization, rather than asserting which BIF version produced
+those cookies. The process-level `NeedsImpl` set may include group members;
+the existing sidecar writer filters those when producing each member's edges.
+Imports and body observations are recorded by existing compiler machinery and
+have not been proven complete for every macro, generated import, or cyclic
+group. The snapshots are always marked `complete: false`, are not a published
+artifact bundle, and must not be used for cache selection or recursive
+dependency validation. Preserving exact input identity under concurrent builds
+will require an immutable bundle or another synchronization mechanism.
+
 `compiler/icconfigmanifest.nim` contains an isolated observation checker for
 the recorded define results. It rejects incomplete, malformed, and explicitly
 untracked inputs. A match checks only those observations: it does not validate
