@@ -115,6 +115,17 @@ with BIF loads and do not establish complete dependency attribution or safe
 cross-configuration reuse. See the trace experiment notes for the schema and
 limitations.
 
+## Coverage and ineligibility probe
+
+A fresh baseline `nim track` run using version 2 config traces wrote 221
+manifests. All marked every coverage area unknown and listed the corresponding
+ineligibility reasons. Selected observed operations added `compileOption` in
+81 processes, `compileOptionArg` in two, `staticRead` in two, and
+`getProjectPath` in one. These are processes containing an observation, not
+distinct source sites or a complete list of unsupported inputs. All 248
+semantic BIFs matched the earlier baseline byte-for-byte. No drawing test was
+run; the traces are not used for cache selection.
+
 ## Trace limitations
 
 The baseline emitted 221 process manifests, all marked incomplete. They include

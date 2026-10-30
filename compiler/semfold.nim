@@ -24,6 +24,15 @@ import std/[strutils, math, strtabs]
 when defined(nimPreviewSlimSystem):
   import std/[assertions]
 
+when defined(nimIcConfigTrace):
+  proc traceFoldUntracked(g: ModuleGraph; n: PNode; reason: string;
+                          context = "<unknown>") =
+    let source = toFullPath(g.config, n.info.fileIndex)
+    g.config.icConfigTraceEvents.add ("untracked", context, source, $n.info.line, reason, "")
+    stderr.writeLine("IC_CONFIG_UNTRACKED_V1\t", getCurrentProcessId(), "\t",
+      context.escape, "\t", source.escape, "\t", n.info.line, "\t",
+      reason.escape, "\t\"\"\t0")
+
 proc errorType*(g: ModuleGraph): PType =
   ## creates a type representing an error state
   result = newType(tyError, g.idgen, g.owners[^1])
@@ -311,8 +320,10 @@ proc evalOp(m: TMagic, n, a, b, c: PNode; idgen: IdGenerator; g: ModuleGraph): P
     result = copyTree(a)
     result.typ = n.typ
   of mCompileOption:
+    when defined(nimIcConfigTrace): traceFoldUntracked(g, n, "compileOption")
     result = newIntNodeT(toInt128(ord(commands.testCompileOption(g.config, a.getStr, n.info))), n, idgen, g)
   of mCompileOptionArg:
+    when defined(nimIcConfigTrace): traceFoldUntracked(g, n, "compileOptionArg")
     result = newIntNodeT(toInt128(ord(
       testCompileOptionArg(g.config, getStr(a), getStr(b), n.info))), n, idgen, g)
   of mEqProc:
@@ -624,8 +635,16 @@ proc getConstExpr(m: PSym, n: PNode; idgen: IdGenerator; g: ModuleGraph): PNode 
                        g.config.isMainModule and m.position == g.config.projectMainIdx.int
                      else: sfMainModule in m.flags
         result = newIntNodeT(toInt128(ord(isMain)), n, idgen, g)
-      of mCompileDate: result = newStrNodeT(getDateStr(), n, g)
-      of mCompileTime: result = newStrNodeT(getClockStr(), n, g)
+      of mCompileDate:
+        when defined(nimIcConfigTrace):
+          let context = if m == nil: "<unknown>" else: toFullPath(g.config, m.info.fileIndex)
+          traceFoldUntracked(g, n, "compileDate", context)
+        result = newStrNodeT(getDateStr(), n, g)
+      of mCompileTime:
+        when defined(nimIcConfigTrace):
+          let context = if m == nil: "<unknown>" else: toFullPath(g.config, m.info.fileIndex)
+          traceFoldUntracked(g, n, "compileTime", context)
+        result = newStrNodeT(getClockStr(), n, g)
       of mCpuEndian: result = newIntNodeT(toInt128(ord(CPU[g.config.target.targetCPU].endian)), n, idgen, g)
       of mHostOS: result = newStrNodeT(toLowerAscii(platform.OS[g.config.target.targetOS].name), n, g)
       of mHostCPU: result = newStrNodeT(platform.CPU[g.config.target.targetCPU].name.toLowerAscii, n, g)

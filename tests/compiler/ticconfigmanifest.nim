@@ -10,8 +10,12 @@ proc event(kind, key, value: string): JsonNode =
      "line": "1", "key": key, "value": value}
 
 proc manifest(events: seq[JsonNode]; complete = true): JsonNode =
-  %*{"version": 1, "complete": complete, "scope": "process",
-     "project": "/m.nim", "group": newJArray(), "observations": events}
+  var coverage = newJObject()
+  for area in ConfigCoverageAreas: coverage[area] = %"complete"
+  let observations = %events
+  %*{"version": 2, "complete": complete, "scope": "process",
+     "project": "/m.nim", "group": newJArray(), "observations": observations,
+     "coverage": coverage, "ineligibleReasons": configIneligibilityReasons(coverage, observations)}
 
 let conf = newConfigRef()
 setTarget(conf.target, osLinux, cpuAmd64)
@@ -50,6 +54,21 @@ doAssert checkConfigObservations(conf, manifest(@[event("value", "linux", "mIntD
 doAssert checkConfigObservations(conf, manifest(@[event("value", "missingValue", "mIntDefine\tfalse\tunexpected")])) == cocInvalid
 doAssert checkConfigObservations(conf, %*{"version": 99}) == cocInvalid
 doAssert checkConfigObservationsFile(conf, "/does-not-exist/ic-config-manifest") == cocInvalid
+for area in ConfigCoverageAreas:
+  var unknown = manifest(observations)
+  unknown["coverage"][area] = %"unknown"
+  unknown["ineligibleReasons"] = configIneligibilityReasons(unknown["coverage"], unknown["observations"])
+  doAssert checkConfigObservations(conf, unknown) == cocIncomplete
+  unknown["ineligibleReasons"] = newJArray()
+  doAssert checkConfigObservations(conf, unknown) == cocInvalid
+var missingCoverage = manifest(observations)
+missingCoverage["coverage"].delete("compilerReads")
+doAssert checkConfigObservations(conf, missingCoverage) == cocInvalid
+var legacy = manifest(observations)
+legacy["version"] = %1
+doAssert checkConfigObservations(conf, legacy) == cocInvalid
+legacy["complete"] = %false
+doAssert checkConfigObservations(conf, legacy) == cocIncomplete
 
 # A consumer's unchanged semantic BIF is insufficient: its imported module's
 # interface cookie may change, or it may have consumed a dependency body.

@@ -37,6 +37,7 @@ when defined(nimIcConfigTrace):
   import std/[algorithm, base64, intsets, sets]
   when not defined(nimPreviewSlimSystem): import std/syncio
   from icmodnames import moduleSuffix
+  from icconfigmanifest import incompleteConfigCoverage, configIneligibilityReasons
   from typekeys import cachedModuleSuffix
 
   proc configTracePath(conf: ConfigRef): string =
@@ -115,9 +116,11 @@ when defined(nimIcConfigTrace):
       observations.add %*{"kind": event.kind, "context": event.context,
         "source": event.source, "line": event.line, "key": event.key,
         "value": event.value}
-    let manifest = %*{"version": 1, "complete": false, "scope": "process",
+    let coverage = incompleteConfigCoverage()
+    let manifest = %*{"version": 2, "complete": false, "scope": "process",
                       "project": conf.projectFull.string, "group": group,
-                      "observations": observations}
+                      "coverage": coverage, "observations": observations,
+                      "ineligibleReasons": configIneligibilityReasons(coverage, observations)}
     let temporary = path & ".tmp." & $getCurrentProcessId()
     try:
       createDir(parentDir(path))

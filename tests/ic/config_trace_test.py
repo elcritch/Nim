@@ -26,6 +26,8 @@ macro macroProbe*(arg: untyped): untyped =
   discard querySetting(setting)
   discard querySettingSeq(seqSetting)
   discard getEnv(name)
+  discard getProjectPath()
+  discard getCurrentCompilerExe()
   result = quote do:
     when defined(probeMacro): discard
 const importedValue* {.intdefine.} = 9
@@ -41,6 +43,10 @@ const probeValue {.strdefine.} = "fallback"
 const probeInt {.intdefine.} = 3
 const probeBool {.booldefine.} = false
 when defined(probeFlag): discard
+when compileOption("threads"): discard
+when compileOption("gc", "orc"): discard
+const traceDate = CompileDate
+const traceTime = CompileTime
 when defined(linux) or defined(freebsd) or defined(openbsd) or defined(netbsd) or
      defined(macosx) or defined(windows): discard
 {.define: probeMutation.}
@@ -101,13 +107,16 @@ static:
         imported = find(records, "IC_CONFIG_VALUE_V2", "importedValue")
         assert imported and any(ast.literal_eval(r[2]) == str(main) and r[7] == "false"
                                 for r in imported), imported
-        for reason in ("querySetting", "querySettingSeq", "getEnv", "staticRead"):
+        for reason in ("querySetting", "querySettingSeq", "getEnv", "staticRead",
+                       "getProjectPath", "getCurrentCompilerExe"):
             observed = find(records, "IC_CONFIG_UNTRACKED_V1", reason)
             assert observed, reason
             if reason == "staticRead":
                 assert any(ast.literal_eval(r[2]) == str(main) for r in observed), observed
-            else:
+            elif reason not in ("getProjectPath", "getCurrentCompilerExe"):
                 assert any(ast.literal_eval(r[6]) == str(main) for r in observed), (reason, observed)
+        for reason in ("compileOption", "compileOptionArg", "compileDate", "compileTime"):
+            assert find(records, "IC_CONFIG_UNTRACKED_V1", reason), reason
         target = ("freebsd" if sys.platform.startswith("freebsd") else
                   "openbsd" if sys.platform.startswith("openbsd") else
                   "netbsd" if sys.platform.startswith("netbsd") else
@@ -139,6 +148,25 @@ static:
     assert any(r[0] == "IC_CONFIG_UNTRACKED_V1" and
                ast.literal_eval(r[5]) == "staticExec"
                for r in (line.split("\t") for line in p.stderr.splitlines()))
+
+    danger_probe = root / "danger_probe.nim"
+    write_target = json.dumps(str(root / "vm-written.txt"))
+    danger_probe.write_text('import std/[times, os, osproc]\n'
+                            'static:\n'
+                            '  discard getCurrentDir()\n'
+                            '  discard getTime()\n'
+                            '  discard cpuTime()\n'
+                            '  discard execCmdEx("echo icConfigTrace")\n'
+                            f'  writeFile({write_target}, "trace")\n')
+    p = subprocess.run([str(nim), "c", "--compileOnly", "--hints:off", "--skipUserCfg",
+                        "--skipParentCfg", "--experimental:vmopsDanger",
+                        "--nimcache:" + str(root / "danger_cache"), str(danger_probe)],
+                       text=True, capture_output=True, check=True)
+    danger_records = [line.split("\t") for line in p.stderr.splitlines()
+                      if line.startswith("IC_CONFIG_UNTRACKED_V1\t")]
+    for reason in ("getCurrentDir", "getTimeImpl", "cpuTime", "execCmdEx", "writeFile"):
+        assert find(danger_records, "IC_CONFIG_UNTRACKED_V1", reason), reason
+    assert (root / "vm-written.txt").read_text() == "trace"
 
     (root / "trackdep.nim").write_text('''const icTrackedValue {.intdefine.} = 4
 func snapshotValue*(): int = 11
@@ -172,7 +200,12 @@ else:
         return next(doc for doc in docs if doc["project"] == str(root / "trackdep.nim"))
 
     first = manifest(root / "trackcache")
-    assert first["version"] == 1 and first["scope"] == "process" and not first["complete"]
+    assert first["version"] == 2 and first["scope"] == "process" and not first["complete"]
+    expected_areas = {"semanticReads", "compilerReads", "discoveryReads", "defineMutation",
+                      "compileTimeInputs", "attribution"}
+    assert set(first["coverage"]) == expected_areas
+    assert set(first["coverage"].values()) == {"unknown"}
+    assert {"coverage:" + area for area in expected_areas} <= set(first["ineligibleReasons"])
     assert any(e["kind"] == "defined" and e["key"] == "icTrackedFlag" and e["value"] == "1"
                for e in first["observations"])
     assert any(e["kind"] == "defined" and e["context"] == "<compiler>" and
@@ -208,6 +241,21 @@ else:
     manifests = [json.loads(path.read_text()) for path in (root / "trackcache").rglob("*.configtrace.json")]
     variants = [doc for doc in manifests if doc["project"] == str(root / "trackdep.nim")]
     assert len(variants) == 2 and all(not doc["complete"] for doc in variants)
+
+    hazardmain = root / "hazardmain.nim"
+    hazardmain.write_text('import std/os\nwhen compileOption("threads"): discard\n'
+                          'const buildDate = CompileDate\nconst buildTime = CompileTime\n'
+                          'const fileData = staticRead("input.txt")\n'
+                          'static: discard getCurrentCompilerExe()\n')
+    hazardcache = root / "hazardcache"
+    subprocess.run([str(nim), "track", "--hints:off", "--skipUserCfg", "--skipParentCfg",
+                    "--nimcache:" + str(hazardcache), "-d:icJobs=1", str(hazardmain)],
+                   text=True, capture_output=True, check=True)
+    hazard = next(json.loads(path.read_text()) for path in hazardcache.rglob("*.configtrace.json")
+                  if json.loads(path.read_text())["project"] == str(hazardmain))
+    reasons = set(hazard["ineligibleReasons"])
+    for reason in ("compileOption", "compileDate", "compileTime", "staticRead", "getCurrentCompilerExe"):
+        assert "untracked:" + reason in reasons, (reason, reasons)
 
     icmain = root / "icmain.nim"
     icmain.write_text('import trackdep\necho snapshotValue()\n')

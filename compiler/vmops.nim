@@ -88,6 +88,8 @@ template wrap2iMath(op) {.dirty.} =
 
 template wrap0(op, modop) {.dirty.} =
   proc `op Wrapper`(a: VmArgs) {.nimcall.} =
+    when defined(nimIcConfigTrace):
+      traceConfigUntracked(a.ctx, a.currentLineInfo, astToStr(op))
     setResult(a, op())
   modop op
 
@@ -133,6 +135,8 @@ template wrapDangerous1svoid(op, modop) {.dirty.} =
     modop op
   else:
     proc `op Wrapper`(a: VmArgs) {.nimcall.} =
+      when defined(nimIcConfigTrace):
+        traceConfigUntracked(a.ctx, a.currentLineInfo, astToStr(op))
       op(getString(a, 0))
     modop op
 
@@ -143,6 +147,8 @@ template wrapDangerous2svoid(op, modop) {.dirty.} =
     modop op
   else:
     proc `op Wrapper`(a: VmArgs) {.nimcall.} =
+      when defined(nimIcConfigTrace):
+        traceConfigUntracked(a.ctx, a.currentLineInfo, astToStr(op))
       op(getString(a, 0), getString(a, 1))
     modop op
 
@@ -217,6 +223,8 @@ proc registerAdditionalOps*(c: PCtx) =
     setResult a, ret.toLit
 
   proc getProjectPathWrapper(a: VmArgs) =
+    when defined(nimIcConfigTrace):
+      traceConfigUntracked(a.ctx, a.currentLineInfo, "getProjectPath")
     setResult a, c.config.projectPath.string
 
   wrap1fMath(sqrt)
@@ -308,6 +316,8 @@ proc registerAdditionalOps*(c: PCtx) =
   macrosop getProjectPath
 
   registerCallback c, "stdlib.os.getCurrentCompilerExe", proc (a: VmArgs) {.nimcall.} =
+    when defined(nimIcConfigTrace):
+      traceConfigUntracked(a.ctx, a.currentLineInfo, "getCurrentCompilerExe")
     setResult(a, getAppFilename())
 
   registerCallback c, "stdlib.macros.symBodyHash", proc (a: VmArgs) =
@@ -376,11 +386,17 @@ proc registerAdditionalOps*(c: PCtx) =
     ## Note that `staticExec` can already do equal amount of damage so it's more
     ## of a semantic issue than a security issue.
     registerCallback c, "stdlib.ospaths2.getCurrentDir", proc (a: VmArgs) {.nimcall.} =
+      when defined(nimIcConfigTrace):
+        traceConfigUntracked(a.ctx, a.currentLineInfo, "getCurrentDir")
       setResult(a, getCurrentDir())
     registerCallback c, "stdlib.osproc.execCmdEx", proc (a: VmArgs) {.nimcall.} =
+      when defined(nimIcConfigTrace):
+        traceConfigUntracked(a.ctx, a.currentLineInfo, "execCmdEx")
       let options = getNode(a, 1).fromLit(set[osproc.ProcessOption])
       a.setResult osproc.execCmdEx(getString(a, 0), options).toLit
     registerCallback c, "stdlib.times.getTimeImpl", proc (a: VmArgs) =
+      when defined(nimIcConfigTrace):
+        traceConfigUntracked(a.ctx, a.currentLineInfo, "getTimeImpl")
       let obj = a.getNode(0).typ.n
       setResult(a, times.getTime().toTimeLit(c, obj, a.currentLineInfo))
 

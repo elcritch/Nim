@@ -12,8 +12,9 @@ the define magic, presence and escaped raw value.
 `IC_CONFIG_UNTRACKED_V1` has process ID, context path, operation source path,
 line, a reason, and an optional macro call-site path and line. It does not log
 the input or result of an external operation. Reasons report selected source
-define mutations, VM config queries, environment and filesystem operations,
-`staticRead`, and `staticExec`; they are diagnostic warnings, not an
+define mutations, `compileOption`, compilation date/time, VM config and
+project-path queries, environment and filesystem operations, `staticRead`,
+and `staticExec`; they are diagnostic warnings, not a complete
 eligibility calculation. `nim check` suppresses `staticExec`, so that skipped
 operation is not logged.
 Strings use Nim `escape` syntax; an absent value has an empty final field.
@@ -25,7 +26,11 @@ Values and paths can contain sensitive data. Run the diagnostic probe with
 trace-enabled compiler at that path.
 
 Successful `nim m` children invoked by the IC driver also write a versioned
-`<module-suffix>.configtrace.json` file in their semantic directory. Its sorted,
+`<module-suffix>.configtrace.json` file in their semantic directory. Version 2
+includes a `coverage` map and sorted `ineligibleReasons`. The six coverage
+areas (semantic reads, compiler reads, discovery reads, define mutation,
+compile-time inputs, and attribution) are all explicitly `unknown`; selected
+untracked operations add further reasons. Its sorted,
 deduplicated observations cover the whole child process, including any cycle
 group, and its `complete` field is always `false`. It also includes process-wide
 `options.isDefined` observations with `<compiler>` as their context; these do
@@ -62,7 +67,11 @@ the recorded define results. It rejects incomplete, malformed, and explicitly
 untracked inputs. A match checks only those observations: it does not validate
 the base configuration, source, dependencies, or artifact integrity and is not
 connected to cache selection. Production trace files are currently incomplete
-and cannot return a match.
+and cannot return a match. The v2 checker requires all coverage areas and a
+consistent list of ineligibility reasons; changing `complete` alone cannot
+make an unknown-coverage trace match. Incomplete v1 traces remain recognizable,
+but a v1 trace marked complete is invalid because v1 has no coverage contract.
+Even a synthetic v2 match is not proof that its coverage assertions are true.
 
 `compiler/icconfigdeps.nim` adds an isolated combined check for config
 observations and dependency observations. It compares the complete set of
@@ -122,6 +131,18 @@ the flag.
   now emit diagnostic reasons, but no unit has been proved eligible. A future
   scheme needs conservative transitive fallback, including cyclic groups and
   unknowns.
+* `semfold` evaluates `compileOption` and `compileOption` with an argument
+  directly against compiler settings; `deps` separately interprets a subset
+  of those conditions for discovery. Target, host, application type and
+  `isMainModule` are other semantic inputs. `CompileDate` and `CompileTime`
+  come from the compiler clock. Selected fold reads now emit untracked records;
+  the trace does not yet validate the complete settings or discovery state.
+* VM callbacks can expose the project path, compiler executable path, current
+  directory, CPU or wall clock, filesystem writes and commands. The optional
+  `vmopsDanger` callbacks and selected other operations now emit diagnostic
+  records when executed. Other VM operations, host services, compile-time state
+  and mutations still need auditing; the default unknown coverage does not
+  depend on observing a particular callback.
 
 ### Attribution probe
 
