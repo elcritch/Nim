@@ -126,6 +126,16 @@ distinct source sites or a complete list of unsupported inputs. All 248
 semantic BIFs matched the earlier baseline byte-for-byte. No drawing test was
 run; the traces are not used for cache selection.
 
+## Bundle checker probe
+
+The isolated bundle checker was run on the `fignodes` source and copies of
+its five baseline semantic artifacts. It rejected the real config trace as
+incomplete. With synthetic claims of complete config and dependency evidence,
+an assumed base key and an empty dependency set, it matched the supplied file
+hashes; corrupting the copied interface cookie caused an artifact mismatch.
+Those assumptions deliberately omit the module's real dependencies, so this
+tests file validation only and does not establish that the module is reusable.
+
 ## Trace limitations
 
 The baseline emitted 221 process manifests, all marked incomplete. They include

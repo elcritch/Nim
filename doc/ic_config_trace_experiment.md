@@ -83,12 +83,32 @@ must independently establish the current dependency set: a candidate's old
 import sidecar is not proof of the graph under a new configuration.
 
 This is a validation component, not an enabled reuse path. No production code
-yet records the cookies consumed by a compilation or constructs independently
-validated dependency snapshots, and a match would still require validation of
-the base configuration, compiler identity, source and includes, SCC membership,
+yet records a complete, coherent set of cookies consumed by a compilation or
+constructs independently validated dependency snapshots, and a match would
+still require validation of the base configuration, compiler identity, source
+and includes, SCC membership,
 external inputs, and the complete artifact bundle. The tests use synthetic
 complete observations to exercise both the changed-cookie and changed-define
 cases; real trace manifests continue to be rejected as incomplete.
+
+`compiler/icconfigbundle.nim` adds an isolated bundle checker. Given supplied
+complete records, it checks configuration observations and dependency records,
+compiler and base-configuration identities, project and group membership, the
+independently supplied source/include set and file hashes, and the semantic BIF,
+interface cookie, implementation cookie, implementation-edge sidecar and
+semantic-import sidecar for every group member. It uses streaming SHA-256 for
+file bytes, requires unique module suffixes and correctly named artifacts, and
+rejects missing, changed, duplicate or malformed evidence. Its tests use
+synthetic completeness claims and a two-member group.
+
+This checker does not discover inputs or produce bundle manifests. A caller
+must establish what the compiler and base keys cover, independently discover
+current sources and imports, prove configuration and dependency coverage, and
+ensure the recorded hashes describe the files actually consumed. Hashing and
+then later reading a mutable file is not atomic. There is no immutable variant
+store, atomic bundle publication, or integration with the driver and nifmake;
+therefore even a `bcMatch` is not an authorization to reuse a bundle. No
+production trace currently supplies the required complete evidence.
 
 A small `nim ic` A → B → A probe with a `strdefine` produced the expected
 executable output on each switch. It exercises the existing separate caches;
