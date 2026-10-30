@@ -1,5 +1,5 @@
 when defined(nimIcConfigTrace):
-  import std/syncio
+  import std/[syncio, os]
 
 #
 #
@@ -2363,8 +2363,13 @@ proc semDefined(c: PContext, n: PNode): PNode =
   let defineName = considerQuotedIdentOrDot(c, n[1], n).s
   result.intVal = ord isDefined(c.config, defineName)
   when defined(nimIcConfigTrace):
-    stderr.writeLine("IC_CONFIG_DEFINED\t", c.module.name.s, "\t", defineName,
-                     "\t", $result.intVal)
+    let context = toFullPath(c.config, c.module.info.fileIndex)
+    let source = toFullPath(c.config, n.info.fileIndex)
+    c.config.icConfigTraceEvents.add ("defined", context, source, $n.info.line,
+                                     defineName, $result.intVal)
+    stderr.writeLine("IC_CONFIG_DEFINED_V2\t", getCurrentProcessId(), "\t",
+      context.escape, "\t", source.escape, "\t", n.info.line, "\t",
+      defineName.escape, "\t", $result.intVal)
   result.info = n.info
   result.typ = getSysType(c.graph, n.info, tyBool)
 

@@ -28,6 +28,22 @@ from magicsys import getSysType, getSysSym, sysTypeFromName
 from astalgo import lookupInRecord
 from liftdestructors import isTrivial
 
+when defined(nimIcConfigTrace):
+  import std/syncio
+  from std/os import getCurrentProcessId, getAppFilename
+
+  proc traceConfigUntracked(c: PCtx; info: TLineInfo; reason: string) =
+    let context = if c.module == nil: "???"
+                  else: toFullPath(c.config, c.module.info.fileIndex)
+    let source = toFullPath(c.config, info.fileIndex)
+    let callsite = if c.callsite == nil: "" else: toFullPath(c.config, c.callsite.info.fileIndex)
+    let callsiteLine = if c.callsite == nil: 0 else: int(c.callsite.info.line)
+    c.config.icConfigTraceEvents.add ("untracked", context, source, $info.line,
+                                      reason, callsite & "\t" & $callsiteLine)
+    stderr.writeLine("IC_CONFIG_UNTRACKED_V1\t", getCurrentProcessId(), "\t",
+      context.escape, "\t", source.escape, "\t",
+      info.line, "\t", reason.escape, "\t", callsite.escape, "\t", callsiteLine)
+
 const
   traceCode = defined(nimVMDebug)
 
@@ -1956,6 +1972,8 @@ proc rawExecute(c: PCtx, start: int, tos: PStackFrame): Address =
         else:
           putStr(ra, $sigHash(shSym, c.config))
     of opcSlurp:
+      when defined(nimIcConfigTrace):
+        traceConfigUntracked(c, c.debug[pc], "staticRead")
       putStr(ra, opSlurp(str(instr.regB), c.debug[pc], c.module, c.config))
     of opcGorge:
       let rb = instr.regB
@@ -1964,6 +1982,8 @@ proc rawExecute(c: PCtx, start: int, tos: PStackFrame): Address =
         putStr(ra, "")
       else:
         when defined(nimcore):
+          when defined(nimIcConfigTrace):
+            traceConfigUntracked(c, c.debug[pc], "staticExec")
           putStr(ra, opGorge(str(rb), str(rb+1), str(rb+2), c.debug[pc], c.config)[0])
         else:
           putStr(ra, "")

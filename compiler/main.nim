@@ -33,6 +33,46 @@ import icprof
 from icconfig import produceIcConfig, ensureIcConfig
 from ic/sharedcounters import releaseSharedCounters
 
+when defined(nimIcConfigTrace):
+  import std/[algorithm, sets]
+  when not defined(nimPreviewSlimSystem): import std/syncio
+  from icmodnames import moduleSuffix
+
+  proc configTracePath(conf: ConfigRef): string =
+    let suffix = moduleSuffix(conf.projectFull.string, cast[seq[string]](conf.searchPaths))
+    result = semanticFile(conf, suffix, ".configtrace.json").string
+
+  proc writeConfigTrace(conf: ConfigRef; path: string) =
+    ## Diagnostic only: a process can compile several modules, and coverage is
+    ## incomplete. An incomplete file is never an authorization to reuse.
+    var events = conf.icConfigTraceEvents
+    events.sort()
+    var group: seq[string] = @[]
+    for member in conf.icGroup: group.add member
+    group.sort()
+    var observations = newJArray()
+    var previous = default(typeof(events[0]))
+    var first = true
+    for event in events:
+      if not first and event == previous: continue
+      first = false
+      previous = event
+      observations.add %*{"kind": event.kind, "context": event.context,
+        "source": event.source, "line": event.line, "key": event.key,
+        "value": event.value}
+    let manifest = %*{"version": 1, "complete": false, "scope": "process",
+                      "project": conf.projectFull.string, "group": group,
+                      "observations": observations}
+    let temporary = path & ".tmp." & $getCurrentProcessId()
+    try:
+      createDir(parentDir(path))
+      writeFile(temporary, $manifest & "\n")
+      moveFile(temporary, path)
+    except IOError, OSError:
+      stderr.writeLine("IC config trace: could not write diagnostic manifest: ", path)
+      try: removeFile(temporary)
+      except OSError: discard
+
 when not defined(nimKochBootstrap):
   import nifbackend
   import deps
@@ -469,7 +509,15 @@ proc mainCommand*(graph: ModuleGraph) =
     excl conf.features, Feature.vtables
     # `tStage` for a `nim m` process, so `Process - Stage` is its real startup
     # (exec, runtime init, config replay) rather than its whole runtime.
+    when defined(nimIcConfigTrace):
+      let tracePath = if conf.icProject.len > 0: configTracePath(conf) else: ""
+      if tracePath.len > 0:
+        try: removeFile(tracePath)
+        except OSError: discard
     timed tStage: commandCheck(graph)
+    when defined(nimIcConfigTrace):
+      if tracePath.len > 0 and conf.errorCounter == 0:
+        writeConfigTrace(conf, tracePath)
     releaseSharedCounters()
   of cmdNifC:
     setUseIc(true)

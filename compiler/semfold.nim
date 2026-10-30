@@ -1,5 +1,5 @@
 when defined(nimIcConfigTrace):
-  import std/syncio
+  import std/[syncio, os]
 
 #
 #
@@ -525,12 +525,17 @@ proc foldDefine(m, s: PSym, n: PNode; idgen: IdGenerator; g: ModuleGraph): PNode
           # should be processed in pragmas.nim already
           if it[1].kind in {nkStrLit, nkRStrLit, nkTripleStrLit}:
             name = it[1].strVal
+  let present = isDefined(g.config, name)
   when defined(nimIcConfigTrace):
-    let present = isDefined(g.config, name)
     let value = if present: g.config.symbols[name].escape else: ""
-    stderr.writeLine("IC_CONFIG_VALUE\t", m.name.s, "\t", name, "\t",
-                     $present, "\t", value)
-  if isDefined(g.config, name):
+    let context = toFullPath(g.config, m.info.fileIndex)
+    let source = toFullPath(g.config, n.info.fileIndex)
+    g.config.icConfigTraceEvents.add ("value", context, source, $n.info.line, name,
+                                     $s.magic & "\t" & $present & "\t" & value)
+    stderr.writeLine("IC_CONFIG_VALUE_V2\t", getCurrentProcessId(), "\t",
+      context.escape, "\t", source.escape, "\t", n.info.line, "\t",
+      name.escape, "\t", $s.magic, "\t", $present, "\t", value)
+  if present:
     let str = g.config.symbols[name]
     case s.magic
     of mIntDefine:

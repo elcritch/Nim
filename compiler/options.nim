@@ -457,6 +457,10 @@ type
     lastCmdTime*: float        # when caas is enabled, we measure each command
     symbolFiles*: SymbolFilesOption
     ic*: bool # whether ic is enabled
+    when defined(nimIcConfigTrace):
+      # Process-wide diagnostic observations. These are deliberately incomplete
+      # and must never be used to decide whether an artifact can be reused.
+      icConfigTraceEvents*: seq[tuple[kind, context, source, line, key, value: string]]
     icParsedDir*: AbsoluteDir # shared source/dependency scans, selected by the IC driver
     icSemDir*: AbsoluteDir    # imported-module semantics for the effective configuration
     icMainSemDir*: AbsoluteDir # semantics for this entry point's import-cycle group
@@ -835,6 +839,12 @@ proc isDefined*(conf: ConfigRef; symbol: string): bool =
       result = conf.target.targetOS in {osSolaris, osIllumos, osNetbsd, osFreebsd, osOpenbsd,
                             osDragonfly, osMacosx}
     else: result = false
+  when defined(nimIcConfigTrace):
+    if conf.cmd == cmdM:
+      # Process-wide diagnostic only: callers include compiler code as well as
+      # semantic checks. No source attribution or completeness is implied.
+      conf.icConfigTraceEvents.add ("defined", "<compiler>", "", "0",
+                                    symbol, $ord(result))
 
 template quitOrRaise*(conf: ConfigRef, msg = "") =
   # xxx in future work, consider whether to also intercept `msgQuit` calls

@@ -24,7 +24,8 @@ when declared(math.signbit):
 
 
 from std/envvars import getEnv, existsEnv, delEnv, putEnv, envPairs
-from std/os import getAppFilename
+when not defined(nimIcConfigTrace):
+  from std/os import getAppFilename
 from std/private/oscommon import dirExists, fileExists
 from std/private/osdirs import walkDir, createDir
 from std/private/ospaths2 import getCurrentDir
@@ -34,7 +35,7 @@ from std/hashes import hash
 from std/osproc import nil
 
 
-when defined(nimPreviewSlimSystem):
+when defined(nimPreviewSlimSystem) and not defined(nimIcConfigTrace):
   import std/syncio
 when not defined(nimPreviewSlimSystem):
   # explicit negated `when` rather than `else:` so nifler's dep scanner guards
@@ -92,26 +93,36 @@ template wrap0(op, modop) {.dirty.} =
 
 template wrap1s(op, modop) {.dirty.} =
   proc `op Wrapper`(a: VmArgs) {.nimcall.} =
+    when defined(nimIcConfigTrace):
+      traceConfigUntracked(a.ctx, a.currentLineInfo, astToStr(op))
     setResult(a, op(getString(a, 0)))
   modop op
 
 template wrap2s(op, modop) {.dirty.} =
   proc `op Wrapper`(a: VmArgs) {.nimcall.} =
+    when defined(nimIcConfigTrace):
+      traceConfigUntracked(a.ctx, a.currentLineInfo, astToStr(op))
     setResult(a, op(getString(a, 0), getString(a, 1)))
   modop op
 
 template wrap2si(op, modop) {.dirty.} =
   proc `op Wrapper`(a: VmArgs) {.nimcall.} =
+    when defined(nimIcConfigTrace):
+      traceConfigUntracked(a.ctx, a.currentLineInfo, astToStr(op))
     setResult(a, op(getString(a, 0), getInt(a, 1)))
   modop op
 
 template wrap1svoid(op, modop) {.dirty.} =
   proc `op Wrapper`(a: VmArgs) {.nimcall.} =
+    when defined(nimIcConfigTrace):
+      traceConfigUntracked(a.ctx, a.currentLineInfo, astToStr(op))
     op(getString(a, 0))
   modop op
 
 template wrap2svoid(op, modop) {.dirty.} =
   proc `op Wrapper`(a: VmArgs) {.nimcall.} =
+    when defined(nimIcConfigTrace):
+      traceConfigUntracked(a.ctx, a.currentLineInfo, astToStr(op))
     op(getString(a, 0), getString(a, 1))
   modop op
 
@@ -193,10 +204,14 @@ proc registerAdditionalOps*(c: PCtx) =
 
   template wrapIterator(fqname: string, iter: untyped) =
     registerCallback c, fqname, proc(a: VmArgs) =
+      when defined(nimIcConfigTrace):
+        traceConfigUntracked(a.ctx, a.currentLineInfo, fqname)
       setResult(a, toLit(toSeq(iter)))
 
 
   proc gorgeExWrapper(a: VmArgs) =
+    when defined(nimIcConfigTrace):
+      traceConfigUntracked(a.ctx, a.currentLineInfo, "gorgeEx")
     let ret = opGorge(getString(a, 0), getString(a, 1), getString(a, 2),
                          a.currentLineInfo, c.config)
     setResult a, ret.toLit
@@ -266,14 +281,24 @@ proc registerAdditionalOps*(c: PCtx) =
     systemop getCurrentException
     systemop raiseDefect
     registerCallback c, "stdlib.staticos.staticWalkDir", proc (a: VmArgs) {.nimcall.} =
+      when defined(nimIcConfigTrace):
+        traceConfigUntracked(a.ctx, a.currentLineInfo, "staticWalkDir")
       setResult(a, staticWalkDirImpl(getString(a, 0), getBool(a, 1)))
     registerCallback c, "stdlib.staticos.staticDirExists", proc (a: VmArgs) {.nimcall.} =
+      when defined(nimIcConfigTrace):
+        traceConfigUntracked(a.ctx, a.currentLineInfo, "staticDirExists")
       setResult(a, dirExists(getString(a, 0)))
     registerCallback c, "stdlib.staticos.staticFileExists", proc (a: VmArgs) {.nimcall.} =
+      when defined(nimIcConfigTrace):
+        traceConfigUntracked(a.ctx, a.currentLineInfo, "staticFileExists")
       setResult(a, fileExists(getString(a, 0)))
     registerCallback c, "stdlib.compilesettings.querySetting", proc (a: VmArgs) =
+      when defined(nimIcConfigTrace):
+        traceConfigUntracked(a.ctx, a.currentLineInfo, "querySetting")
       setResult(a, querySettingImpl(c.config, getInt(a, 0)))
     registerCallback c, "stdlib.compilesettings.querySettingSeq", proc (a: VmArgs) =
+      when defined(nimIcConfigTrace):
+        traceConfigUntracked(a.ctx, a.currentLineInfo, "querySettingSeq")
       setResult(a, querySettingSeqImpl(c.config, getInt(a, 0)))
 
     if defined(nimsuggest) or c.config.cmd == cmdCheck:
